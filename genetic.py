@@ -22,6 +22,7 @@ Instructions:
 import os
 import cv2
 import numpy as np
+import pickle
 import glob
 import random
 import itertools
@@ -32,7 +33,36 @@ from viz_3d import SceneObject, SceneVisualizer
 # --- Configuration ---
 DATA_FOLDER = 'data'
 VIDEO_FORMAT = '*.mp4'
-NUM_POINTS = 20  # Number of points to track (P1, P2, P3)
+SKELETON = {
+        "thorax": [ "neck", "leg_f_L0", "leg_f_R0", "leg_m_L0", "leg_m_R0" ],
+        "neck": [ "thorax", "a_R0", "a_L0", "eye_L", "eye_R", "m_L0", "m_R0" ],
+        "eye_L": [ "neck" ],
+        "eye_R": [ "neck" ],
+        "a_L0": [ "neck", "a_L1" ],
+        "a_L1": [ "a_L2", "a_L0" ],
+        "a_L2": [ "a_L1" ],
+        "a_R0": [ "neck", "a_R1" ],
+        "a_R1": [ "a_R2", "a_R0" ],
+        "a_R2": [ "a_R1" ],
+        "leg_f_L0": [ "thorax", "leg_f_L1" ],
+        "leg_f_L1": [ "leg_f_L2", "leg_f_L0" ],
+        "leg_f_L2": [ "leg_f_L1" ],
+        "leg_f_R0": [ "thorax", "leg_f_R1" ],
+        "leg_f_R1": [ "leg_f_R2", "leg_f_R0" ],
+        "leg_f_R2": [ "leg_f_R1" ],
+        "leg_m_L0": [ "thorax", "leg_m_L1" ],
+        "leg_m_L1": [ "leg_m_L2", "leg_m_L0" ],
+        "leg_m_L2": [ "leg_m_L1" ],
+        "leg_m_R0": [ "thorax", "leg_m_R1" ],
+        "leg_m_R1": [ "leg_m_R2", "leg_m_R0" ],
+        "leg_m_R2": [ "leg_m_R1" ],
+        "m_L0": [ "neck", "m_L1" ],
+        "m_L1": [ "m_L0" ],
+        "m_R0": [ "neck", "m_R1" ],
+        "m_R1": [ "m_R0" ]
+}
+POINT_NAMES = list(SKELETON.keys())
+NUM_POINTS = len(POINT_NAMES)
 
 # Genetic Algorithm Parameters
 POPULATION_SIZE = 200 
@@ -79,14 +109,14 @@ lk_params = dict(winSize=(15, 15),
 
 # Point colors
 point_colors = np.array([
-    [255, 0, 0],   # P1 - Red
-    [0, 255, 0],   # P2 - Green
-    [0, 0, 255],   # P3 - Blue
-    [255, 255, 0], # P4 - Yellow
-    [0, 255, 255], # P5 - Cyan
-    [255, 0, 255], # P6 - Magenta
-    [192, 192, 192],# P7 - Silver
-    [255, 128, 0],   # P8 - Orange
+    [255, 0, 0],      # P1 - Red
+    [0, 255, 0],      # P2 - Green
+    [0, 0, 255],      # P3 - Blue
+    [255, 255, 0],    # P4 - Yellow
+    [0, 255, 255],    # P5 - Cyan
+    [255, 0, 255],    # P6 - Magenta
+    [192, 192, 192],  # P7 - Silver
+    [255, 128, 0],    # P8 - Orange
     [128, 0, 255],    # P9 - Purple
     [255, 128, 128],  # P10 - Light Red
     [128, 128, 0],    # P11 - Olive
@@ -98,7 +128,13 @@ point_colors = np.array([
     [192, 192, 128],  # P17 - Khaki
     [192, 128, 192],  # P18 - Plum
     [128, 192, 192],  # P19 - Light Cyan
-    [255, 255, 255]   # P20 - White
+    [255, 255, 255],  # P20 - White
+    [0, 0, 0],        # P21 - Black
+    [128, 128, 128],  # P22 - Gray
+    [255, 128, 64],   # P23 - Light Orange
+    [128, 64, 255],   # P24 - Light Purple
+    [210, 105, 30],   # P25 - Chocolate
+    [128, 255, 64]    # P26 - Light Yellow
 ], dtype=np.uint8)
 
 assert NUM_POINTS <= len(point_colors), "Not enough colors defined for the number of points."
@@ -486,7 +522,7 @@ def draw_ui(frame, cam_idx):
                 # Draw a while square around annotated points
                 cv2.circle(frame, tuple(point.astype(int)), 5 + 2, (255, 255, 255), -1) # White outline for human
             cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[p_idx].tolist(), -1)
-            cv2.putText(frame, f"P{p_idx}", tuple(point.astype(int) + np.array([5, -5])), 
+            cv2.putText(frame, POINT_NAMES[p_idx], tuple(point.astype(int) + np.array([5, -5])), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
     cv2.putText(frame, video_names[cam_idx], (10, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -501,7 +537,7 @@ def create_control_window():
     texts = [
         f"Frame: {frame_idx}/{video_metadata['num_frames']}",
         f"Status: {'Paused' if paused else 'Playing'}",
-        f"Annotating Point: P{selected_point_idx}",
+        f"Annotating Point: {POINT_NAMES[selected_point_idx]}",
         "--- Controls ---",
         "space: play/pause",
         "n/b: next/prev frame",
@@ -514,19 +550,6 @@ def create_control_window():
         
     cv2.imshow("Controls", control_img)
 
-def load_annotations():
-    """Loads annotations from a file if available."""
-    global annotations
-    try:
-        loaded_annotations = np.load(os.path.join(DATA_FOLDER, 'annotations.npy'))
-        if loaded_annotations.shape == annotations.shape:
-            annotations = loaded_annotations
-            print("Annotations loaded successfully.")
-        else:
-            print("Loaded annotations shape mismatch.")
-    except FileNotFoundError:
-        print("No saved annotations found.")
-
 def reproj_3d(frame: np.ndarray, camera_idx: int):
     """Reprojects 3D points using the given camera parameters and displays the points on a new window."""
     points_3d = reconstructed_3d_points[frame_idx]  # (num_points, 3)
@@ -537,11 +560,11 @@ def reproj_3d(frame: np.ndarray, camera_idx: int):
     for i, point in enumerate(points_2d):
         if not np.isnan(point).any():
             cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[i].tolist(), -1)
-            cv2.putText(frame, f"P{i}", tuple(point.astype(int) + np.array([5, -5])), 
+            cv2.putText(frame, POINT_NAMES[i], tuple(point.astype(int) + np.array([5, -5])), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[i].tolist(), 2)
-    cv2.putText(frame, f"Camera {camera_idx} Reprojection", (10, 30), 
+    cv2.putText(frame, f"{video_names[camera_idx]} Reprojection", (10, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.imshow(f"Reprojected Camera {camera_idx}", frame)
+    cv2.imshow(f"{video_names[camera_idx]} Reprojection", frame)
 
 def create_camera_visual(
     cam_params: CameraParams,
@@ -623,12 +646,33 @@ def create_camera_visual(
 
     return scene_objects
 
+def save_state():
+    """Saves the current state of annotations and 3D points."""
+    np.save(os.path.join(DATA_FOLDER, 'annotations.npy'), annotations)
+    np.save(os.path.join(DATA_FOLDER, 'human_annotated.npy'), human_annotated)
+    np.save(os.path.join(DATA_FOLDER, 'reconstructed_3d_points.npy'), reconstructed_3d_points)
+    if best_individual is not None:
+        pickle.dump(best_individual, open(os.path.join(DATA_FOLDER, 'best_individual.pkl'), 'wb'))
+    print("State saved successfully.")
+
+def load_state():
+    """Loads the saved state of annotations and 3D points."""
+    global annotations, human_annotated, reconstructed_3d_points, best_individual
+    try:
+        annotations = np.load(os.path.join(DATA_FOLDER, 'annotations.npy'))
+        human_annotated = np.load(os.path.join(DATA_FOLDER, 'human_annotated.npy'))
+        reconstructed_3d_points = np.load(os.path.join(DATA_FOLDER, 'reconstructed_3d_points.npy'))
+        best_individual = pickle.load(open(os.path.join(DATA_FOLDER, 'best_individual.pkl'), 'rb'))
+        print("State loaded successfully.")
+    except FileNotFoundError as e:
+        print(f"Error loading state: {e}")
+
 # --- Main Loop ---
 def main():
     global frame_idx, paused, selected_point_idx, annotations, train_ga, population, best_individual, needs_3d_reconstruction
 
     load_videos()
-    load_annotations()  # Load annotations if available
+    load_state()  # Load previous state if available
 
     # Create windows and set mouse callbacks
     # Arrange windows in a grid
@@ -690,14 +734,25 @@ def main():
                     cam_params=cam,
                     scale=1.0,
                     color=point_colors[i % len(point_colors)],
-                    label=f"Cam {i+1}"
+                    label=video_names[i]
                 )
                 scene.extend(cam_viz)
             # Draw 3d points
             points_3d = reconstructed_3d_points[frame_idx]  # (num_points, 3)
             for i, point in enumerate(points_3d):
                 if not np.isnan(point).any():
-                    scene.append(SceneObject(type='point', coords=point, color=point_colors[i % len(point_colors)], label=f"P{i}"))
+                    scene.append(SceneObject(type='point', coords=point, color=point_colors[i % len(point_colors)], label=POINT_NAMES[i]))
+                from_name = POINT_NAMES[i] # e.g. thorax
+                for to in SKELETON[from_name]:
+                    # e.g. to = neck
+                    to_id = POINT_NAMES.index(to)
+                    if not np.isnan(point).any() and not np.isnan(points_3d[to_id]).any():
+                        scene.append(SceneObject(
+                            type='line',
+                            coords=np.array([point, points_3d[to_id]]),
+                            color=point_colors[i % len(point_colors)],
+                            label=None
+                        ))
 
         # prev_gray_frames = current_gray_frames
         if train_ga:
@@ -722,11 +777,9 @@ def main():
         elif key == ord(' '):
             paused = not paused
         elif key == ord('s'):
-            # Save annotations to a file
-            np.save(os.path.join(DATA_FOLDER, 'annotations.npy'), annotations)
-            print("Annotations saved.")
+            save_state()
         elif key == ord('l'):
-            load_annotations()  # Load annotations from file
+            load_state()
         elif key == ord('n'):
             paused = True
             if frame_idx < video_metadata['num_frames'] - 1:
