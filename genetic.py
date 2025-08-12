@@ -60,9 +60,12 @@ video_metadata = {
 # Shape: (num_frames, num_camera, num_points, 2) for (x, y) coordinates
 # Using np.nan for un-annotated points
 annotations = None
+human_annotated = None  # (num_frames, num_camera, num_points) boolean array indicating if a point is annotated
 
 # Shape: (num_frames, num_points, 3) for (X, Y, Z) coordinates
 reconstructed_3d_points = None
+needs_3d_reconstruction = False
+
 
 # UI and Control State
 frame_idx = 600
@@ -163,7 +166,7 @@ def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndar
 
 def load_videos():
     """Loads all videos from the specified data folder."""
-    global annotations, reconstructed_3d_points
+    global annotations, reconstructed_3d_points, human_annotated
     video_paths = sorted(glob.glob(os.path.join(DATA_FOLDER, VIDEO_FORMAT)))
     if not video_paths:
         print(f"Error: No videos found in '{DATA_FOLDER}/' with format '{VIDEO_FORMAT}'")
@@ -191,18 +194,63 @@ def load_videos():
     # Initialize data structures based on metadata
     annotations = np.full((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS, 2), np.nan, dtype=np.float32)
     reconstructed_3d_points = np.full((video_metadata['num_frames'], NUM_POINTS, 3), np.nan, dtype=np.float32)
+    human_annotated = np.zeros((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS), dtype=bool)
 
     print(f"Loaded {video_metadata['num_videos']} videos.")
     print(f"Resolution: {video_metadata['width']}x{video_metadata['height']}, Frames: {video_metadata['num_frames']}")
 
 
+# def mouse_callback(event, x, y, flags, param):
+#     """Handles mouse clicks for point annotation."""
+#     if event == cv2.EVENT_LBUTTONDOWN:
+#         cam_idx = param['cam_idx']
+#         annotations[frame_idx, cam_idx, selected_point_idx] = [x, y]
+#         human_annotated[frame_idx, cam_idx, selected_point_idx] = True
+#         print(f"Annotated P{selected_point_idx} on Cam {cam_idx} at frame {frame_idx}: ({x}, {y})")
+
+dragging_kp_idx = None
 def mouse_callback(event, x, y, flags, param):
-    """Handles mouse clicks for point annotation."""
-    global annotations
+    global selected_point_idx, dragging_kp_idx, needs_3d_reconstruction
+    cam_idx = param['cam_idx']
+    kp_idx = selected_point_idx
+
     if event == cv2.EVENT_LBUTTONDOWN:
-        cam_idx = param['cam_idx']
-        annotations[frame_idx, cam_idx, selected_point_idx] = [x, y]
-        print(f"Annotated P{selected_point_idx} on Cam {cam_idx} at frame {frame_idx}: ({x}, {y})")
+        # Check if clicking near an existing point to start dragging
+        min_dist = 10 # pixels
+        clicked_on_existing = False
+        dists = np.linalg.norm(annotations[frame_idx, cam_idx, :] - np.array([x, y]), axis=1) # (num_keypoints,)
+        # Find the closest visible keypoint
+        dists[np.isnan(dists)] = np.inf # Ignore NaN points
+        if np.min(dists) < min_dist:
+            clicked_on_existing = True
+            # Get the index of the closest keypoint
+            closest_kp_idx = np.argmin(dists)
+            selected_point_idx = closest_kp_idx
+            kp_idx = selected_point_idx
+
+        dragging_kp_idx = kp_idx
+        if not clicked_on_existing:
+            # Add new point
+            dragging_kp_idx = kp_idx
+            annotations[frame_idx, cam_idx, kp_idx] = (float(x), float(y))
+            human_annotated[frame_idx, cam_idx, kp_idx] = True
+        needs_3d_reconstruction = True
+
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if dragging_kp_idx == kp_idx:
+            annotations[frame_idx, cam_idx, kp_idx] = (float(x), float(y))
+            human_annotated[frame_idx, cam_idx, kp_idx] = True
+            needs_3d_reconstruction = True
+
+    elif event == cv2.EVENT_LBUTTONUP:
+        if dragging_kp_idx == kp_idx:
+            dragging_kp_idx = None
+            needs_3d_reconstruction = True
+
+    elif event == cv2.EVENT_RBUTTONDOWN: # Remove point
+        annotations[frame_idx, cam_idx, kp_idx] = np.nan
+        human_annotated[frame_idx, cam_idx, kp_idx] = False
+        needs_3d_reconstruction = True
 
 
 def track_points(prev_gray, current_gray, cam_idx):
@@ -434,6 +482,9 @@ def draw_ui(frame, cam_idx):
     for p_idx in range(NUM_POINTS):
         point = annotations[frame_idx, cam_idx, p_idx]
         if not np.isnan(point).any():
+            if human_annotated[frame_idx, cam_idx, p_idx]:
+                # Draw a while square around annotated points
+                cv2.circle(frame, tuple(point.astype(int)), 5 + 2, (255, 255, 255), -1) # White outline for human
             cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[p_idx].tolist(), -1)
             cv2.putText(frame, f"P{p_idx}", tuple(point.astype(int) + np.array([5, -5])), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
@@ -574,7 +625,7 @@ def create_camera_visual(
 
 # --- Main Loop ---
 def main():
-    global frame_idx, paused, selected_point_idx, annotations, train_ga, population, best_individual
+    global frame_idx, paused, selected_point_idx, annotations, train_ga, population, best_individual, needs_3d_reconstruction
 
     load_videos()
     load_annotations()  # Load annotations if available
@@ -586,7 +637,7 @@ def main():
     win_w = 400
     win_h = 300
     for i in range(video_metadata['num_videos']):
-        win_name = f"Camera {i+1}"
+        win_name = video_names[i]
         cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(win_name, mouse_callback, {'cam_idx': i})
         row = i // grid_cols
@@ -599,8 +650,6 @@ def main():
     prev_frame_idx = -1
     scene = []
     scene_viz = SceneVisualizer()
-
-    needs_3d_reconstruction = False
 
     while True:
         # Set all captures to the current frame index
@@ -662,9 +711,10 @@ def main():
 
         # --- Keyboard Controls ---
         # key = cv2.waitKey(1 if not paused else 0) & 0xFF
-        wait_time = 25 if train_ga else 500
-        if scene_viz.is_dragging:
-            wait_time = 1  # Fast updates while dragging
+        # wait_time = 25 if train_ga else 500
+        # if scene_viz.is_dragging:
+        #     wait_time = 1  # Fast updates while dragging
+        wait_time = 10
         key = cv2.waitKey(wait_time) & 0xFF
 
         if key == ord('q'):
