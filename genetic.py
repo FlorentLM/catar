@@ -249,8 +249,9 @@ def mouse_callback(event, x, y, flags, param):
     global selected_point_idx, dragging_kp_idx, needs_3d_reconstruction
     cam_idx = param['cam_idx']
     kp_idx = selected_point_idx
+    # print(f"Mouse event: {event}, Position: ({x}, {y}), Cam: {video_names[cam_idx]}, Point: {POINT_NAMES[kp_idx]}")
 
-    if event == cv2.EVENT_LBUTTONDOWN:
+    if event == cv2.EVENT_LBUTTONDOWN and flags & cv2.EVENT_FLAG_SHIFTKEY:
         # Check if clicking near an existing point to start dragging
         min_dist = 10 # pixels
         clicked_on_existing = False
@@ -263,22 +264,24 @@ def mouse_callback(event, x, y, flags, param):
             closest_kp_idx = np.argmin(dists)
             selected_point_idx = closest_kp_idx
             kp_idx = selected_point_idx
-
         dragging_kp_idx = kp_idx
+        print(f"Dragging {POINT_NAMES[kp_idx]} at ({x}, {y}) in Cam {cam_idx} at frame {frame_idx}")
+
         if not clicked_on_existing:
             # Add new point
-            dragging_kp_idx = kp_idx
             annotations[frame_idx, cam_idx, kp_idx] = (float(x), float(y))
             human_annotated[frame_idx, cam_idx, kp_idx] = True
+            print(f"Annotated {POINT_NAMES[kp_idx]} at ({x}, {y}) in Cam {cam_idx} at frame {frame_idx}")
         needs_3d_reconstruction = True
 
-    elif event == cv2.EVENT_MOUSEMOVE:
+    elif event == cv2.EVENT_MOUSEMOVE and flags & cv2.EVENT_FLAG_SHIFTKEY:
         if dragging_kp_idx == kp_idx:
             annotations[frame_idx, cam_idx, kp_idx] = (float(x), float(y))
             human_annotated[frame_idx, cam_idx, kp_idx] = True
             needs_3d_reconstruction = True
 
     elif event == cv2.EVENT_LBUTTONUP:
+        print(f"Released {POINT_NAMES[kp_idx]} at ({x}, {y}) in Cam {cam_idx} at frame {frame_idx}")
         if dragging_kp_idx == kp_idx:
             dragging_kp_idx = None
             needs_3d_reconstruction = True
@@ -558,7 +561,7 @@ def reproj_3d(frame: np.ndarray, camera_idx: int):
         return
     points_2d = reproject_points(points_3d, best_individual[camera_idx])  # (num_points, 2)
     for i, point in enumerate(points_2d):
-        if not np.isnan(point).any():
+        if not np.isnan(point).any() and (point > 0).all():
             cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[i].tolist(), -1)
             cv2.putText(frame, POINT_NAMES[i], tuple(point.astype(int) + np.array([5, -5])), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[i].tolist(), 2)
@@ -678,11 +681,11 @@ def main():
     # Arrange windows in a grid
     grid_cols = int(np.ceil(np.sqrt(video_metadata['num_videos'])))
     # grid_rows = int(np.ceil(video_metadata['num_videos'] / grid_cols))
-    win_w = 400
-    win_h = 300
+    win_w = 600
+    win_h = 500
     for i in range(video_metadata['num_videos']):
         win_name = video_names[i]
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(win_name)
         cv2.setMouseCallback(win_name, mouse_callback, {'cam_idx': i})
         row = i // grid_cols
         col = i % grid_cols
@@ -693,7 +696,7 @@ def main():
     prev_frames = [None] * video_metadata['num_videos']
     prev_frame_idx = -1
     scene = []
-    scene_viz = SceneVisualizer()
+    scene_viz = SceneVisualizer(frame_size=(video_metadata['width'], video_metadata['height']))
 
     while True:
         # Set all captures to the current frame index
