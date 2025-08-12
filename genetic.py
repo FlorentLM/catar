@@ -46,6 +46,7 @@ best_fitness_so_far = float('inf')  # Initialize to a very high value
 best_individual = None
 
 # --- Global State ---
+video_names = []
 video_captures = []
 video_metadata = {
     'width': 0,
@@ -162,7 +163,7 @@ def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndar
 
 def load_videos():
     """Loads all videos from the specified data folder."""
-    global video_captures, video_metadata, annotations, reconstructed_3d_points
+    global annotations, reconstructed_3d_points
     video_paths = sorted(glob.glob(os.path.join(DATA_FOLDER, VIDEO_FORMAT)))
     if not video_paths:
         print(f"Error: No videos found in '{DATA_FOLDER}/' with format '{VIDEO_FORMAT}'")
@@ -174,6 +175,7 @@ def load_videos():
             print(f"Error: Could not open video {path}")
             continue
         video_captures.append(cap)
+        video_names.append(os.path.basename(path))
 
     if not video_captures:
         print("Error: No videos were loaded successfully.")
@@ -435,7 +437,7 @@ def draw_ui(frame, cam_idx):
             cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[p_idx].tolist(), -1)
             cv2.putText(frame, f"P{p_idx}", tuple(point.astype(int) + np.array([5, -5])), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
-    cv2.putText(frame, f"Camera {cam_idx}", (10, 30), 
+    cv2.putText(frame, video_names[cam_idx], (10, 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return frame
 
@@ -626,7 +628,7 @@ def main():
         if not train_ga and not scene_viz.is_dragging:
             for i, frame in enumerate(current_frames):
                 frame_with_ui = draw_ui(frame.copy(), i)
-                cv2.imshow(f"Camera {i+1}", frame_with_ui)
+                cv2.imshow(video_names[i], frame_with_ui)
 
         if needs_3d_reconstruction and best_individual is not None:
             needs_3d_reconstruction = False
