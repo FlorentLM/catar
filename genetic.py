@@ -59,7 +59,9 @@ SKELETON = {
         "m_L0": [ "neck", "m_L1" ],
         "m_L1": [ "m_L0" ],
         "m_R0": [ "neck", "m_R1" ],
-        "m_R1": [ "m_R0" ]
+        "m_R1": [ "m_R0" ],
+        "s_small": [ "s_large" ],
+        "s_large": []
 }
 POINT_NAMES = list(SKELETON.keys())
 NUM_POINTS = len(POINT_NAMES)
@@ -101,11 +103,13 @@ needs_3d_reconstruction = False
 frame_idx = 600
 paused = True
 selected_point_idx = 0  # Default to P1
+focus_selected_point = False  # Whether to focus on the selected point in the visualization
 
 # Lucas-Kanade Optical Flow parameters
 lk_params = dict(winSize=(15, 15),
-                 maxLevel=2,
+                 maxLevel=5,
                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+tracking_enabled = False
 
 # Point colors
 point_colors = np.array([
@@ -134,7 +138,9 @@ point_colors = np.array([
     [255, 128, 64],   # P23 - Light Orange
     [128, 64, 255],   # P24 - Light Purple
     [210, 105, 30],   # P25 - Chocolate
-    [128, 255, 64]    # P26 - Light Yellow
+    [128, 255, 64],   # P26 - Light Yellow
+    [128, 64, 0],     # P27 - Brown
+    [64, 128, 255]   # P28 - Light Blue
 ], dtype=np.uint8)
 
 assert NUM_POINTS <= len(point_colors), "Not enough colors defined for the number of points."
@@ -298,6 +304,10 @@ def track_points(prev_gray, current_gray, cam_idx):
     # Get points from the previous frame that are valid
     p0 = annotations[frame_idx - 1, cam_idx, :, :]
     valid_points_indices = ~np.isnan(p0).any(axis=1)
+    if focus_selected_point:
+        # Only track the selected point
+        valid_points_indices[:] = False
+        valid_points_indices[selected_point_idx] = True
     
     if not np.any(valid_points_indices):
         return
@@ -317,7 +327,7 @@ def track_points(prev_gray, current_gray, cam_idx):
 
         for i, idx in enumerate(good_original_indices):
              # Only update if the point is not already manually annotated in the current frame
-            if np.isnan(annotations[frame_idx, cam_idx, idx, 0]):
+            if np.isnan(annotations[frame_idx, cam_idx, idx, 0]) and not human_annotated[frame_idx, cam_idx, idx]:
                 annotations[frame_idx, cam_idx, idx] = good_new[i]
 
 
@@ -414,7 +424,7 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
     proj_matrices = np.array(proj_matrices)  # (num_cams, 3, 4)
 
     # Find frames with at least one valid annotation to process.
-    valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3))
+    valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3)) & np.any(human_annotated, axis=(1, 2))
     valid_frame_indices = np.where(valid_frames_mask)[0]
 
     # --- Main Logic: Iterate by Frame, then Camera Pair ---
@@ -443,7 +453,7 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
             points_evaluated += np.sum(common_mask)  # Count how many points were evaluated
 
     if points_evaluated == 0:
-        return 0.0  # Return a very low fitness if no points could be evaluated.
+        return float('inf')  # No valid points to evaluate
         
     average_error = total_reprojection_error / points_evaluated
     # average_error = total_reprojection_error
@@ -517,39 +527,63 @@ def update_3d_reconstruction(best_params: List[CameraParams]):
 
 def draw_ui(frame, cam_idx):
     """Draws UI elements on the frame."""
+    if best_individual is not None:
+        reprojected = reproject_points(reconstructed_3d_points[frame_idx], best_individual[cam_idx])  # (num_points, 2)
     # Draw annotated points for the current frame
-    for p_idx in range(NUM_POINTS):
+    p_idxs = np.arange(NUM_POINTS) if not focus_selected_point else [selected_point_idx]
+    for p_idx in p_idxs:
         point = annotations[frame_idx, cam_idx, p_idx]
         if not np.isnan(point).any():
             if human_annotated[frame_idx, cam_idx, p_idx]:
                 # Draw a while square around annotated points
                 cv2.circle(frame, tuple(point.astype(int)), 5 + 2, (255, 255, 255), -1) # White outline for human
             cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[p_idx].tolist(), -1)
-            cv2.putText(frame, POINT_NAMES[p_idx], tuple(point.astype(int) + np.array([5, -5])), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
-    cv2.putText(frame, video_names[cam_idx], (10, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame, POINT_NAMES[p_idx], tuple(point.astype(int) + np.array([5, -5])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
+            # Reproject the 3D point back to 2D
+            if best_individual is None:
+                continue
+            point_2d_from_3d = reprojected[p_idx] # (2,)
+            if not np.isnan(point_2d_from_3d).any() and (point_2d_from_3d > 0).all():
+                # Draw a line from the reprojected point to the annotated point
+                cv2.line(frame, tuple(point.astype(int)), tuple(point_2d_from_3d.astype(int)), point_colors[p_idx].tolist(), 1)
+                # Euclidean distance text
+                distance = np.linalg.norm(point - point_2d_from_3d)
+                cv2.putText(frame, f"{distance:.2f}", tuple(point_2d_from_3d.astype(int) + np.array([5, -5])), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 1)
+    cv2.putText(frame, video_names[cam_idx], (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return frame
 
 def create_control_window():
     """Creates the control and info panel."""
-    w, h = 400, 200
-    control_img = np.zeros((h, w, 3), dtype=np.uint8)
-    
     # Display info
     texts = [
         f"Frame: {frame_idx}/{video_metadata['num_frames']}",
         f"Status: {'Paused' if paused else 'Playing'}",
         f"Annotating Point: {POINT_NAMES[selected_point_idx]}",
+        f"Focus on Point: {'Enabled' if focus_selected_point else 'Disabled'}",
+        f"Best Fitness: {best_fitness_so_far:.2f}",
+        f"Num Annotations: {np.sum(~np.isnan(annotations[frame_idx])) // 2} / {NUM_POINTS * len(video_names)}",
+        f"Num 3D Points: {np.sum(~np.isnan(reconstructed_3d_points[frame_idx]).any(axis=1))} / {NUM_POINTS}",
+        f"Tracking: {'Enabled' if tracking_enabled else 'Disabled'}",
         "--- Controls ---",
         "space: play/pause",
         "n/b: next/prev frame",
-        "1,2..: select point",
+        "j/k: next/prev keypoint",
+        "t: toggle tracking",
+        "u: run genetic algorithm",
         "q: quit",
-        "t: run genetic algorithm",
     ]
+    w, h = 300, len(texts) * 20 + 20
+    control_img = np.zeros((h, w, 3), dtype=np.uint8)
     for i, text in enumerate(texts):
-        cv2.putText(control_img, text, (10, 20 + i * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        colour = (255, 255, 255)
+        if "Annotating Point" in text:
+            # Highlight the currently selected point
+            colour = point_colors[selected_point_idx].tolist()
+        if "Enabled" in text or "Disabled" in text:
+            # Highlight tracking status
+            colour = (0, 255, 0) if "Enabled" in text else (0, 0, 255)
+        cv2.putText(control_img, text, (10, 20 + i * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1)
         
     cv2.imshow("Controls", control_img)
 
@@ -660,19 +694,21 @@ def save_state():
 
 def load_state():
     """Loads the saved state of annotations and 3D points."""
-    global annotations, human_annotated, reconstructed_3d_points, best_individual
+    global annotations, human_annotated, reconstructed_3d_points, best_individual, best_fitness_so_far
     try:
         annotations = np.load(os.path.join(DATA_FOLDER, 'annotations.npy'))
         human_annotated = np.load(os.path.join(DATA_FOLDER, 'human_annotated.npy'))
         reconstructed_3d_points = np.load(os.path.join(DATA_FOLDER, 'reconstructed_3d_points.npy'))
         best_individual = pickle.load(open(os.path.join(DATA_FOLDER, 'best_individual.pkl'), 'rb'))
+        best_fitness_so_far = fitness(best_individual, annotations)  # Recalculate fitness
         print("State loaded successfully.")
     except FileNotFoundError as e:
         print(f"Error loading state: {e}")
 
 # --- Main Loop ---
 def main():
-    global frame_idx, paused, selected_point_idx, annotations, train_ga, population, best_individual, needs_3d_reconstruction
+    global frame_idx, paused, selected_point_idx, annotations, train_ga, population, best_individual
+    global needs_3d_reconstruction, tracking_enabled, focus_selected_point
 
     load_videos()
     load_state()  # Load previous state if available
@@ -703,7 +739,8 @@ def main():
         current_frames = []
         if prev_frame_idx != frame_idx:
             for i, cap in enumerate(video_captures):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                if prev_frame_idx != frame_idx-1:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
                 ret, frame = cap.read()
                 if not ret:
                     print("End of video or error.")
@@ -711,25 +748,31 @@ def main():
                     frame_idx = max(0, frame_idx -1) # Go back one frame if at end
                     continue
                 current_frames.append(frame)
+
+            # If not paused and not the first frame, track points
+            if tracking_enabled and prev_frame_idx != -1 and prev_frame_idx == frame_idx - 1:
+                for i in range(video_metadata['num_videos']):
+                    prev_gray = cv2.cvtColor(prev_frames[i].copy(), cv2.COLOR_BGR2GRAY)
+                    gray_frame = cv2.cvtColor(current_frames[i].copy(), cv2.COLOR_BGR2GRAY)
+                    track_points(prev_gray, gray_frame, i)
+                    needs_3d_reconstruction = True  # Tracking may change points
+                if focus_selected_point:
+                    # Check if the selected point is annotated in the current frame in at least two cameras
+                    count = np.sum(~np.isnan(annotations[frame_idx, :, selected_point_idx, 0]))
+                    if count < 2:
+                        print(f"Selected point {POINT_NAMES[selected_point_idx]} is not annotated in at least two cameras. Please annotate more points.")
+                        paused = True
+
             prev_frame_idx = frame_idx
             prev_frames = current_frames
         else:
             current_frames = prev_frames  # Use previous frames if not changing index
 
-        # If not paused and not the first frame, track points
-        # if not paused and frame_idx > 0 and prev_gray_frames[i] is not None:
-        #     track_points(prev_gray_frames[i], gray_frame, i)
-
-        # Draw UI on frame
-        if not train_ga and not scene_viz.is_dragging:
-            for i, frame in enumerate(current_frames):
-                frame_with_ui = draw_ui(frame.copy(), i)
-                cv2.imshow(video_names[i], frame_with_ui)
-
         if needs_3d_reconstruction and best_individual is not None:
             needs_3d_reconstruction = False
             update_3d_reconstruction(best_individual)
-            reproj_3d(current_frames[4].copy(), 4)
+            # Debugging reprojection
+            # reproj_3d(current_frames[2].copy(), 2)
             scene = []
             for i, cam in enumerate(best_individual):
                 # Create a camera visualization object
@@ -757,11 +800,17 @@ def main():
                             label=None
                         ))
 
+        # Draw UI on frame
+        if not train_ga and not scene_viz.is_dragging:
+            for i, frame in enumerate(current_frames):
+                frame_with_ui = draw_ui(frame.copy(), i)
+                cv2.imshow(video_names[i], frame_with_ui)
+
         # prev_gray_frames = current_gray_frames
         if train_ga:
             run_genetic_step()
             needs_3d_reconstruction = True
-
+        
         # Update control and 3D plot windows
         create_control_window()
         cv2.imshow(scene_viz.window_name, scene_viz.draw_scene(scene))
@@ -783,6 +832,16 @@ def main():
             save_state()
         elif key == ord('l'):
             load_state()
+        elif key == ord('f'):
+            if focus_selected_point:
+                # Mark all previous frames as human-annotated for the selected point
+                human_annotated[:frame_idx + 1, :, selected_point_idx] = True
+            else:
+                human_annotated[:frame_idx + 1] = True  # Mark all previous frames as human-annotated
+            print("Marked all previous frames as human-annotated. You may want to save the state.")
+        elif key == ord('h'):
+            focus_selected_point = not focus_selected_point
+            print(f"Focus on selected point {'enabled' if focus_selected_point else 'disabled'}.")
         elif key == ord('n'):
             paused = True
             if frame_idx < video_metadata['num_frames'] - 1:
@@ -791,7 +850,7 @@ def main():
             paused = True
             if frame_idx > 0:
                 frame_idx -= 1
-        elif key == ord('t'):
+        elif key == ord('u'):
             paused = True
             train_ga = not train_ga
             if train_ga:
@@ -800,6 +859,9 @@ def main():
                 #     run_genetic_step()
         elif key == ord('r'):
             population = []
+        elif key == ord('t'):
+            tracking_enabled = not tracking_enabled
+            print(f"Tracking {'enabled' if tracking_enabled else 'disabled'}.")
         elif ord('1') <= key <= ord('9'):
             point_num = key - ord('1')
             if point_num < NUM_POINTS:
