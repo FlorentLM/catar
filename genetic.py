@@ -63,6 +63,10 @@ SKELETON = {
         "s_small": [ "s_large" ],
         "s_large": []
 }
+GROUND_PLANE_POINTS = [
+    "leg_m_R2", "leg_m_L2", "leg_f_R2", "leg_f_L2",
+]
+GROUND_PLANE_INDICES = np.array([list(SKELETON.keys()).index(p) for p in GROUND_PLANE_POINTS if p in SKELETON.keys()]) # (len(GROUND_PLANE_POINTS),)
 POINT_NAMES = list(SKELETON.keys())
 NUM_POINTS = len(POINT_NAMES)
 
@@ -451,6 +455,12 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
             error = np.sqrt(np.sum(error, axis=1))  # Euclidean distance
             total_reprojection_error += np.sum(error)
             points_evaluated += np.sum(common_mask)  # Count how many points were evaluated
+        # Add error for ground plane points
+        # ground_mask = valid_3d_mask & np.isin(np.arange(NUM_POINTS), GROUND_PLANE_INDICES) # (num_points,)
+        # ground_points_3d = points_3d[ground_mask]  # (num_ground_points, 3)
+        # Penalize the y up axis deviation from 0
+        # ground_error = np.sum(np.abs(ground_points_3d[:, 1]))
+        # total_reprojection_error += ground_error*1000
 
     if points_evaluated == 0:
         return float('inf')  # No valid points to evaluate
