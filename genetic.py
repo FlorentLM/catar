@@ -104,7 +104,7 @@ needs_3d_reconstruction = False
 
 
 # UI and Control State
-frame_idx = 600
+frame_idx = 300
 paused = True
 selected_point_idx = 0  # Default to P1
 focus_selected_point = False  # Whether to focus on the selected point in the visualization
@@ -173,28 +173,28 @@ def get_projection_matrix(cam_params: CameraParams) -> np.ndarray:
 
 def combination_triangulate(frame_annotations: np.ndarray, proj_matrices: np.ndarray) -> np.ndarray:
     """Triangulates 3D points from 2D correspondences using multiple camera views."""
-    # frame_annotations: (num_videos, num_points, 2) and proj_matrices: (num_videos, 3, 4)
-    # returns (points_3d: (num_points, 3))
-    assert frame_annotations.shape[0] == proj_matrices.shape[0], "Number of cameras must match annotations."
-    combs = list(itertools.combinations(range(frame_annotations.shape[0]), 2))
+    # frame_annotations: (num_frames, num_cams, num_points, 2) and proj_matrices: (num_cams, 3, 4)
+    # returns (points_3d: (num_frames, num_points, 3))
+    assert frame_annotations.shape[1] == proj_matrices.shape[0], "Number of cameras must match annotations."
+    combs = list(itertools.combinations(range(proj_matrices.shape[0]), 2))
     # Every combination makes a prediction, some combinations may not have enough points to triangulate
-    points_3d = np.full((len(combs), frame_annotations.shape[1], 3), np.nan, dtype=np.float32)  # (num_combs, num_points, 3)
+    points_3d = np.full((frame_annotations.shape[0], len(combs), frame_annotations.shape[2], 3), np.nan, dtype=np.float32)  # (num_frames, num_combs, num_points, 3)
     for idx, (i, j) in enumerate(combs):
         # Get 2D points from both cameras
-        p1_2d = frame_annotations[i] # (num_points, 2)
-        p2_2d = frame_annotations[j] # (num_points, 2)
-        common_mask = ~np.isnan(p1_2d).any(axis=1) & ~np.isnan(p2_2d).any(axis=1)  # (num_points,)
+        p1_2d = frame_annotations[:, i] # (num_frames, num_points, 2)
+        p2_2d = frame_annotations[:, j] # (num_frames, num_points, 2)
+        common_mask = ~np.isnan(p1_2d).any(axis=2) & ~np.isnan(p2_2d).any(axis=2)  # (num_frames, num_points,)
         if not np.any(common_mask):
             continue
         # Prepare 2D points for triangulation (requires shape [2, N])
         p1_2d = p1_2d[common_mask] # (num_common_points, 2)
         p2_2d = p2_2d[common_mask] # (num_common_points, 2)
         # Expects (3, 4) project matrices and (2, N) points
-        points_4d_hom = cv2.triangulatePoints(proj_matrices[i], proj_matrices[j], p1_2d.T, p2_2d.T) # (4, N) homogenous coordinates
-        triangulated_3d = (points_4d_hom[:3] / points_4d_hom[3]).T  # Convert to 3D coordinates (N, 3)
-        points_3d[idx, common_mask] = triangulated_3d
+        points_4d_hom = cv2.triangulatePoints(proj_matrices[i], proj_matrices[j], p1_2d.T, p2_2d.T) # (4, num_common_points) homogenous coordinates
+        triangulated_3d = (points_4d_hom[:3] / points_4d_hom[3]).T  # Convert to 3D coordinates (num_common_points, 3)
+        points_3d[:, idx][common_mask] = triangulated_3d
     # Average the triangulated points across all combinations
-    average = np.nanmean(points_3d, axis=0)  # (num_points, 3)
+    average = np.nanmean(points_3d, axis=1)  # (num_frames, num_points, 3)
     return average
 
 def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndarray:
@@ -428,39 +428,37 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
     proj_matrices = np.array(proj_matrices)  # (num_cams, 3, 4)
 
     # Find frames with at least one valid annotation to process.
-    valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3)) & np.any(human_annotated, axis=(1, 2))
-    valid_frame_indices = np.where(valid_frames_mask)[0]
+    valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3)) & np.any(human_annotated, axis=(1, 2)) # (num_frames,)
+    # Limit maximum number of frames to process across the full video range
+    # max_frames_to_process = 100
+    # random_mask = np.random.uniform(0, 1, size=valid_frames_mask.shape) < (max_frames_to_process / np.sum(valid_frames_mask)) if np.sum(valid_frames_mask) > max_frames_to_process else np.ones_like(valid_frames_mask, dtype=bool)
+    # valid_frames_mask = valid_frames_mask & random_mask  # Apply random mask to valid frames
+    # valid_frames_mask[:] = False
+    # valid_frames_mask[600] = True
+    valid_annotations = annotations[valid_frames_mask]  # (num_valid_frames, num_cams, num_points, 2)
+    undistorted_annotations = np.full_like(valid_annotations, np.nan, dtype=np.float32)  # (num_valid_frames, num_cams, num_points, 2)
 
-    # --- Main Logic: Iterate by Frame, then Camera Pair ---
-    for f_idx in valid_frame_indices:
-        frame_annotations = annotations[f_idx]  # (num_cams, num_points, 2)
-        undistorted_annotations = np.full_like(frame_annotations, np.nan, dtype=np.float32)
-        for c in range(num_cams):
-            camera_annotations = frame_annotations[c] # (num_points, 2)
-            valid_2d_mask = ~np.isnan(camera_annotations).any(axis=1) # (num_points,)
-            valid_2d_points = camera_annotations[valid_2d_mask]  # (num_valid_points, 2)
-            undistorted_camera_anns = undistorted_annotations[c] # (num_points, 2)
-            undistorted_camera_anns[valid_2d_mask] = cv2.undistortPoints(valid_2d_points.reshape(-1, 1, 2), get_camera_matrix(individual[c]), individual[c]['dist']).reshape(-1, 2)
-        points_3d = combination_triangulate(undistorted_annotations, proj_matrices)  # (num_points, 3)
-        valid_3d_mask = ~np.isnan(points_3d).any(axis=1)  # (num_points,)
-        for c in range(num_cams):
-            camera_annotations = frame_annotations[c]  # (num_points, 2)
-            valid_2d_mask = ~np.isnan(camera_annotations).any(axis=1) # (num_points,)
-            common_mask = valid_3d_mask & valid_2d_mask  # Points that are valid in both 3D and 2D
-            valid_3d_points = points_3d[common_mask]  # (num_valid_points, 3)
-            valid_2d_points = camera_annotations[common_mask]  # (num_valid_points, 2)
-            reprojected = reproject_points(valid_3d_points, individual[c]) # (num_valid_points, 2)
-            # Calculate the reprojection error for valid points
-            error = np.square(reprojected - valid_2d_points)
-            error = np.sqrt(np.sum(error, axis=1))  # Euclidean distance
-            total_reprojection_error += np.sum(error)
-            points_evaluated += np.sum(common_mask)  # Count how many points were evaluated
-        # Add error for ground plane points
-        # ground_mask = valid_3d_mask & np.isin(np.arange(NUM_POINTS), GROUND_PLANE_INDICES) # (num_points,)
-        # ground_points_3d = points_3d[ground_mask]  # (num_ground_points, 3)
-        # Penalize the y up axis deviation from 0
-        # ground_error = np.sum(np.abs(ground_points_3d[:, 1]))
-        # total_reprojection_error += ground_error*1000
+    for c in range(num_cams):
+        valid_2d_mask = ~np.isnan(valid_annotations[:, c]).any(axis=-1)  # (num_valid_frames, num_points)
+        if not np.any(valid_2d_mask):
+            continue
+        valid_2d_points = valid_annotations[:, c][valid_2d_mask]  # (num_valid_frames, num_valid_points, 2)
+        undistorted = cv2.undistortPoints(valid_2d_points.reshape(-1, 1, 2), get_camera_matrix(individual[c]), individual[c]['dist']).reshape(valid_2d_points.shape)
+        undistorted_annotations[:, c][valid_2d_mask] = undistorted  # (num_valid_frames, num_points, 2)
+    points_3d = combination_triangulate(undistorted_annotations, proj_matrices) # (num_valid_frames, num_points, 3)
+    valid_3d_mask = ~np.isnan(points_3d).any(axis=-1)  # (num_valid_frames, num_points)
+    for c in range(num_cams):
+        # Reproject 3d points back to 2d for this camera
+        valid_2d_mask = ~np.isnan(valid_annotations[:, c]).any(axis=-1)  # (num_valid_frames, num_points)
+        common_mask = valid_3d_mask & valid_2d_mask  # Points that are valid in both 3D and 2D
+        valid_3d_points = points_3d[common_mask]  # (num_common_points, 3)
+        valid_2d_points = valid_annotations[:, c][common_mask]  # (num_common_points, 2)
+        reprojected = reproject_points(valid_3d_points, individual[c]) # (num_common_points, 2)
+        # Calculate the reprojection error for valid points
+        error = np.square(reprojected - valid_2d_points)
+        error = np.sqrt(np.sum(error, axis=1))  # Euclidean distance
+        total_reprojection_error += np.sum(error)
+        points_evaluated += np.sum(common_mask)  # Count how many points were evaluated
 
     if points_evaluated == 0:
         return float('inf')  # No valid points to evaluate
@@ -530,7 +528,7 @@ def update_3d_reconstruction(best_params: List[CameraParams]):
     """Uses the best camera parameters to reconstruct all 3D points in the current frame."""
     proj_matrices = np.array([get_projection_matrix(i) for i in best_params])
     frame_annotations = annotations[frame_idx]  # (num_cams, num_points, 2)
-    points_3d = combination_triangulate(frame_annotations, proj_matrices)  # (num_points, 3)
+    points_3d = combination_triangulate(frame_annotations[None], proj_matrices)[0]  # (num_points, 3)
     reconstructed_3d_points[frame_idx] = points_3d  # Update the global 3D points for this frame
 
 # --- Visualization ---
@@ -842,14 +840,14 @@ def main():
             save_state()
         elif key == ord('l'):
             load_state()
-        elif key == ord('f'):
+        elif key == ord('h'):
             if focus_selected_point:
                 # Mark all previous frames as human-annotated for the selected point
                 human_annotated[:frame_idx + 1, :, selected_point_idx] = True
             else:
                 human_annotated[:frame_idx + 1] = True  # Mark all previous frames as human-annotated
             print("Marked all previous frames as human-annotated. You may want to save the state.")
-        elif key == ord('h'):
+        elif key == ord('f'):
             focus_selected_point = not focus_selected_point
             print(f"Focus on selected point {'enabled' if focus_selected_point else 'disabled'}.")
         elif key == ord('n'):
