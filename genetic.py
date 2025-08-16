@@ -110,9 +110,9 @@ selected_point_idx = 0  # Default to P1
 focus_selected_point = False  # Whether to focus on the selected point in the visualization
 
 # Lucas-Kanade Optical Flow parameters
-lk_params = dict(winSize=(15, 15),
-                 maxLevel=5,
-                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+lk_params = dict(winSize=(9, 9),
+                 maxLevel=2,
+                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01))
 tracking_enabled = False
 
 # Point colors
@@ -331,7 +331,7 @@ def track_points(prev_gray, current_gray, cam_idx):
 
         for i, idx in enumerate(good_original_indices):
              # Only update if the point is not already manually annotated in the current frame
-            if np.isnan(annotations[frame_idx, cam_idx, idx, 0]) and not human_annotated[frame_idx, cam_idx, idx]:
+            if np.isnan(annotations[frame_idx, cam_idx, idx]).any() or not human_annotated[frame_idx, cam_idx, idx]:
                 annotations[frame_idx, cam_idx, idx] = good_new[i]
 
 
@@ -429,6 +429,10 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
 
     # Find frames with at least one valid annotation to process.
     valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3)) & np.any(human_annotated, axis=(1, 2)) # (num_frames,)
+    # (num_frames,) For each frame, calculate the number of annotations for that frame
+    annotation_count = np.sum(~np.isnan(annotations), axis=(1, 2, 3))  # (num_frames,)
+    most_annotated_frames = np.argsort(annotation_count)[-10:]  # Get indices of the 100 frames with the most annotations
+    valid_frames_mask = np.isin(np.arange(len(valid_frames_mask)), most_annotated_frames)
     # Limit maximum number of frames to process across the full video range
     # max_frames_to_process = 100
     # random_mask = np.random.uniform(0, 1, size=valid_frames_mask.shape) < (max_frames_to_process / np.sum(valid_frames_mask)) if np.sum(valid_frames_mask) > max_frames_to_process else np.ones_like(valid_frames_mask, dtype=bool)
@@ -725,8 +729,8 @@ def main():
     # Arrange windows in a grid
     grid_cols = int(np.ceil(np.sqrt(video_metadata['num_videos'])))
     # grid_rows = int(np.ceil(video_metadata['num_videos'] / grid_cols))
-    win_w = 600
-    win_h = 500
+    win_w = 700
+    win_h = 550    
     for i in range(video_metadata['num_videos']):
         win_name = video_names[i]
         cv2.namedWindow(win_name)
@@ -741,6 +745,7 @@ def main():
     prev_frame_idx = -1
     scene = []
     scene_viz = SceneVisualizer(frame_size=(video_metadata['width'], video_metadata['height']))
+    show_3d_viz = True
 
     while True:
         # Set all captures to the current frame index
@@ -757,13 +762,13 @@ def main():
                     continue
                 current_frames.append(frame)
 
+            needs_3d_reconstruction = True  # Tracking may change points
             # If not paused and not the first frame, track points
             if tracking_enabled and prev_frame_idx != -1 and prev_frame_idx == frame_idx - 1:
                 for i in range(video_metadata['num_videos']):
                     prev_gray = cv2.cvtColor(prev_frames[i].copy(), cv2.COLOR_BGR2GRAY)
                     gray_frame = cv2.cvtColor(current_frames[i].copy(), cv2.COLOR_BGR2GRAY)
                     track_points(prev_gray, gray_frame, i)
-                    needs_3d_reconstruction = True  # Tracking may change points
                 if focus_selected_point:
                     # Check if the selected point is annotated in the current frame in at least two cameras
                     count = np.sum(~np.isnan(annotations[frame_idx, :, selected_point_idx, 0]))
@@ -821,8 +826,8 @@ def main():
         
         # Update control and 3D plot windows
         create_control_window()
-        cv2.imshow(scene_viz.window_name, scene_viz.draw_scene(scene))
-
+        if show_3d_viz:
+            cv2.imshow(scene_viz.window_name, scene_viz.draw_scene(scene))
 
         # --- Keyboard Controls ---
         # key = cv2.waitKey(1 if not paused else 0) & 0xFF
@@ -836,6 +841,13 @@ def main():
             break
         elif key == ord(' '):
             paused = not paused
+        elif key == ord('v'):
+            show_3d_viz = not show_3d_viz
+            if show_3d_viz:
+                print("Showing 3D visualization.")
+            else:
+                print("Hiding 3D visualization.")
+                cv2.destroyWindow(scene_viz.window_name)
         elif key == ord('s'):
             save_state()
         elif key == ord('l'):
@@ -844,9 +856,7 @@ def main():
             if focus_selected_point:
                 # Mark all previous frames as human-annotated for the selected point
                 human_annotated[:frame_idx + 1, :, selected_point_idx] = True
-            else:
-                human_annotated[:frame_idx + 1] = True  # Mark all previous frames as human-annotated
-            print("Marked all previous frames as human-annotated. You may want to save the state.")
+                print(f"Marked all previous frames as human-annotated for point {POINT_NAMES[selected_point_idx]}.")
         elif key == ord('f'):
             focus_selected_point = not focus_selected_point
             print(f"Focus on selected point {'enabled' if focus_selected_point else 'disabled'}.")
@@ -858,6 +868,22 @@ def main():
             paused = True
             if frame_idx > 0:
                 frame_idx -= 1
+        elif key == ord('d'):
+            if focus_selected_point:
+                annotations[frame_idx:, :, selected_point_idx] = np.nan
+                human_annotated[frame_idx:, :, selected_point_idx] = False
+                print(f"Deleted annotations for point {POINT_NAMES[selected_point_idx]} from frame {frame_idx} onwards.")
+        elif key == ord('g'):
+            goto_frame_number = input("Enter frame number to go to: ")
+            try:
+                goto_frame_number = int(goto_frame_number)
+                if 0 <= goto_frame_number < video_metadata['num_frames']:
+                    frame_idx = goto_frame_number
+                    paused = True
+                else:
+                    print(f"Frame number must be between 0 and {video_metadata['num_frames'] - 1}.")
+            except ValueError:
+                print("Invalid frame number. Please enter a valid integer.")
         elif key == ord('u'):
             paused = True
             train_ga = not train_ga
