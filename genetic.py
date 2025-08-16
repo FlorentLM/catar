@@ -23,6 +23,7 @@ import os
 import cv2
 import numpy as np
 import pickle
+import json
 import glob
 import random
 import itertools
@@ -97,11 +98,11 @@ video_metadata = {
 # Using np.nan for un-annotated points
 annotations = None
 human_annotated = None  # (num_frames, num_camera, num_points) boolean array indicating if a point is annotated
+calibration_frames = []  # Frames selected for calibration, empty if not set
 
 # Shape: (num_frames, num_points, 3) for (X, Y, Z) coordinates
 reconstructed_3d_points = None
 needs_3d_reconstruction = False
-
 
 # UI and Control State
 frame_idx = 300
@@ -429,16 +430,9 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
 
     # Find frames with at least one valid annotation to process.
     valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3)) & np.any(human_annotated, axis=(1, 2)) # (num_frames,)
-    # (num_frames,) For each frame, calculate the number of annotations for that frame
-    annotation_count = np.sum(~np.isnan(annotations), axis=(1, 2, 3))  # (num_frames,)
-    most_annotated_frames = np.argsort(annotation_count)[-10:]  # Get indices of the 100 frames with the most annotations
-    valid_frames_mask = np.isin(np.arange(len(valid_frames_mask)), most_annotated_frames)
-    # Limit maximum number of frames to process across the full video range
-    # max_frames_to_process = 100
-    # random_mask = np.random.uniform(0, 1, size=valid_frames_mask.shape) < (max_frames_to_process / np.sum(valid_frames_mask)) if np.sum(valid_frames_mask) > max_frames_to_process else np.ones_like(valid_frames_mask, dtype=bool)
-    # valid_frames_mask = valid_frames_mask & random_mask  # Apply random mask to valid frames
-    # valid_frames_mask[:] = False
-    # valid_frames_mask[600] = True
+    calibration_frames_mask = np.zeros_like(valid_frames_mask, dtype=bool)  # (num_frames,)
+    calibration_frames_mask[calibration_frames] = True  # Mark calibration frames as valid
+    valid_frames_mask = valid_frames_mask & calibration_frames_mask  # Only consider frames that are both valid and in the calibration set
     valid_annotations = annotations[valid_frames_mask]  # (num_valid_frames, num_cams, num_points, 2)
     undistorted_annotations = np.full_like(valid_annotations, np.nan, dtype=np.float32)  # (num_valid_frames, num_cams, num_points, 2)
 
@@ -577,6 +571,7 @@ def create_control_window():
         f"Num Annotations: {np.sum(~np.isnan(annotations[frame_idx])) // 2} / {NUM_POINTS * len(video_names)}",
         f"Num 3D Points: {np.sum(~np.isnan(reconstructed_3d_points[frame_idx]).any(axis=1))} / {NUM_POINTS}",
         f"Tracking: {'Enabled' if tracking_enabled else 'Disabled'}",
+        f"Num Calibration Frames: {len(calibration_frames)}",
         "--- Controls ---",
         "space: play/pause",
         "n/b: next/prev frame",
@@ -700,17 +695,19 @@ def save_state():
     np.save(os.path.join(DATA_FOLDER, 'annotations.npy'), annotations)
     np.save(os.path.join(DATA_FOLDER, 'human_annotated.npy'), human_annotated)
     np.save(os.path.join(DATA_FOLDER, 'reconstructed_3d_points.npy'), reconstructed_3d_points)
+    json.dump(calibration_frames, open(os.path.join(DATA_FOLDER, 'calibration_frames.json'), 'w'))
     if best_individual is not None:
         pickle.dump(best_individual, open(os.path.join(DATA_FOLDER, 'best_individual.pkl'), 'wb'))
     print("State saved successfully.")
 
 def load_state():
     """Loads the saved state of annotations and 3D points."""
-    global annotations, human_annotated, reconstructed_3d_points, best_individual, best_fitness_so_far
+    global annotations, human_annotated, reconstructed_3d_points, best_individual, best_fitness_so_far, calibration_frames
     try:
         annotations = np.load(os.path.join(DATA_FOLDER, 'annotations.npy'))
         human_annotated = np.load(os.path.join(DATA_FOLDER, 'human_annotated.npy'))
         reconstructed_3d_points = np.load(os.path.join(DATA_FOLDER, 'reconstructed_3d_points.npy'))
+        calibration_frames = json.load(open(os.path.join(DATA_FOLDER, 'calibration_frames.json')))
         best_individual = pickle.load(open(os.path.join(DATA_FOLDER, 'best_individual.pkl'), 'rb'))
         best_fitness_so_far = fitness(best_individual, annotations)  # Recalculate fitness
         print("State loaded successfully.")
@@ -854,7 +851,6 @@ def main():
             load_state()
         elif key == ord('h'):
             if focus_selected_point:
-                # Mark all previous frames as human-annotated for the selected point
                 human_annotated[:frame_idx + 1, :, selected_point_idx] = True
                 print(f"Marked all previous frames as human-annotated for point {POINT_NAMES[selected_point_idx]}.")
         elif key == ord('f'):
@@ -887,10 +883,6 @@ def main():
         elif key == ord('u'):
             paused = True
             train_ga = not train_ga
-            if train_ga:
-                print("Training Genetic Algorithm...")
-                # for _ in range(100):
-                #     run_genetic_step()
         elif key == ord('r'):
             population = []
         elif key == ord('t'):
@@ -908,6 +900,14 @@ def main():
         elif key == ord('k'):
             selected_point_idx = (selected_point_idx - 1) % NUM_POINTS
             print(f"Selected point P{selected_point_idx} for annotation.")
+        elif key == ord('c'):
+            # Toggle calibration frame for the current frame
+            if frame_idx in calibration_frames:
+                calibration_frames.remove(frame_idx)
+                print(f"Frame {frame_idx} removed from calibration frames.")
+            else:
+                calibration_frames.append(frame_idx)
+                print(f"Frame {frame_idx} added to calibration frames.")
 
         # If playing, advance frame
         if not paused:
