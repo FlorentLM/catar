@@ -27,7 +27,7 @@ import json
 import glob
 import random
 import itertools
-import pprint
+from pprint import pprint
 from tqdm import tqdm
 from typing import TypedDict, List, Tuple, Optional
 from viz_3d import SceneObject, SceneVisualizer
@@ -530,7 +530,7 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
     # Fitness is the error
     return average_error
 
-def find_worst_reprojections(top_k=10):
+def calculate_all_reprojection_errors() -> List[dict]:
     """Finds the top_k worst reprojection errors across all frames, cameras, and points."""
     # Check if the camera parameters (best_individual) are available
     if 'best_individual' not in globals() or best_individual is None:
@@ -597,14 +597,31 @@ def find_worst_reprojections(top_k=10):
 
     # Sort the collected errors in descending order to find the largest ones
     sorted_errors = sorted(all_errors, key=lambda x: x['error'], reverse=True)
+    return sorted_errors
 
-    # Return the top k results
+def find_worst_frame():
+    """Finds the frame with the worst reprojection error."""
+    sorted_errors = calculate_all_reprojection_errors()
+    frame_errors = {}
+    for e in sorted_errors:
+        if e['frame'] in calibration_frames:
+            continue
+        frame_errors.setdefault(e['frame'], 0)
+        frame_errors[e['frame']] += e['error']
+    sorted_frame_errors = sorted(frame_errors.items(), key=lambda x: x[1], reverse=True) # (frame, total_error)
+    print("Worst frames by total reprojection error:")
+    pprint(sorted_frame_errors[:10])  # Print top 10 worst frames
+    global frame_idx
+    frame_idx = sorted_frame_errors[0][0] if sorted_frame_errors else 0
+
+def find_worst_reprojection():
+    sorted_errors = calculate_all_reprojection_errors()
     # Compute mean error across all cameras and points
     mean_error = np.mean([e['error'] for e in sorted_errors])
     print(f"Mean reprojection error across all cameras and points: {mean_error:.2f}")
     global frame_idx, selected_point_idx
     if len(sorted_errors) > 0:
-        pprint.pprint(sorted_errors[0])
+        pprint(sorted_errors[0])
         frame_idx = sorted_errors[0]['frame']
         selected_point_idx = POINT_NAMES.index(sorted_errors[0]['point'])
 
@@ -1038,7 +1055,9 @@ def main():
                 selected_point_idx = point_num
                 print(f"Selected point P{selected_point_idx} for annotation.")
         elif key == ord('w'):
-            find_worst_reprojections()
+            find_worst_reprojection()
+        elif key == ord('e'):
+            find_worst_frame()
         # Cycle through points
         elif key == ord('j'):
             selected_point_idx = (selected_point_idx + 1) % NUM_POINTS
