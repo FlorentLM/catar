@@ -893,7 +893,8 @@ def load_state():
 # --- Main Loop ---
 def main():
     global frame_idx, paused, selected_point_idx, annotations, train_ga, population, best_individual
-    global needs_3d_reconstruction, tracking_enabled, focus_selected_point
+    global needs_3d_reconstruction, tracking_enabled, focus_selected_point, best_fitness_so_far
+    global save_output_video
 
     load_videos()
     load_state()  # Load previous state if available
@@ -919,6 +920,13 @@ def main():
     scene = []
     scene_viz = SceneVisualizer(frame_size=(video_metadata['width'], video_metadata['height']))
     show_3d_viz = True
+
+    video_save_output = None
+    last_written_frame = -1
+    num_columns = 3
+    num_videos = len(video_names) + 1 # +1 for the 3D visualization
+    num_rows = num_videos // num_columns + (1 if num_videos % num_columns > 0 else 0)
+    video_recording_buffer = np.zeros((video_metadata['height']*num_rows, video_metadata['width']*num_columns, 3), dtype=np.uint8)
 
     while True:
         # Set all captures to the current frame index
@@ -990,6 +998,12 @@ def main():
         if not scene_viz.is_dragging:
             for i, frame in enumerate(current_frames):
                 frame_with_ui = draw_ui(frame.copy(), i)
+                # Place the frame in the recording buffer
+                row = i // num_columns
+                col = i % num_columns
+                y_start = row * video_metadata['height']
+                x_start = col * video_metadata['width']
+                video_recording_buffer[y_start:y_start + video_metadata['height'], x_start:x_start + video_metadata['width']] = frame_with_ui
                 cv2.imshow(video_names[i], frame_with_ui)
 
         # prev_gray_frames = current_gray_frames
@@ -1000,7 +1014,19 @@ def main():
         # Update control and 3D plot windows
         create_control_window()
         if show_3d_viz:
-            cv2.imshow(scene_viz.window_name, scene_viz.draw_scene(scene))
+            viz_3d_frame = scene_viz.draw_scene(scene)
+            # Place the 3D visualization in the recording buffer
+            row = (num_videos-1) // num_columns
+            col = (num_videos-1) % num_columns
+            y_start = row * video_metadata['height']
+            x_start = col * video_metadata['width']
+            video_recording_buffer[y_start:y_start + video_metadata['height'], x_start:x_start + video_metadata['width']] = viz_3d_frame
+            cv2.imshow(scene_viz.window_name, viz_3d_frame)
+        
+        if save_output_video and video_save_output is not None and last_written_frame != frame_idx:
+            # Save the current frame to the video output
+            video_save_output.write(video_recording_buffer)
+            last_written_frame = frame_idx
 
         # --- Keyboard Controls ---
         # key = cv2.waitKey(1 if not paused else 0) & 0xFF
@@ -1060,6 +1086,17 @@ def main():
             paused = True
             train_ga = not train_ga
         elif key == ord('r'):
+            save_output_video = not save_output_video
+            print(f"Output video recording {'enabled' if save_output_video else 'disabled'}.")
+            if save_output_video:
+                # Initialize video writer
+                fourcc = cv2.VideoWriter_fourcc(*'hvc1')
+                output_filename = 'recording.mp4'
+                video_save_output = cv2.VideoWriter(output_filename, fourcc, 30.0, 
+                                                    (video_metadata['width'] * num_columns, 
+                                                     video_metadata['height'] * num_rows))
+                print(f"Output video will be saved to {output_filename}.")
+        elif key == ord('p'):
             population = []
         elif key == ord('t'):
             tracking_enabled = not tracking_enabled
@@ -1099,6 +1136,8 @@ def main():
     # Cleanup
     for cap in video_captures:
         cap.release()
+    if video_save_output is not None:
+        video_save_output.release()
     cv2.destroyAllWindows()
     print("Exiting application.")
 
