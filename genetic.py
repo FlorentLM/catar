@@ -31,6 +31,8 @@ from tqdm import tqdm
 from typing import TypedDict, List, Tuple, Optional
 from viz_3d import SceneObject, SceneVisualizer
 
+np.set_printoptions(precision=3, suppress=True, linewidth=120)
+
 # --- Configuration ---
 DATA_FOLDER = 'data'
 VIDEO_FORMAT = '*.mp4'
@@ -72,7 +74,7 @@ POINT_NAMES = list(SKELETON.keys())
 NUM_POINTS = len(POINT_NAMES)
 
 # Genetic Algorithm Parameters
-POPULATION_SIZE = 200 
+POPULATION_SIZE = 400
 ELITISM_RATE = 0.1 # Keep the top 10%
 
 # GA State
@@ -172,6 +174,17 @@ def get_projection_matrix(cam_params: CameraParams) -> np.ndarray:
     R, _ = cv2.Rodrigues(cam_params['rvec'])
     return K @ np.hstack((R, cam_params['tvec'].reshape(-1, 1))) # (3, 4)
 
+def undistort_points(points_2d: np.ndarray, cam_params: CameraParams) -> np.ndarray:
+    """Undistorts 2D points using camera parameters."""
+    # points_2d: (..., 2)
+    valid_points_mask = ~np.isnan(points_2d).any(axis=-1)  # Mask for valid points
+    valid_points = points_2d[valid_points_mask]  # Extract valid points (num_valid_points, 2)
+    undistorted_full = np.full_like(points_2d, np.nan, dtype=np.float32)  # Prepare output array with NaNs
+    # The following function returns normalised coordinates, not pixel coordinates
+    undistorted_points = cv2.undistortImagePoints(valid_points.reshape(-1, 1, 2), get_camera_matrix(cam_params), cam_params['dist']) # (num_valid_points, 1, 2)
+    undistorted_full[valid_points_mask] = undistorted_points.reshape(-1, 2)  # Fill only valid points
+    return undistorted_full  # Shape: (..., 2) with NaNs for invalid points
+
 def combination_triangulate(frame_annotations: np.ndarray, proj_matrices: np.ndarray) -> np.ndarray:
     """Triangulates 3D points from 2D correspondences using multiple camera views."""
     # frame_annotations: (num_frames, num_cams, num_points, 2) and proj_matrices: (num_cams, 3, 4)
@@ -197,6 +210,72 @@ def combination_triangulate(frame_annotations: np.ndarray, proj_matrices: np.nda
     # Average the triangulated points across all combinations
     average = np.nanmean(points_3d, axis=1)  # (num_frames, num_points, 3)
     return average
+
+def estimate_pose(frame_annotations: np.ndarray, individual: List[CameraParams]):
+    """Triangulates 3D points from 2D correspondences using multiple camera views."""
+    # frame_annotations: (num_frames, num_cams, num_points, 2) and proj_matrices: (num_cams, 3, 4)
+    # returns (points_3d: (num_frames, num_points, 3))
+    assert frame_annotations.shape[1] == len(individual), "Number of cameras must match annotations."
+    individual[0]['rvec'][:] = 0 # No rotation for the first camera
+    individual[0]['tvec'][:] = 0 # No translation for the first camera
+    # Construct poses from first 2 cameras
+    p1_2d = frame_annotations[:, 0] # (num_frames, num_points, 2)
+    p2_2d = frame_annotations[:, 1] # (num_frames, num_points, 2)
+    common_mask = ~np.isnan(p1_2d).any(axis=2) & ~np.isnan(p2_2d).any(axis=2)  # (num_frames, num_points,)
+    if not np.any(common_mask):
+        return
+    # Prepare 2D points for triangulation (requires shape [2, N])
+    pts1 = p1_2d[common_mask] # (num_common_points, 2)
+    pts2 = p2_2d[common_mask] # (num_common_points, 2)
+    # Find essential matrix
+    _, E, R, t, mask_e = cv2.recoverPose(pts1, pts2, get_camera_matrix(individual[0]), individual[0]['dist'], get_camera_matrix(individual[1]), individual[1]['dist'], method=cv2.RANSAC, prob=0.999, threshold=1.0)
+    # The 'mask' is an output array that specifies which points were considered inliers.
+    # We should use only the inliers for further calculations.
+    pts1_inliers = pts1[mask_e.ravel() == 1]
+    pts2_inliers = pts2[mask_e.ravel() == 1]
+    print(f"{np.sum(mask_e)} inliers found out of {len(pts1)} points.\n")
+    individual[1]['rvec'] = cv2.Rodrigues(R)[0].flatten()  # Convert rotation matrix to rotation vector
+    individual[1]['tvec'] = t.flatten()  # Translation vector
+    # Now we can triangulate the points using the first two cameras
+    pts1_inliers = undistort_points(pts1_inliers, individual[0])  # (num_common_points, 2)
+    pts2_inliers = undistort_points(pts2_inliers, individual[1])  # (num_common_points, 2)
+    points_3d = cv2.triangulatePoints(get_projection_matrix(individual[0]), get_projection_matrix(individual[1]), pts1_inliers.T, pts2_inliers.T)  # (4, num_common_points)
+    points_3d = (points_3d[:3] / points_3d[3]).T  # Convert to 3D coordinates (num_common_points, 3)
+    # Solve for other cameras using PnP
+    for i in range(2, len(individual)):
+        # # We only use the inliers from the first view that were successfully triangulated.
+        pnp_points = frame_annotations[:, i][common_mask][mask_e.ravel() == 1]  # (num_common_points, 2)
+        # We do this masking because some points might not be visible in the third camera.
+        valid_mask = ~np.isnan(pnp_points).any(axis=1)  # Mask for valid points
+        pnp_points = pnp_points[valid_mask]  # (num_valid_points, 2)
+        valid_3d_points = points_3d[valid_mask] # (num_valid_points, 3)
+        # We use solvePnPRansac to find the pose of the third camera.
+        # Distortion coefficients are assumed to be zero as we're using undistorted points.
+        success, rvec, tvec, inliers_pnp = cv2.solvePnPRansac(valid_3d_points, pnp_points, get_camera_matrix(individual[i]), individual[i]['dist'])
+        print(success)
+        raise NotImplementedError()
+
+def estimate_independent_pose(frame_annotations: np.ndarray, individual: List[CameraParams]):
+    """Triangulates 3D points from 2D correspondences using multiple camera views."""
+    # frame_annotations: (num_frames, num_cams, num_points, 2)
+    assert frame_annotations.shape[1] == len(individual), "Number of cameras must match annotations."
+    individual[0]['rvec'][:] = 0 # No rotation for the first camera
+    individual[0]['tvec'][:] = 0 # No translation for the first camera
+    # Construct poses from first 2 cameras
+    for j in range(1, len(individual)):
+        p1_2d = frame_annotations[:, 0] # (num_frames, num_points, 2)
+        p2_2d = frame_annotations[:, j] # (num_frames, num_points, 2)
+        common_mask = ~np.isnan(p1_2d).any(axis=2) & ~np.isnan(p2_2d).any(axis=2)  # (num_frames, num_points,)
+        if not np.any(common_mask):
+            return
+        # Prepare 2D points for triangulation (requires shape [2, N])
+        pts1 = p1_2d[common_mask] # (num_common_points, 2)
+        pts2 = p2_2d[common_mask] # (num_common_points, 2)
+        # Find essential matrix
+        _, E, R, t, mask_e = cv2.recoverPose(pts1, pts2, get_camera_matrix(individual[0]), individual[0]['dist'], get_camera_matrix(individual[j]), individual[j]['dist'], method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        # print(f"{np.sum(mask_e)} inliers found out of {len(pts1)} points.\n")
+        individual[j]['rvec'] = cv2.Rodrigues(R)[0].flatten()  # Convert rotation matrix to rotation vector
+        individual[j]['tvec'] = t.flatten()  # Translation vector
 
 def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndarray:
     """Reprojects 3D points back to 2D image plane using camera parameters."""
@@ -246,14 +325,6 @@ def load_videos():
     print(f"Loaded {video_metadata['num_videos']} videos.")
     print(f"Resolution: {video_metadata['width']}x{video_metadata['height']}, Frames: {video_metadata['num_frames']}")
 
-
-# def mouse_callback(event, x, y, flags, param):
-#     """Handles mouse clicks for point annotation."""
-#     if event == cv2.EVENT_LBUTTONDOWN:
-#         cam_idx = param['cam_idx']
-#         annotations[frame_idx, cam_idx, selected_point_idx] = [x, y]
-#         human_annotated[frame_idx, cam_idx, selected_point_idx] = True
-#         print(f"Annotated P{selected_point_idx} on Cam {cam_idx} at frame {frame_idx}: ({x}, {y})")
 
 dragging_kp_idx = None
 def mouse_callback(event, x, y, flags, param):
@@ -384,19 +455,20 @@ def create_individual() -> List[CameraParams]:
 def mutate(individual: List[CameraParams]) -> List[CameraParams]:
     """Mutates an individual by applying small random changes."""
     mutated = []
+    alpha = 0.01
     for cam_params in individual:
         # Mutate intrinsics
-        fx = cam_params['fx'] + random.uniform(-0.01, 0.01)
-        fy = cam_params['fy'] + random.uniform(-0.01, 0.01)
-        cx = cam_params['cx'] + random.uniform(-0.01, 0.01)
-        cy = cam_params['cy'] + random.uniform(-0.01, 0.01)
+        fx = cam_params['fx'] + random.uniform(-alpha, alpha)
+        fy = cam_params['fy'] + random.uniform(-alpha, alpha)
+        cx = cam_params['cx'] + random.uniform(-alpha, alpha)
+        cy = cam_params['cy'] + random.uniform(-alpha, alpha)
 
         # Mutate distortion
-        dist = cam_params['dist'] + np.random.uniform(-0.001, 0.001, cam_params['dist'].shape[0])
+        dist = cam_params['dist'] + np.random.uniform(-alpha, alpha, cam_params['dist'].shape[0])
         
         # Mutate extrinsics
         rvec = cam_params['rvec'] + np.random.uniform(-np.pi/180, np.pi/180, 3)
-        tvec = cam_params['tvec'] + np.random.uniform(-0.01, 0.01, 3)
+        tvec = cam_params['tvec'] + np.random.uniform(-alpha, alpha, 3)
         
         mutated.append(CameraParams(fx=fx, fy=fy, cx=cx, cy=cy, dist=dist, rvec=rvec, tvec=tvec))
     
@@ -413,20 +485,14 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
     This version calculates multiple triangulation points from pairs of cameras for a given valid frame.
     Lower reprojection error results in a higher fitness score.
     """
-    total_reprojection_error = 0.0
-    points_evaluated = 0
+    reprojection_errors = []
 
     num_cams = annotations.shape[1]
     
     # --- Pre-computation for Efficiency ---
     # Get projection matrices and camera parameters once to avoid redundant calculations in the loop.
     # **We are ignoring the intrinsics because we undistort the points before triangulation.**
-    proj_matrices = []
-    for i in individual:
-        R, _ = cv2.Rodrigues(i['rvec'])  # Convert rotation vector to rotation matrix
-        P = np.hstack((R, i['tvec'].reshape(-1, 1)))
-        proj_matrices.append(P)
-    proj_matrices = np.array(proj_matrices)  # (num_cams, 3, 4)
+    proj_matrices = np.array([get_projection_matrix(i) for i in individual]) # (num_cams, 3, 4)
 
     # Find frames with at least one valid annotation to process.
     valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3)) & np.any(human_annotated, axis=(1, 2)) # (num_frames,)
@@ -437,12 +503,8 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
     undistorted_annotations = np.full_like(valid_annotations, np.nan, dtype=np.float32)  # (num_valid_frames, num_cams, num_points, 2)
 
     for c in range(num_cams):
-        valid_2d_mask = ~np.isnan(valid_annotations[:, c]).any(axis=-1)  # (num_valid_frames, num_points)
-        if not np.any(valid_2d_mask):
-            continue
-        valid_2d_points = valid_annotations[:, c][valid_2d_mask]  # (num_valid_frames, num_valid_points, 2)
-        undistorted = cv2.undistortPoints(valid_2d_points.reshape(-1, 1, 2), get_camera_matrix(individual[c]), individual[c]['dist']).reshape(valid_2d_points.shape)
-        undistorted_annotations[:, c][valid_2d_mask] = undistorted  # (num_valid_frames, num_points, 2)
+        undistorted_annotations[:, c] = undistort_points(valid_annotations[:, c], individual[c])  # (num_valid_frames, num_points, 2)
+    
     points_3d = combination_triangulate(undistorted_annotations, proj_matrices) # (num_valid_frames, num_points, 3)
     valid_3d_mask = ~np.isnan(points_3d).any(axis=-1)  # (num_valid_frames, num_points)
     for c in range(num_cams):
@@ -453,19 +515,98 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
         valid_2d_points = valid_annotations[:, c][common_mask]  # (num_common_points, 2)
         reprojected = reproject_points(valid_3d_points, individual[c]) # (num_common_points, 2)
         # Calculate the reprojection error for valid points
-        error = np.square(reprojected - valid_2d_points)
-        error = np.sqrt(np.sum(error, axis=1))  # Euclidean distance
-        total_reprojection_error += np.sum(error)
-        points_evaluated += np.sum(common_mask)  # Count how many points were evaluated
+        error = np.linalg.norm(reprojected - valid_2d_points, axis=1)  # Euclidean distance, (num_common_points,)
+        reprojection_errors.extend(error)  # Append the error for this camera
 
-    if points_evaluated == 0:
+    if len(reprojection_errors) == 0:
         return float('inf')  # No valid points to evaluate
         
-    average_error = total_reprojection_error / points_evaluated
-    # average_error = total_reprojection_error
+    # average_error = total_reprojection_error / points_evaluated
+    average_error = np.mean(reprojection_errors)
+    # print("Descriptive statistics of reprojection errors:")
+    # print(f"  Min: {np.min(reprojection_errors):.2f}, Max: {np.max(reprojection_errors):.2f}, Mean: {average_error:.2f}, Std Dev: {np.std(reprojection_errors):.2f}")
+    find_worst_reprojections()
     
     # Fitness is the error
     return average_error
+
+def find_worst_reprojections(top_k=10):
+    """Finds the top_k worst reprojection errors across all frames, cameras, and points."""
+    # Check if the camera parameters (best_individual) are available
+    if 'best_individual' not in globals() or best_individual is None:
+        print("Optimized camera parameters ('best_individual') not found.")
+        return []
+
+    # Compute reconstruction
+    undistorted_annotations = np.full_like(annotations, np.nan, dtype=np.float32)  # (frames, num_cams, num_points, 2)
+
+    for c in range(video_metadata['num_videos']):
+        undistorted_annotations[:, c] = undistort_points(annotations[:, c], best_individual[c])  # (frames, num_points, 2)
+    proj_matrices = np.array([get_projection_matrix(i) for i in best_individual])
+    points_3d = combination_triangulate(undistorted_annotations, proj_matrices) # (frames, num_points, 3)
+    reconstructed_3d_points[:] = points_3d  # Update the global 3D points for this frame
+
+    all_errors = []
+
+    # Pre-calculate masks for valid 3D points and 2D annotations to avoid re-computation
+    valid_3d_mask = ~np.isnan(reconstructed_3d_points).any(axis=-1)  # Shape: (num_frames, num_points)
+    valid_2d_mask = ~np.isnan(annotations).any(axis=-1)             # Shape: (num_frames, num_cams, num_points)
+
+    # Iterate over each camera to calculate its reprojection errors
+    for cam_idx in range(video_metadata['num_videos']):
+        # Find points that are valid in both the 3D data and this camera's 2D annotations
+        common_mask = valid_3d_mask & valid_2d_mask[:, cam_idx]
+
+        # Get the (frame_idx, point_idx) coordinates for all valid points
+        frame_indices, point_indices = np.where(common_mask)
+
+        # If no valid points exist for this camera, skip to the next one
+        if frame_indices.size == 0:
+            continue
+
+        # Select the corresponding 3D points and 2D ground truth annotations
+        points_3d = reconstructed_3d_points[frame_indices, point_indices]
+        points_2d = annotations[frame_indices, cam_idx, point_indices]
+
+        # Reproject the 3D points onto the current camera's 2D image plane
+        reprojected_points = reproject_points(points_3d, best_individual[cam_idx]) # (num_valid_points, 2)
+
+        valid_reprojection_mask = (reprojected_points[:, 0] >= 0) & (reprojected_points[:, 0] < video_metadata['width']) & \
+                                    (reprojected_points[:, 1] >= 0) & (reprojected_points[:, 1] < video_metadata['height'])
+        # Filter out points that are outside the image bounds
+        reprojected_points = reprojected_points[valid_reprojection_mask]
+        points_2d = points_2d[valid_reprojection_mask]
+        frame_indices = frame_indices[valid_reprojection_mask]
+        point_indices = point_indices[valid_reprojection_mask]
+
+        # Calculate the Euclidean distance (L2 norm) between reprojected and annotated points
+        errors = np.square(reprojected_points - points_2d)
+        errors = np.sqrt(np.sum(errors, axis=-1))  # Shape: (num_valid_points,)
+
+        # Store each error along with its full context (frame, camera, point index)
+        for i in range(len(errors)):
+            all_errors.append({
+                'error': float(errors[i]),
+                'frame': int(frame_indices[i]),
+                'camera': video_names[cam_idx],
+                'point': POINT_NAMES[point_indices[i]],
+                'annotated_point': annotations[frame_indices[i], cam_idx, point_indices[i]].tolist(),
+                'reprojected_point': reprojected_points[i].tolist(),
+                '3d_point': points_3d[i].tolist()
+            })
+
+    # Sort the collected errors in descending order to find the largest ones
+    sorted_errors = sorted(all_errors, key=lambda x: x['error'], reverse=True)
+
+    # Return the top k results
+    for i in sorted_errors[:top_k]:
+        print(i)
+    # Compute mean error across all cameras and points
+    mean_error = np.mean([e['error'] for e in sorted_errors])
+    print(f"Mean reprojection error across all cameras and points: {mean_error:.2f}")
+    global frame_idx
+    if len(sorted_errors) > 0:
+        frame_idx = sorted_errors[0]['frame']
 
 def permutation_optimization(individual: List[CameraParams]):
     """It may at random initialisation the order of cameras are not optimal
@@ -526,6 +667,9 @@ def update_3d_reconstruction(best_params: List[CameraParams]):
     """Uses the best camera parameters to reconstruct all 3D points in the current frame."""
     proj_matrices = np.array([get_projection_matrix(i) for i in best_params])
     frame_annotations = annotations[frame_idx]  # (num_cams, num_points, 2)
+    undistorted_annotations = np.full_like(frame_annotations, np.nan, dtype=np.float32)  # (num_cams, num_points, 2)
+    for c in range(video_metadata['num_videos']):
+        undistorted_annotations[c] = undistort_points(frame_annotations[c], best_params[c])  # (num_points, 2)
     points_3d = combination_triangulate(frame_annotations[None], proj_matrices)[0]  # (num_points, 3)
     reconstructed_3d_points[frame_idx] = points_3d  # Update the global 3D points for this frame
 
@@ -811,7 +955,7 @@ def main():
                         ))
 
         # Draw UI on frame
-        if not train_ga and not scene_viz.is_dragging:
+        if not scene_viz.is_dragging:
             for i, frame in enumerate(current_frames):
                 frame_with_ui = draw_ui(frame.copy(), i)
                 cv2.imshow(video_names[i], frame_with_ui)
