@@ -75,13 +75,12 @@ POINT_NAMES = list(SKELETON.keys())
 NUM_POINTS = len(POINT_NAMES)
 
 # Genetic Algorithm Parameters
-POPULATION_SIZE = 400
+POPULATION_SIZE = 200
 ELITISM_RATE = 0.1 # Keep the top 10%
 
 # GA State
 generation = 0
 train_ga = False
-population = []
 best_fitness_so_far = float('inf')  # Initialize to a very high value
 best_individual = None
 
@@ -112,6 +111,7 @@ frame_idx = 300
 paused = True
 selected_point_idx = 0  # Default to P1
 focus_selected_point = False  # Whether to focus on the selected point in the visualization
+save_output_video = False
 
 # Lucas-Kanade Optical Flow parameters
 lk_params = dict(winSize=(9, 9),
@@ -153,6 +153,7 @@ point_colors = np.array([
 
 assert NUM_POINTS <= len(point_colors), "Not enough colors defined for the number of points."
     
+NUM_DIST_COEFFS = 14  # Number of distortion coefficients
 class CameraParams(TypedDict):
     fx: float
     fy: float
@@ -162,20 +163,49 @@ class CameraParams(TypedDict):
     rvec: np.ndarray
     tvec: np.ndarray
 
-    def flattened(self) -> np.ndarray:
-        """Returns a flattened array of camera parameters for genetic algorithm."""
-        return np.concatenate((np.array([self.fx, self.fy, self.cx, self.cy]), self.dist, self.rvec, self.tvec))
-    
-    def from_flattened(self, flattened: np.ndarray):
-        """Creates a CameraParams object from a flattened array."""
-        num_dist_coeffs = 5
-        self.fx = flattened[0]
-        self.fy = flattened[1]
-        self.cx = flattened[2]
-        self.cy = flattened[3]
-        self.dist = flattened[4:4 + num_dist_coeffs]
-        self.rvec = flattened[4 + num_dist_coeffs:4 + num_dist_coeffs + 3]
-        self.tvec = flattened[4 + num_dist_coeffs + 3:4 + num_dist_coeffs + 6]
+def flat_camera_params(cam: CameraParams) -> np.ndarray:
+    """Returns a flattened array of camera parameters for genetic algorithm."""
+    """Flattens the CameraParams into a single array."""
+    return np.concatenate([
+        np.array([cam['fx'], cam['fy'], cam['cx'], cam['cy']], dtype=np.float32),
+        cam['dist'][:NUM_DIST_COEFFS].astype(np.float32),
+        cam['rvec'].astype(np.float32),
+        cam['tvec'].astype(np.float32)
+    ])
+
+def unflat_camera_params(cam: CameraParams, flattened: np.ndarray):
+    """Creates a CameraParams object from a flattened array."""
+    """Unflattens a single array into CameraParams."""
+    cam['fx'] = flattened[0]
+    cam['fy'] = flattened[1]
+    cam['cx'] = flattened[2]
+    cam['cy'] = flattened[3]
+    cam['dist'] = flattened[4:4 + NUM_DIST_COEFFS].astype(np.float32)
+    cam['rvec'] = flattened[4 + NUM_DIST_COEFFS:4 + NUM_DIST_COEFFS + 3].astype(np.float32)
+    cam['tvec'] = flattened[4 + NUM_DIST_COEFFS + 3:4 + NUM_DIST_COEFFS + 6].astype(np.float32)
+
+def flat_individual(individual: List[CameraParams]) -> np.ndarray:
+    """Flattens a list of CameraParams into a single array."""
+    return np.concatenate([flat_camera_params(cam) for cam in individual])
+
+def unflat_individual(flattened: np.ndarray) -> List[CameraParams]:
+    """Unflattens a single array into a list of CameraParams."""
+    cam_params_list = []
+    offset = 0
+    num_cameras = video_metadata['num_videos']
+    for _ in range(num_cameras):
+        cam_params = CameraParams(
+            fx=flattened[offset],
+            fy=flattened[offset + 1],
+            cx=flattened[offset + 2],
+            cy=flattened[offset + 3],
+            dist=flattened[offset + 4:offset + 4 + NUM_DIST_COEFFS],
+            rvec=flattened[offset + 4 + NUM_DIST_COEFFS:offset + 4 + NUM_DIST_COEFFS + 3],
+            tvec=flattened[offset + 4 + NUM_DIST_COEFFS + 3:offset + 4 + NUM_DIST_COEFFS + 6]
+        )
+        cam_params_list.append(cam_params)
+        offset += (4 + NUM_DIST_COEFFS + 6)  # Move to the next camera's parameters
+    return cam_params_list
 
 def get_camera_matrix(cam_params: CameraParams) -> np.ndarray:
     """Constructs the camera matrix from camera parameters."""
@@ -194,6 +224,8 @@ def undistort_points(points_2d: np.ndarray, cam_params: CameraParams) -> np.ndar
     """Undistorts 2D points using camera parameters."""
     # points_2d: (..., 2)
     valid_points_mask = ~np.isnan(points_2d).any(axis=-1)  # Mask for valid points
+    if not np.any(valid_points_mask):
+        return np.full_like(points_2d, np.nan, dtype=np.float32)
     valid_points = points_2d[valid_points_mask]  # Extract valid points (num_valid_points, 2)
     undistorted_full = np.full_like(points_2d, np.nan, dtype=np.float32)  # Prepare output array with NaNs
     # The following function returns normalised coordinates, not pixel coordinates
@@ -301,6 +333,8 @@ def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndar
     reprojected_pts_2d, _ = cv2.projectPoints(
         points_3d, cam_params['rvec'], cam_params['tvec'], get_camera_matrix(cam_params), cam_params['dist']
     )  # (N, 1, 2)
+    if reprojected_pts_2d is None:
+        raise ValueError("Reprojection failed, check camera parameters and 3D points.")
     return reprojected_pts_2d.squeeze(axis=1)  # Shape: (N, 2)
 
 
@@ -440,7 +474,7 @@ def create_individual() -> List[CameraParams]:
         cy = h / 2 + random.uniform(-h * 0.05, h * 0.05)
         
         # Distortion (keep it small initially)
-        dist = np.random.normal(0.0, 0.001, size=5).astype(np.float32)
+        dist = np.random.normal(0.0, 0.001, size=NUM_DIST_COEFFS).astype(np.float32)
         
         # 1. Calculate tvec: Position the camera in a circle
         angle = (2 * np.pi / num_cameras) * i
@@ -650,9 +684,10 @@ def permutation_optimization(individual: List[CameraParams]):
     best_perm = perms[np.argmin(fitness_scores)]
     individual[:] = list(best_perm)  # Update the individual with the best permutation
 
+mean_params = None
 def run_genetic_step():
     """The main loop for the genetic algorithm to find best camera parameters."""
-    global population, best_fitness_so_far, best_individual, generation
+    global best_fitness_so_far, best_individual, generation, mean_params
     
     # Check if there are enough annotations
     num_annotations = np.sum(~np.isnan(annotations))
@@ -660,39 +695,42 @@ def run_genetic_step():
         print("Not enough annotations to run calibration. Please annotate more points.")
         return None
 
-    # 1. Initialization
-    if len(population) == 0:
-        print("Initializing population for Genetic Algorithm...")
+    # 2. Fitness Evaluation
+    std_dev = 0.01
+    if best_individual is not None:
+        mean_params = flat_individual(best_individual)  # Flatten the best individual parameters
+    else:
+        # Initialize the population with random individuals
         population = [create_individual() for _ in range(POPULATION_SIZE)]
         for i in tqdm(population, desc="Finding optimal initial permutation"):
             permutation_optimization(i)
         best_fitness_so_far = float('inf')  # Initialize to a very high value
         best_individual = None
-
-    # 2. Fitness Evaluation
-    fitness_scores = np.array([fitness(ind, annotations) for ind in population]) # (Population,)
+        pop_fitness = np.array([fitness(ind, annotations) for ind in population])  # (Population,)
+        mean_params = flat_individual(population[np.argmin(pop_fitness)])  # Get the best parameters from the population
+    num_params = mean_params.shape[0]  # Number of parameters in an individual
+    noise = np.random.normal(0, std_dev, size=(POPULATION_SIZE, num_params))  # (Population, num_params)
+    pop_params = noise + mean_params # Add noise to the best parameters for exploration (Population, num_params)
+    fitness_scores = np.zeros(POPULATION_SIZE, dtype=np.float32)  # (Population,)
+    temp_individual = create_individual()
+    for i in range(POPULATION_SIZE):
+        temp_individual = unflat_individual(pop_params[i])  # Unflatten the parameters
+        fitness_scores[i] = fitness(temp_individual, annotations)  # Calculate fitness for the individual
     
     # 3. Selection (Elitism + Tournament)
-    elite_size = int(POPULATION_SIZE * ELITISM_RATE)
     sorted_population_indices = np.argsort(fitness_scores)  # Sort in ascending order
     
     if fitness_scores[sorted_population_indices[0]] < best_fitness_so_far:
         best_fitness_so_far = fitness_scores[sorted_population_indices[0]]
-        best_individual = population[sorted_population_indices[0]]
+        best_individual = unflat_individual(pop_params[sorted_population_indices[0]])  # Update the best individual
 
     print(f"Generation {generation}: Best Fitness (err): {best_fitness_so_far:.2f} Mean Error: {np.nanmean(fitness_scores):.2f} Std Dev: {np.nanstd(fitness_scores):.2f}")
 
-    next_generation = [population[i] for i in sorted_population_indices[:elite_size]]
+    normalised_scores = fitness_scores - np.nanmin(fitness_scores)  # Normalize scores to avoid NaN issues
+    normalised_scores /= np.nanmax(normalised_scores)  # Normalize to [0, 1]
+    # Update based on evolution strategy
+    mean_params = mean_params + 0.1 * np.sum(noise * -normalised_scores[:, None], axis=0) / (POPULATION_SIZE * std_dev)  # Weighted sum of noise
 
-    # 4. Crossover & Mutation (here simplified to mutation of the best)
-    while len(next_generation) < POPULATION_SIZE:
-        # Select a parent from the elite group
-        parent = random.choice(next_generation[:elite_size])
-        # Create a new individual by mutating the parent
-        child = mutate(parent)
-        next_generation.append(child)
-        
-    population = next_generation
     generation += 1
 
 def update_3d_reconstruction(best_params: List[CameraParams]):
@@ -1090,6 +1128,9 @@ def main():
         elif key == ord('u'):
             paused = True
             train_ga = not train_ga
+            if train_ga:
+                best_fitness_so_far = float('inf')  # Reset best fitness for new training
+                print("Starting genetic algorithm training.")
         elif key == ord('r'):
             save_output_video = not save_output_video
             print(f"Output video recording {'enabled' if save_output_video else 'disabled'}.")
