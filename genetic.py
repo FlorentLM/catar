@@ -752,6 +752,7 @@ def create_control_window():
         f"Num 3D Points: {np.sum(~np.isnan(reconstructed_3d_points[frame_idx]).any(axis=1))} / {NUM_POINTS}",
         f"Tracking: {'Enabled' if tracking_enabled else 'Disabled'}",
         f"Num Calibration Frames: {len(calibration_frames)}",
+        f"Save output video: {'Enabled' if save_output_video else 'Disabled'}",
         "--- Controls ---",
         "space: play/pause",
         "n/b: next/prev frame",
