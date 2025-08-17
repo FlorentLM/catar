@@ -27,6 +27,7 @@ import json
 import glob
 import random
 import itertools
+import pprint
 from tqdm import tqdm
 from typing import TypedDict, List, Tuple, Optional
 from viz_3d import SceneObject, SceneVisualizer
@@ -525,7 +526,6 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
     average_error = np.mean(reprojection_errors)
     # print("Descriptive statistics of reprojection errors:")
     # print(f"  Min: {np.min(reprojection_errors):.2f}, Max: {np.max(reprojection_errors):.2f}, Mean: {average_error:.2f}, Std Dev: {np.std(reprojection_errors):.2f}")
-    find_worst_reprojections()
     
     # Fitness is the error
     return average_error
@@ -599,14 +599,14 @@ def find_worst_reprojections(top_k=10):
     sorted_errors = sorted(all_errors, key=lambda x: x['error'], reverse=True)
 
     # Return the top k results
-    for i in sorted_errors[:top_k]:
-        print(i)
     # Compute mean error across all cameras and points
     mean_error = np.mean([e['error'] for e in sorted_errors])
     print(f"Mean reprojection error across all cameras and points: {mean_error:.2f}")
-    global frame_idx
+    global frame_idx, selected_point_idx
     if len(sorted_errors) > 0:
+        pprint.pprint(sorted_errors[0])
         frame_idx = sorted_errors[0]['frame']
+        selected_point_idx = POINT_NAMES.index(sorted_errors[0]['point'])
 
 def permutation_optimization(individual: List[CameraParams]):
     """It may at random initialisation the order of cameras are not optimal
@@ -1037,6 +1037,8 @@ def main():
             if point_num < NUM_POINTS:
                 selected_point_idx = point_num
                 print(f"Selected point P{selected_point_idx} for annotation.")
+        elif key == ord('w'):
+            find_worst_reprojections()
         # Cycle through points
         elif key == ord('j'):
             selected_point_idx = (selected_point_idx + 1) % NUM_POINTS
