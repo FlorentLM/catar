@@ -162,6 +162,21 @@ class CameraParams(TypedDict):
     rvec: np.ndarray
     tvec: np.ndarray
 
+    def flattened(self) -> np.ndarray:
+        """Returns a flattened array of camera parameters for genetic algorithm."""
+        return np.concatenate((np.array([self.fx, self.fy, self.cx, self.cy]), self.dist, self.rvec, self.tvec))
+    
+    def from_flattened(self, flattened: np.ndarray):
+        """Creates a CameraParams object from a flattened array."""
+        num_dist_coeffs = 5
+        self.fx = flattened[0]
+        self.fy = flattened[1]
+        self.cx = flattened[2]
+        self.cy = flattened[3]
+        self.dist = flattened[4:4 + num_dist_coeffs]
+        self.rvec = flattened[4 + num_dist_coeffs:4 + num_dist_coeffs + 3]
+        self.tvec = flattened[4 + num_dist_coeffs + 3:4 + num_dist_coeffs + 6]
+
 def get_camera_matrix(cam_params: CameraParams) -> np.ndarray:
     """Constructs the camera matrix from camera parameters."""
     K = np.array([[cam_params['fx'], 0, cam_params['cx']],
@@ -425,7 +440,7 @@ def create_individual() -> List[CameraParams]:
         cy = h / 2 + random.uniform(-h * 0.05, h * 0.05)
         
         # Distortion (keep it small initially)
-        dist = np.random.uniform(-0.001, 0.001, 5).astype(np.float32)
+        dist = np.random.normal(0.0, 0.001, size=5).astype(np.float32)
         
         # 1. Calculate tvec: Position the camera in a circle
         angle = (2 * np.pi / num_cameras) * i
@@ -459,17 +474,17 @@ def mutate(individual: List[CameraParams]) -> List[CameraParams]:
     alpha = 0.01
     for cam_params in individual:
         # Mutate intrinsics
-        fx = cam_params['fx'] + random.uniform(-alpha, alpha)
-        fy = cam_params['fy'] + random.uniform(-alpha, alpha)
-        cx = cam_params['cx'] + random.uniform(-alpha, alpha)
-        cy = cam_params['cy'] + random.uniform(-alpha, alpha)
+        fx = cam_params['fx'] + np.random.normal(0, alpha)
+        fy = cam_params['fy'] + np.random.normal(0, alpha)
+        cx = cam_params['cx'] + np.random.normal(0, alpha)
+        cy = cam_params['cy'] + np.random.normal(0, alpha)
 
         # Mutate distortion
-        dist = cam_params['dist'] + np.random.uniform(-alpha, alpha, cam_params['dist'].shape[0])
+        dist = cam_params['dist'] + np.random.normal(0, alpha, size=cam_params['dist'].shape[0])
         
         # Mutate extrinsics
-        rvec = cam_params['rvec'] + np.random.uniform(-np.pi/180, np.pi/180, 3)
-        tvec = cam_params['tvec'] + np.random.uniform(-alpha, alpha, 3)
+        rvec = cam_params['rvec'] + np.random.normal(0, np.pi/180, size=3)
+        tvec = cam_params['tvec'] + np.random.normal(0, alpha, size=3)
         
         mutated.append(CameraParams(fx=fx, fy=fy, cx=cx, cy=cy, dist=dist, rvec=rvec, tvec=tvec))
     
@@ -523,7 +538,7 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
         return float('inf')  # No valid points to evaluate
         
     # average_error = total_reprojection_error / points_evaluated
-    average_error = np.mean(reprojection_errors)
+    average_error = np.sum(reprojection_errors)
     # print("Descriptive statistics of reprojection errors:")
     # print(f"  Min: {np.min(reprojection_errors):.2f}, Max: {np.max(reprojection_errors):.2f}, Mean: {average_error:.2f}, Std Dev: {np.std(reprojection_errors):.2f}")
     
