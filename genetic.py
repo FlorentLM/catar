@@ -733,6 +733,10 @@ def draw_ui(frame, cam_idx):
                 cv2.putText(frame, f"{distance:.2f}", tuple(point_2d_from_3d.astype(int) + np.array([5, -5])), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 1)
     cv2.putText(frame, video_names[cam_idx], (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    if cam_idx == 0:
+        # Draw the current frame index
+        cv2.putText(frame, f"Frame: {frame_idx}/{video_metadata['num_frames']}", (10, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return frame
 
 def create_control_window():
