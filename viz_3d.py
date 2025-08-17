@@ -99,9 +99,9 @@ class SceneVisualizer:
             # Draw world axes
             ax_length = 5.0
             # Create world axes as LineObjects
-            scene_objects.append(SceneObject(coords=np.array([[0,0,0], [ax_length,0,0]]), color=(0,0,255), label="X", type="line"))
-            scene_objects.append(SceneObject(coords=np.array([[0,0,0], [0,ax_length,0]]), color=(0,255,0), label="Y", type="line"))
-            scene_objects.append(SceneObject(coords=np.array([[0,0,0], [0,0,ax_length]]), color=(255,0,0), label="Z", type="line"))
+            scene_objects.append(SceneObject(coords=np.array([[0,0,0], [ax_length,0,0]]), color=(96,96,96), label="X", type="line"))
+            scene_objects.append(SceneObject(coords=np.array([[0,0,0], [0,ax_length,0]]), color=(96,96,96), label="Y", type="line"))
+            scene_objects.append(SceneObject(coords=np.array([[0,0,0], [0,0,ax_length]]), color=(96,96,96), label="Z", type="line"))
 
         all_3d_coords = []
         for obj in scene_objects:
@@ -131,13 +131,13 @@ class SceneVisualizer:
                 p2 = tuple(projected_2d[coord_idx + 1])
                 cv2.line(canvas, p1, p2, color, 1)
                 if label:
-                    cv2.putText(canvas, label, (p2[0]+5, p2[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color)
+                    cv2.putText(canvas, label, (p2[0]+5, p2[1]), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color)
                 coord_idx += 2
             elif obj['type'] == 'point':
                 p = tuple(projected_2d[coord_idx])
-                cv2.circle(canvas, p, 2, color, -1)
+                cv2.circle(canvas, p, 8, color, -1)
                 if label:
-                    cv2.putText(canvas, label, (p[0]+5, p[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color)
+                    cv2.putText(canvas, label, (p[0]+5, p[1]), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color)
                 coord_idx += 1
 
         return canvas
