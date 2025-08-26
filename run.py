@@ -1,16 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Multi-Camera 3D Point Tracking and Calibration using DearPyGui, OpenCV, and Genetic Algorithms.
+Multi-Camera 3D Point Tracking and Calibration using DearPyGui and OpenCV
 
 This script provides a DearPyGui interface for the multi-camera 3D point tracking and calibration project.
 It loads multiple synchronized videos, allows for manual annotation of points, tracks these points using
 Lucas-Kanade optical flow, and uses a genetic algorithm to solve for camera intrinsics, extrinsics, and
 distortion parameters. The final output is a 3D reconstruction of the tracked points.
-
-Instructions:
-1.  Place your synchronized video files (e.g., cam1.mp4, cam2.mp4) in a 'data' subdirectory.
-2.  Run the script: python main_dpg.py
-3.  Use the controls in the UI to interact with the application.
 """
 import os
 import cv2
@@ -108,6 +103,7 @@ paused = True
 selected_point_idx = 0  # Default to P1
 focus_selected_point = False  # Whether to focus on the selected point in the visualization
 save_output_video = False
+video_save_output = None
 
 # Lucas-Kanade Optical Flow parameters
 lk_params = dict(winSize=(9, 9),
@@ -255,72 +251,6 @@ def combination_triangulate(frame_annotations: np.ndarray, proj_matrices: np.nda
     average = np.nanmean(points_3d, axis=1)  # (num_frames, num_points, 3)
     return average
 
-def estimate_pose(frame_annotations: np.ndarray, individual: List[CameraParams]):
-    """Triangulates 3D points from 2D correspondences using multiple camera views."""
-    # frame_annotations: (num_frames, num_cams, num_points, 2) and proj_matrices: (num_cams, 3, 4)
-    # returns (points_3d: (num_frames, num_points, 3))
-    assert frame_annotations.shape[1] == len(individual), "Number of cameras must match annotations."
-    individual[0]['rvec'][:] = 0 # No rotation for the first camera
-    individual[0]['tvec'][:] = 0 # No translation for the first camera
-    # Construct poses from first 2 cameras
-    p1_2d = frame_annotations[:, 0] # (num_frames, num_points, 2)
-    p2_2d = frame_annotations[:, 1] # (num_frames, num_points, 2)
-    common_mask = ~np.isnan(p1_2d).any(axis=2) & ~np.isnan(p2_2d).any(axis=2)  # (num_frames, num_points,)
-    if not np.any(common_mask):
-        return
-    # Prepare 2D points for triangulation (requires shape [2, N])
-    pts1 = p1_2d[common_mask] # (num_common_points, 2)
-    pts2 = p2_2d[common_mask] # (num_common_points, 2)
-    # Find essential matrix
-    _, E, R, t, mask_e = cv2.recoverPose(pts1, pts2, get_camera_matrix(individual[0]), individual[0]['dist'], get_camera_matrix(individual[1]), individual[1]['dist'], method=cv2.RANSAC, prob=0.999, threshold=1.0)
-    # The 'mask' is an output array that specifies which points were considered inliers.
-    # We should use only the inliers for further calculations.
-    pts1_inliers = pts1[mask_e.ravel() == 1]
-    pts2_inliers = pts2[mask_e.ravel() == 1]
-    print(f"{np.sum(mask_e)} inliers found out of {len(pts1)} points.\n")
-    individual[1]['rvec'] = cv2.Rodrigues(R)[0].flatten()  # Convert rotation matrix to rotation vector
-    individual[1]['tvec'] = t.flatten()  # Translation vector
-    # Now we can triangulate the points using the first two cameras
-    pts1_inliers = undistort_points(pts1_inliers, individual[0])  # (num_common_points, 2)
-    pts2_inliers = undistort_points(pts2_inliers, individual[1])  # (num_common_points, 2)
-    points_3d = cv2.triangulatePoints(get_projection_matrix(individual[0]), get_projection_matrix(individual[1]), pts1_inliers.T, pts2_inliers.T)  # (4, num_common_points)
-    points_3d = (points_3d[:3] / points_3d[3]).T  # Convert to 3D coordinates (num_common_points, 3)
-    # Solve for other cameras using PnP
-    for i in range(2, len(individual)):
-        # # We only use the inliers from the first view that were successfully triangulated.
-        pnp_points = frame_annotations[:, i][common_mask][mask_e.ravel() == 1]  # (num_common_points, 2)
-        # We do this masking because some points might not be visible in the third camera.
-        valid_mask = ~np.isnan(pnp_points).any(axis=1)  # Mask for valid points
-        pnp_points = pnp_points[valid_mask]  # (num_valid_points, 2)
-        valid_3d_points = points_3d[valid_mask] # (num_valid_points, 3)
-        # We use solvePnPRansac to find the pose of the third camera.
-        # Distortion coefficients are assumed to be zero as we're using undistorted points.
-        success, rvec, tvec, inliers_pnp = cv2.solvePnPRansac(valid_3d_points, pnp_points, get_camera_matrix(individual[i]), individual[i]['dist'])
-        print(success)
-        raise NotImplementedError()
-
-def estimate_independent_pose(frame_annotations: np.ndarray, individual: List[CameraParams]):
-    """Triangulates 3D points from 2D correspondences using multiple camera views."""
-    # frame_annotations: (num_frames, num_cams, num_points, 2)
-    assert frame_annotations.shape[1] == len(individual), "Number of cameras must match annotations."
-    individual[0]['rvec'][:] = 0 # No rotation for the first camera
-    individual[0]['tvec'][:] = 0 # No translation for the first camera
-    # Construct poses from first 2 cameras
-    for j in range(1, len(individual)):
-        p1_2d = frame_annotations[:, 0] # (num_frames, num_points, 2)
-        p2_2d = frame_annotations[:, j] # (num_frames, num_points, 2)
-        common_mask = ~np.isnan(p1_2d).any(axis=2) & ~np.isnan(p2_2d).any(axis=2)  # (num_frames, num_points,)
-        if not np.any(common_mask):
-            return
-        # Prepare 2D points for triangulation (requires shape [2, N])
-        pts1 = p1_2d[common_mask] # (num_common_points, 2)
-        pts2 = p2_2d[common_mask] # (num_common_points, 2)
-        # Find essential matrix
-        _, E, R, t, mask_e = cv2.recoverPose(pts1, pts2, get_camera_matrix(individual[0]), individual[0]['dist'], get_camera_matrix(individual[j]), individual[j]['dist'], method=cv2.RANSAC, prob=0.999, threshold=1.0)
-        # print(f"{np.sum(mask_e)} inliers found out of {len(pts1)} points.\n")
-        individual[j]['rvec'] = cv2.Rodrigues(R)[0].flatten()  # Convert rotation matrix to rotation vector
-        individual[j]['tvec'] = t.flatten()  # Translation vector
-
 def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndarray:
     """Reprojects 3D points back to 2D image plane using camera parameters."""
     # points_3d: (N, 3)
@@ -332,7 +262,6 @@ def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndar
     if reprojected_pts_2d is None:
         raise ValueError("Reprojection failed, check camera parameters and 3D points.")
     return reprojected_pts_2d.squeeze(axis=1)  # Shape: (N, 2)
-
 
 # --- Main Application Logic ---
 
@@ -495,8 +424,6 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
         print("No calibration frames found / selected.")
         return float('inf')
     
-    # import pdb; pdb.set_trace()
-
     # Find frames with at least one valid annotation to process.
     valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3)) & np.any(human_annotated, axis=(1, 2)) # (num_frames,)
     calibration_frames_mask = np.zeros_like(valid_frames_mask, dtype=bool)  # (num_frames,)
@@ -861,9 +788,13 @@ def on_key_press(sender, app_data):
         case dpg.mvKey_Down:
             set_selected_point(None, POINT_NAMES[(selected_point_idx + 1) % NUM_POINTS], None)
         case dpg.mvKey_T:
-            toggle_tracking(None, None, not tracking_enabled)
+            toggle_tracking()
         case dpg.mvKey_G:
             toggle_ga(None, None, not train_ga)
+        case dpg.mvKey_H:
+            set_human_annotated(sender, app_data, None)
+        case dpg.mvKey_D:
+            clear_future_annotations(sender, app_data, None)
         case dpg.mvKey_S:
             save_state()
         case dpg.mvKey_L:
@@ -876,6 +807,8 @@ def on_key_press(sender, app_data):
             add_to_calib_frames(sender, app_data, None)
         case dpg.mvKey_Q:
             dpg.stop_dearpygui()
+        case dpg.mvKey_R:
+            toggle_record()
         case dpg.mvKey_Z:
             global focus_selected_point
             focus_selected_point = not focus_selected_point
@@ -892,6 +825,18 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
     y_pos = int((screen_height - viewport_height) * 0.5)
 
     dpg.create_viewport(title='Multi-Camera 3D Tracker', width=viewport_width, height=viewport_height, x_pos=x_pos, y_pos=y_pos)
+    
+    with dpg.viewport_menu_bar():
+        with dpg.menu(label="File"):
+            dpg.add_menu_item(label="Save State", callback=save_state)
+            dpg.add_menu_item(label="Load State", callback=load_state)
+        with dpg.menu(label="Calibration"):
+            dpg.add_menu_item(label="Run genetic algorithm", callback=toggle_ga)
+            dpg.add_menu_item(label="Find worst calibration", callback=find_worst_reprojection)
+            dpg.add_menu_item(label="Worst reprojection", callback=find_worst_frame)
+            dpg.add_menu_item(label="Add calibration frame", callback=add_to_calib_frames)
+
+
     dpg.setup_dearpygui()
     dpg.set_viewport_resize_callback(resize_callback)
 
@@ -912,6 +857,18 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
             tag="3d_texture",
             format=dpg.mvFormat_Float_rgba
         )
+
+    with dpg.theme(tag="record_button_theme"):
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (255, 0, 0, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (255, 50, 50, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (255, 100, 100, 255))
+            
+    with dpg.theme(tag="tracking_button_theme"):
+        with dpg.theme_component(dpg.mvButton):
+            dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 255, 0, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (50, 255, 50, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (100, 255, 100, 255))
 
     with dpg.window(label="Main Window", tag="main_window"):
         with dpg.group(horizontal=True):
@@ -936,30 +893,28 @@ def create_control_panel():
     dpg.add_text("--- Info ---")
     dpg.add_text(f"Frame: {frame_idx}/{video_metadata['num_frames']}", tag="frame_text")
     dpg.add_text(f"Status: {'Paused' if paused else 'Playing'}", tag="status_text")
-    dpg.add_text(f"Annotating Point: {POINT_NAMES[selected_point_idx]}", tag="annotating_point_text")
-    dpg.add_text(f"Focus on Point: {'Enabled' if focus_selected_point else 'Disabled'}", tag="focus_text")
-    dpg.add_text(f"Best Fitness: {best_fitness_so_far:.2f}", tag="fitness_text")
-    dpg.add_text(f"Num Annotations: {np.sum(~np.isnan(annotations[frame_idx])) // 2} / {NUM_POINTS * len(video_names)}", tag="num_annotations_text")
-    dpg.add_text(f"Num 3D Points: {np.sum(~np.isnan(reconstructed_3d_points[frame_idx]).any(axis=1))} / {NUM_POINTS}", tag="num_3d_points_text")
-    dpg.add_text(f"Tracking: {'Enabled' if tracking_enabled else 'Disabled'}", tag="tracking_text")
-    dpg.add_text(f"Num Calibration Frames: {len(calibration_frames)}", tag="num_calib_frames_text")
     dpg.add_text(f"Save output video: {'Enabled' if save_output_video else 'Disabled'}", tag="save_video_text")
+    dpg.add_text(f"Tracking: {'Enabled' if tracking_enabled else 'Disabled'}", tag="tracking_text")
+    dpg.add_text(f"Focus mode: {'Enabled' if focus_selected_point else 'Disabled'}", tag="focus_text")
+    dpg.add_text(f"Annotating keypoint: {POINT_NAMES[selected_point_idx]}", tag="annotating_point_text")
+    dpg.add_spacing(count=5)
+    dpg.add_text(f"Best fitness: {best_fitness_so_far:.2f}", tag="fitness_text")
+    dpg.add_text(f"Num annotation: {np.sum(~np.isnan(annotations[frame_idx])) // 2} / {NUM_POINTS * len(video_names)}", tag="num_annotations_text")
+    dpg.add_text(f"Num 3D points: {np.sum(~np.isnan(reconstructed_3d_points[frame_idx]).any(axis=1))} / {NUM_POINTS}", tag="num_3d_points_text")
+    dpg.add_text(f"Num calibration frames: {len(calibration_frames)}", tag="num_calib_frames_text")
     dpg.add_separator()
     dpg.add_text("--- Controls ---")
-    dpg.add_button(label="Play/Pause", callback=toggle_pause)
     with dpg.group(horizontal=True):
-        dpg.add_button(label="< Prev Frame", callback=prev_frame)
-        dpg.add_button(label="Next Frame >", callback=next_frame)
+        dpg.add_button(label="< Prev", callback=prev_frame)
+        play_label = "Play" if paused else "Pause"
+        dpg.add_button(label=play_label, callback=toggle_pause, tag="play_pause_button")
+        dpg.add_button(label="Next >", callback=next_frame)
     dpg.add_slider_int(label="Frame", min_value=0, max_value=video_metadata['num_frames'] - 1, default_value=frame_idx, callback=set_frame, tag="frame_slider")
-    dpg.add_combo(label="Point", items=POINT_NAMES, default_value=POINT_NAMES[selected_point_idx], callback=set_selected_point, tag="point_combo")
-    dpg.add_button(label="Clear future annotations", callback=clear_future_annotations)
-    dpg.add_checkbox(label="Toggle Tracking", default_value=tracking_enabled, callback=toggle_tracking, tag="tracking_checkbox")
-    dpg.add_checkbox(label="Run Genetic Algorithm", default_value=train_ga, callback=toggle_ga)
-    dpg.add_button(label="Save State", callback=save_state)
-    dpg.add_button(label="Load State", callback=load_state)
-    dpg.add_button(label="Find Worst Reprojection", callback=find_worst_reprojection)
-    dpg.add_button(label="Find Worst Frame", callback=find_worst_frame)
-    dpg.add_button(label="Add to Calibration Frames", callback=add_to_calib_frames)
+    dpg.add_combo(label="Keypoint", items=POINT_NAMES, default_value=POINT_NAMES[selected_point_idx], callback=set_selected_point, tag="point_combo")
+    dpg.add_button(label="Set all previous to 'human annotated'", callback=set_human_annotated)
+    dpg.add_button(label="Delete future annotations", callback=clear_future_annotations)
+    dpg.add_button(label="Track", callback=toggle_tracking, tag="tracking_button")
+    dpg.add_button(label="Record", callback=toggle_record, tag="record_button")
 
 def create_video_grid(scene_viz: SceneVisualizer):
     """Creates the grid for video feeds and 3D projection."""
@@ -990,13 +945,33 @@ def create_video_grid(scene_viz: SceneVisualizer):
 
 # --- DPG Callbacks ---
 
+def toggle_record():
+    global save_output_video, video_save_output
+    save_output_video = not save_output_video
+    if save_output_video:
+        dpg.bind_item_theme("record_button", "record_button_theme")
+    else:
+        dpg.bind_item_theme("record_button", 0) # 0 resets to the default theme
+    if save_output_video:  # Initialize video writer
+        num_rows = video_metadata["num_videos"] // GRID_COLS + (1 if video_metadata["num_videos"] % GRID_COLS > 0 else 0)
+        fourcc = cv2.VideoWriter_fourcc(*'hvc1')
+        video_save_output = cv2.VideoWriter("recording.mp4", fourcc, 30.0, 
+                                            (video_metadata['width'] * GRID_COLS, 
+                                            video_metadata['height'] * num_rows))
+    print(f"Recording toggled: {save_output_video}")
+
 def toggle_pause(sender, app_data, user_data):
     global paused
     paused = not paused
+    if paused:
+        dpg.configure_item("play_pause_button", label="Play")
+    else:
+        dpg.configure_item("play_pause_button", label="Pause")
 
 def next_frame(sender, app_data, user_data):
     global frame_idx, paused
     paused = True
+    dpg.configure_item("play_pause_button", label="Play")
     if frame_idx < video_metadata['num_frames'] - 1:
         frame_idx += 1
     dpg.set_value("frame_slider", frame_idx)
@@ -1004,6 +979,7 @@ def next_frame(sender, app_data, user_data):
 def prev_frame(sender, app_data, user_data):
     global frame_idx, paused
     paused = True
+    dpg.configure_item("play_pause_button", label="Play")
     if frame_idx > 0:
         frame_idx -= 1
     dpg.set_value("frame_slider", frame_idx)
@@ -1011,6 +987,7 @@ def prev_frame(sender, app_data, user_data):
 def set_frame(sender, app_data, user_data):
     global frame_idx, paused
     paused = True
+    dpg.configure_item("play_pause_button", label="Play")
     frame_idx = app_data
 
 def set_selected_point(sender, app_data, user_data):
@@ -1018,21 +995,29 @@ def set_selected_point(sender, app_data, user_data):
     selected_point_idx = POINT_NAMES.index(app_data)
     dpg.set_value("point_combo", POINT_NAMES[selected_point_idx])
 
+def set_human_annotated(sender, app_data, user_data):
+    if focus_selected_point:
+        human_annotated[:frame_idx + 1, :, selected_point_idx] = True
+        print(f"Marked all previous frames as human-annotated for point {POINT_NAMES[selected_point_idx]}.")
+
 def clear_future_annotations(sender, app_data, user_data):
     if focus_selected_point:
         annotations[frame_idx:, :, selected_point_idx] = np.nan
         human_annotated[frame_idx:, :, selected_point_idx] = False
         print(f"Cleared all annotations for {POINT_NAMES[selected_point_idx]} from frame {frame_idx}")
 
-def toggle_tracking(sender, app_data, user_data):
+def toggle_tracking():
     global tracking_enabled
-    new_state = user_data if app_data is None else app_data
-    tracking_enabled = new_state
-    dpg.set_value("tracking_checkbox", tracking_enabled)
+    tracking_enabled = not tracking_enabled
+    if tracking_enabled:
+        dpg.bind_item_theme("tracking_button", "tracking_button_theme")
+    else:
+        dpg.bind_item_theme("tracking_button", 0)
 
 def toggle_ga(sender, app_data, user_data):
     global train_ga, best_fitness_so_far, paused
     paused = True
+    dpg.configure_item("play_pause_button", label="Play")
     train_ga = app_data
     if train_ga:
         best_fitness_so_far = float('inf')
@@ -1090,17 +1075,22 @@ def main_dpg():
     prev_frames = [None] * video_metadata['num_videos']
     prev_frame_idx = -1
 
+    last_written_frame = -1
+    num_videos = video_metadata["num_videos"] + 1 # +1 for the 3D visualization
+    num_rows = num_videos // GRID_COLS + (1 if num_videos % GRID_COLS > 0 else 0)
+    video_recording_buffer = np.zeros((video_metadata["height"]*num_rows, video_metadata["width"]*GRID_COLS, 3), dtype=np.uint8)
+
     while dpg.is_dearpygui_running():
         # Update UI text
         dpg.set_value("frame_text", f"Frame: {frame_idx}/{video_metadata['num_frames']}")
         dpg.set_value("status_text", f"Status: {'Paused' if paused else 'Playing'}")
-        dpg.set_value("annotating_point_text", f"Annotating Point: {POINT_NAMES[selected_point_idx]}")
-        dpg.set_value("focus_text", f"Focus on Point: {'Enabled' if focus_selected_point else 'Disabled'}")
-        dpg.set_value("fitness_text", f"Best Fitness: {best_fitness_so_far:.2f}")
-        dpg.set_value("num_annotations_text", f"Num Annotations: {np.sum(~np.isnan(annotations[frame_idx])) // 2} / {NUM_POINTS * len(video_names)}")
-        dpg.set_value("num_3d_points_text", f"Num 3D Points: {np.sum(~np.isnan(reconstructed_3d_points[frame_idx]).any(axis=1))} / {NUM_POINTS}")
+        dpg.set_value("annotating_point_text", f"Annotating keypoint: {POINT_NAMES[selected_point_idx]}")
+        dpg.set_value("focus_text", f"Focus mode: {'Enabled' if focus_selected_point else 'Disabled'}")
+        dpg.set_value("fitness_text", f"Best fitness: {best_fitness_so_far:.2f}")
+        dpg.set_value("num_annotations_text", f"Num annotations: {np.sum(~np.isnan(annotations[frame_idx])) // 2} / {NUM_POINTS * len(video_names)}")
+        dpg.set_value("num_3d_points_text", f"Num 3D points: {np.sum(~np.isnan(reconstructed_3d_points[frame_idx]).any(axis=1))} / {NUM_POINTS}")
         dpg.set_value("tracking_text", f"Tracking: {'Enabled' if tracking_enabled else 'Disabled'}")
-        dpg.set_value("num_calib_frames_text", f"Num Calibration Frames: {len(calibration_frames)}")
+        dpg.set_value("num_calib_frames_text", f"Num calibration frames: {len(calibration_frames)}")
         dpg.set_value("save_video_text", f"Save output video: {'Enabled' if save_output_video else 'Disabled'}")
 
         # Frame update logic
@@ -1112,6 +1102,7 @@ def main_dpg():
                 ret, frame = cap.read()
                 if not ret:
                     paused = True
+                    dpg.configure_item("play_pause_button", label="Play")
                     frame_idx = max(0, frame_idx - 1)
                     continue
                 current_frames.append(frame)
@@ -1152,12 +1143,29 @@ def main_dpg():
                 # Convert BGR to RGBA, then to float32 and normalize
                 rgba_frame = cv2.cvtColor(frame_with_ui, cv2.COLOR_BGR2RGBA) # (H, W, 4)
                 textures[i, :, :, :] = rgba_frame.astype(np.float32) / 255.0
-
+                # Place the frame in the recording buffer
+                row = i // GRID_COLS
+                col = i % GRID_COLS
+                y_start = row * video_metadata['height']
+                x_start = col * video_metadata['width']
+                video_recording_buffer[y_start:y_start + video_metadata['height'], x_start:x_start + video_metadata['width']] = frame_with_ui                
+                               
         # Update 3D projection texture
         viz_3d_frame = scene_viz.draw_scene(scene)
         rgba_3d_frame = cv2.cvtColor(viz_3d_frame, cv2.COLOR_BGR2RGBA)
         textures[-1, :, :, :] = rgba_3d_frame.astype(np.float32) / 255.0
         
+        # Place the 3D visualization in the recording buffer
+        row = (num_videos-1) // GRID_COLS
+        col = (num_videos-1) % GRID_COLS
+        y_start = row * video_metadata['height']
+        x_start = col * video_metadata['width']
+        video_recording_buffer[y_start:y_start + video_metadata['height'], x_start:x_start + video_metadata['width']] = viz_3d_frame
+        
+        if save_output_video and video_save_output is not None and last_written_frame != frame_idx:
+            video_save_output.write(video_recording_buffer)
+            last_written_frame = frame_idx
+
         if train_ga:
             run_genetic_step()
             needs_3d_reconstruction = True
@@ -1167,6 +1175,7 @@ def main_dpg():
                 frame_idx += 1
             else:
                 paused = True
+                dpg.configure_item("play_pause_button", label="Play")
             dpg.set_value("frame_slider", frame_idx)
         
         dpg.render_dearpygui_frame()
@@ -1174,6 +1183,8 @@ def main_dpg():
     dpg.destroy_context()
     for cap in video_captures:
         cap.release()
+    if video_save_output is not None:
+        video_save_output.release()
 
 if __name__ == '__main__':
     if not os.path.exists(DATA_FOLDER):
