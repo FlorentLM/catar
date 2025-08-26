@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from typing import TypedDict, List, Tuple, Optional
+import dearpygui.dearpygui as dpg
 
 
 class SceneObject(TypedDict):
@@ -28,8 +29,8 @@ class SceneVisualizer:
         self.is_dragging = False
         self.last_mouse_pos = {'x': 0, 'y': 0}
 
-        cv2.namedWindow(self.window_name)
-        cv2.setMouseCallback(self.window_name, self.mouse_callback)
+        # cv2.namedWindow(self.window_name)
+        # cv2.setMouseCallback(self.window_name, self.mouse_callback)
 
     def mouse_callback(self, event, x, y, flags, param):
         """Handles mouse events for rotation and zooming."""
@@ -52,7 +53,33 @@ class SceneVisualizer:
         elif event == cv2.EVENT_MOUSEWHEEL:
             zoom_factor = 0.9 if flags > 0 else 1.1
             self.distance = max(1.0, self.distance * zoom_factor)
+    
+    def dpg_drag_start(self, sender, app_data, user_data):
+        """Callback for when dragging starts."""
+        self.is_dragging = True
+    
+    def dpg_drag_end(self, sender, app_data, user_data):
+        """Callback for when dragging ends."""
+        self.is_dragging = False
 
+    def dpg_drag_move(self, sender, app_data, user_data):
+        """Callback for when the image is actively being dragged."""
+        if self.is_dragging:
+            # dx, dy = app_data[0], app_data[1] # dx, dy are in app_data for this handler
+            dx, dy = dpg.get_mouse_drag_delta()
+            
+            self.azimuth -= dx * 0.0005
+            self.elevation -= dy * 0.0005
+
+
+    def dpg_on_mouse_wheel(self, sender, app_data, user_data):
+        """Global callback for the mouse wheel."""
+        # IMPORTANT: Only zoom if the mouse is over our image
+        if dpg.is_item_hovered(user_data):
+            # app_data will be +1.0 (up) or -1.0 (down)
+            zoom_factor = 0.9 if app_data > 0 else 1.1
+            self.distance = max(1.0, self.distance * zoom_factor)
+    
     def draw_scene(self, scene_objects: List[SceneObject]) -> np.ndarray:
         """Renders a dynamic list of scene objects onto a 2D canvas."""
         width, height = self.frame_size
