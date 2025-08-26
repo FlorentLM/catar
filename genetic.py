@@ -696,7 +696,7 @@ def run_genetic_step():
         return None
 
     # 2. Fitness Evaluation
-    std_dev = 0.01
+    std_dev = 0.001
     if best_individual is not None:
         mean_params = flat_individual(best_individual)  # Flatten the best individual parameters
     else:
@@ -726,8 +726,7 @@ def run_genetic_step():
 
     print(f"Generation {generation}: Best Fitness (err): {best_fitness_so_far:.2f} Mean Error: {np.nanmean(fitness_scores):.2f} Std Dev: {np.nanstd(fitness_scores):.2f}")
 
-    normalised_scores = fitness_scores - np.nanmin(fitness_scores)  # Normalize scores to avoid NaN issues
-    normalised_scores /= np.nanmax(normalised_scores)  # Normalize to [0, 1]
+    normalised_scores = (fitness_scores - np.nanmean(fitness_scores)) / (np.nanstd(fitness_scores) + 1e-8)  # Normalize scores
     # Update based on evolution strategy
     mean_params = mean_params + 0.1 * np.sum(noise * -normalised_scores[:, None], axis=0) / (POPULATION_SIZE * std_dev)  # Weighted sum of noise
 
