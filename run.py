@@ -824,16 +824,16 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
     x_pos = int((screen_width - viewport_width) * 0.5)
     y_pos = int((screen_height - viewport_height) * 0.5)
 
-    dpg.create_viewport(title='Multi-Camera 3D Tracker', width=viewport_width, height=viewport_height, x_pos=x_pos, y_pos=y_pos)
+    dpg.create_viewport(title="CATAR", width=viewport_width, height=viewport_height, x_pos=x_pos, y_pos=y_pos)
     
     with dpg.viewport_menu_bar():
         with dpg.menu(label="File"):
-            dpg.add_menu_item(label="Save State", callback=save_state)
-            dpg.add_menu_item(label="Load State", callback=load_state)
+            dpg.add_menu_item(label="Save state", callback=save_state)
+            dpg.add_menu_item(label="Load state", callback=load_state)
         with dpg.menu(label="Calibration"):
             dpg.add_menu_item(label="Run genetic algorithm", callback=toggle_ga)
             dpg.add_menu_item(label="Find worst calibration", callback=find_worst_reprojection)
-            dpg.add_menu_item(label="Worst reprojection", callback=find_worst_frame)
+            dpg.add_menu_item(label="Find worst reprojection", callback=find_worst_frame)
             dpg.add_menu_item(label="Add calibration frame", callback=add_to_calib_frames)
 
 
