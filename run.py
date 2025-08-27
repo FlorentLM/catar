@@ -421,7 +421,8 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
     proj_matrices = np.array([get_projection_matrix(i) for i in individual]) # (num_cams, 3, 4)
 
     if len(calibration_frames) == 0:
-        print("No calibration frames found / selected.")
+        dpg.set_value("status_message", "No calibration frames found / selected.")
+        dpg.show_item("status_message")        
         return float('inf')
     
     # Find frames with at least one valid annotation to process.
@@ -527,7 +528,7 @@ def calculate_all_reprojection_errors() -> List[dict]:
     return sorted_errors
 
 def find_worst_frame():
-    """Finds the frame with the worst reprojection error."""
+    """Finds the frame with the worst total reprojection error."""
     sorted_errors = calculate_all_reprojection_errors()
     frame_errors = {}
     for e in sorted_errors:
@@ -540,6 +541,12 @@ def find_worst_frame():
     pprint(sorted_frame_errors[:10])  # Print top 10 worst frames
     global frame_idx
     frame_idx = sorted_frame_errors[0][0] if sorted_frame_errors else 0
+    dpg.set_value("frame_slider", frame_idx)
+    message = (f"Worst frames by total reprojection error (frame, error):\n"
+               f"{np.round(sorted_frame_errors[:10],2)}"
+    )
+    dpg.set_value("status_message", message)
+    dpg.show_item("status_message")
 
 def find_worst_reprojection():
     sorted_errors = calculate_all_reprojection_errors()
@@ -551,6 +558,14 @@ def find_worst_reprojection():
         pprint(sorted_errors[0])
         frame_idx = sorted_errors[0]['frame']
         selected_point_idx = POINT_NAMES.index(sorted_errors[0]['point'])
+        dpg.set_value("frame_slider", frame_idx)
+        dpg.set_value("point_combo", POINT_NAMES[selected_point_idx])
+        message = (f"Mean reprojection error across all cameras and points for frame {frame_idx}: {mean_error:.2f}\n"
+                   f"Worst keypoint in frame: '{POINT_NAMES[selected_point_idx]}'\n"
+                   f"For camera: {sorted_errors[0]['camera']}"
+        )
+        dpg.set_value("status_message", message)
+        dpg.show_item("status_message")
 
 def permutation_optimization(individual: List[CameraParams]):
     """It may at random initialisation the order of cameras are not optimal
@@ -846,8 +861,8 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
             dpg.add_menu_item(label="Load state", callback=load_state)
         with dpg.menu(label="Calibration"):
             dpg.add_menu_item(label="Run genetic algorithm", callback=toggle_ga)
-            dpg.add_menu_item(label="Find worst calibration", callback=find_worst_reprojection)
-            dpg.add_menu_item(label="Find worst reprojection", callback=find_worst_frame)
+            dpg.add_menu_item(label="Find worst calibration", callback=find_worst_frame)
+            dpg.add_menu_item(label="Find worst reprojection", callback=find_worst_reprojection)
             dpg.add_menu_item(label="Add calibration frame", callback=add_to_calib_frames)
 
     create_ga_popup()
