@@ -1120,6 +1120,10 @@ def calculate_annotation_counts():
     """Calculates the number of annotations for each frame."""
     return np.sum(~np.isnan(annotations[:, :, :, 0]), axis=(1, 2))
 
+def calculate_keypoint_annotation_counts(point_idx):
+    """Calculates the number of annotations for a specific keypoint for each frame."""
+    return np.sum(~np.isnan(annotations[:, :, point_idx, 0]), axis=1)
+
 def on_histogram_click(sender, app_data):
     """Callback for when the annotation histogram is clicked."""
     global frame_idx
@@ -1152,10 +1156,6 @@ def main_dpg():
     textures = np.zeros((video_metadata['num_videos'] + 1, video_metadata['height'], video_metadata['width'], 4), dtype=np.float32) # RGBA
     create_dpg_ui(textures, scene_viz)
     
-    # Calculate and display annotation histogram
-    annotation_counts = calculate_annotation_counts()
-    dpg.set_value("annotation_histogram_series", [list(range(video_metadata['num_frames'])), annotation_counts.tolist()])
-
     # Call resize_callback once to set initial sizes
     resize_callback(None, [dpg.get_viewport_width(), dpg.get_viewport_height()], None)
 
@@ -1181,6 +1181,18 @@ def main_dpg():
         dpg.set_value("save_video_text", f"Save output video: {'Enabled' if save_output_video else 'Disabled'}")
         dpg.set_value("current_frame_line", float(frame_idx))
 
+        # Update annotation histogram based on focus mode
+        if focus_selected_point:
+            keypoint_annotation_counts = calculate_keypoint_annotation_counts(selected_point_idx)
+            dpg.configure_item("histogram_y_axis", label=f"'{POINT_NAMES[selected_point_idx]}'")
+            dpg.set_value("annotation_histogram_series", [list(range(video_metadata['num_frames'])), keypoint_annotation_counts.tolist()])
+            dpg.set_axis_limits("histogram_y_axis", 0, video_metadata['num_videos'])
+        else:
+            total_annotation_counts = calculate_annotation_counts()
+            dpg.configure_item("histogram_y_axis", label="Total annotations")
+            dpg.set_value("annotation_histogram_series", [list(range(video_metadata['num_frames'])), total_annotation_counts.tolist()])
+            dpg.set_axis_limits("histogram_y_axis", 0, max(total_annotation_counts.tolist()))
+
         # Frame update logic
         current_frames = []
         if prev_frame_idx != frame_idx:
@@ -1200,7 +1212,7 @@ def main_dpg():
                     prev_gray = cv2.cvtColor(prev_frames[i], cv2.COLOR_BGR2GRAY)
                     gray_frame = cv2.cvtColor(current_frames[i], cv2.COLOR_BGR2GRAY)
                     track_points(prev_gray, gray_frame, i)
-            if focus_selected_point:
+            if focus_selected_point and tracking_enabled:
                 # Check if the selected point is annotated in the current frame in at least two cameras
                 count = np.sum(~np.isnan(annotations[frame_idx, :, selected_point_idx, 0]))
                 if count < 2:
