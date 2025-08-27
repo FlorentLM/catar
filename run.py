@@ -1085,31 +1085,34 @@ def add_to_calib_frames(sender, app_data, user_data):
         print(f"Frame {frame_idx} added to calibration frames.")
 
 def image_click_callback(sender, app_data, user_data):
+    """Callback function for handling mouse clicks on video images."""
     global needs_3d_reconstruction
     cam_idx = user_data
     image_tag = f"video_image_{cam_idx}"
-    mouse_pos = dpg.get_mouse_pos(local=True)
-    image_pos = dpg.get_item_pos(image_tag)
+    # Mouse pos in absolute window coords
+    mouse_pos_abs = dpg.get_mouse_pos(local=False)
+    # Get the absolute position of the top-left corner of the frame
+    image_pos_abs = dpg.get_item_rect_min(image_tag)
+    local_pos_x = mouse_pos_abs[0] - image_pos_abs[0]
+    local_pos_y = mouse_pos_abs[1] - image_pos_abs[1]
+    # Current size of frame
     image_size = dpg.get_item_rect_size(image_tag)
-    # Convert mouse_pos to image coordinates
-    mouse_pos = (mouse_pos[0] - image_pos[0], mouse_pos[1] - image_pos[1])
-    # Scale mouse_pos to the original image size
-    mouse_pos = (mouse_pos[0] * video_metadata['width'] / image_size[0],
-                 mouse_pos[1] * video_metadata['height'] / image_size[1])
-    # Clamp to image bounds
-    mouse_pos = (max(0, min(video_metadata['width'] - 1, mouse_pos[0])),
-                 max(0, min(video_metadata['height'] - 1, mouse_pos[1])))
-    if app_data[0] == 0:  # Left click
+    # Scale local mouse position to original video's resolution
+    scaled_x = local_pos_x * video_metadata['width'] / image_size[0]
+    scaled_y = local_pos_y * video_metadata['height'] / image_size[1]
+    # Clip coordinates within frame bounds
+    mouse_pos = (max(0, min(video_metadata['width'] - 1, scaled_x)),
+                 max(0, min(video_metadata['height'] - 1, scaled_y)))
+    if app_data[0] == 0:  # Left click to annotate
         annotations[frame_idx, cam_idx, selected_point_idx] = (float(mouse_pos[0]), float(mouse_pos[1]))
         human_annotated[frame_idx, cam_idx, selected_point_idx] = True
-        print(f"Annotated {POINT_NAMES[selected_point_idx]} at ({mouse_pos[0]}, {mouse_pos[1]}) in Cam {cam_idx} at frame {frame_idx}")
+        print(f"Annotated {POINT_NAMES[selected_point_idx]} at ({mouse_pos[0]:.2f}, {mouse_pos[1]:.2f}) in Cam {cam_idx} at frame {frame_idx}")
         needs_3d_reconstruction = True
-    elif app_data[0] == 1: # Right click
+    elif app_data[0] == 1: # Right click to remove annotation
         annotations[frame_idx, cam_idx, selected_point_idx] = np.nan
         human_annotated[frame_idx, cam_idx, selected_point_idx] = False
-        print(f"Removed {POINT_NAMES[selected_point_idx]} in Cam {cam_idx} at frame {frame_idx}")
+        print(f"Removed annotation for {POINT_NAMES[selected_point_idx]} in Cam {cam_idx} at frame {frame_idx}")
         needs_3d_reconstruction = True
-
 
 # --- Main Loop (DPG) ---
 
