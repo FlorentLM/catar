@@ -905,8 +905,20 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
                 create_control_panel()
             # Right side video and 3D projection
             with dpg.child_window(width=-1):
-                create_video_grid(scene_viz)
-    
+                with dpg.child_window(height=-150, tag="video_grid_window"):
+                    create_video_grid(scene_viz)
+                # Annotation histogram
+                with dpg.child_window(height=150, tag="histogram_window"):
+                    with dpg.plot(label="Annotation Histogram", height=-1, width=-1, no_menus=True, no_box_select=True, no_mouse_pos=True, tag="annotation_plot"):
+                        dpg.add_plot_legend()
+                        dpg.add_plot_axis(dpg.mvXAxis, label="Frame", tag="histogram_x_axis")
+                        dpg.add_plot_axis(dpg.mvYAxis, label="Annotations", tag="histogram_y_axis")
+                        dpg.add_bar_series(list(range(video_metadata['num_frames'])), [0]*video_metadata['num_frames'], label="Annotation Count", parent="histogram_y_axis", tag="annotation_histogram_series")
+                        dpg.add_drag_line(label="Current Frame", color=[255, 0, 0, 255], vertical=True, default_value=frame_idx, tag="current_frame_line")
+                    with dpg.item_handler_registry(tag="histogram_handler"):
+                        dpg.add_item_clicked_handler(callback=on_histogram_click)
+                    dpg.bind_item_handler_registry("annotation_plot", "histogram_handler")
+
     with dpg.handler_registry():
         dpg.add_key_press_handler(callback=on_key_press)
         dpg.add_mouse_wheel_handler(callback=scene_viz.dpg_on_mouse_wheel, user_data="3d_image")
@@ -943,6 +955,7 @@ def create_control_panel():
     dpg.add_button(label="Delete future annotations", callback=clear_future_annotations)
     dpg.add_button(label="Track", callback=toggle_tracking, tag="tracking_button")
     dpg.add_button(label="Record", callback=toggle_record, tag="record_button")
+    dpg.add_checkbox(label="Show histogram", default_value=True, callback=toggle_histogram)
     dpg.add_separator()
     dpg.add_text("--- Messages ---")
     dpg.add_text("", tag="status_message", color=(255, 100, 100), wrap=280, show=False)
@@ -1100,6 +1113,30 @@ def image_click_callback(sender, app_data, user_data):
 
 # --- Main Loop (DPG) ---
 
+def calculate_annotation_counts():
+    """Calculates the number of annotations for each frame."""
+    return np.sum(~np.isnan(annotations[:, :, :, 0]), axis=(1, 2))
+
+def on_histogram_click(sender, app_data):
+    """Callback for when the annotation histogram is clicked."""
+    global frame_idx
+    mouse_pos = dpg.get_plot_mouse_pos()
+    if mouse_pos:
+        clicked_frame = int(mouse_pos[0])
+        if 0 <= clicked_frame < video_metadata['num_frames']:
+            frame_idx = clicked_frame
+            dpg.set_value("frame_slider", frame_idx)
+
+def toggle_histogram(sender, app_data, user_data):
+    """Toggles the visibility of the annotation histogram."""
+    show = dpg.is_item_shown("histogram_window")
+    if show:
+        dpg.configure_item("video_grid_window", height=-1)
+        dpg.hide_item("histogram_window")
+    else:
+        dpg.configure_item("video_grid_window", height=-150)
+        dpg.show_item("histogram_window")
+
 def main_dpg():
     """Main loop for the DearPyGui application."""
     global frame_idx, paused, needs_3d_reconstruction, best_individual, tracking_enabled, focus_selected_point, save_output_video
@@ -1112,6 +1149,10 @@ def main_dpg():
     textures = np.zeros((video_metadata['num_videos'] + 1, video_metadata['height'], video_metadata['width'], 4), dtype=np.float32) # RGBA
     create_dpg_ui(textures, scene_viz)
     
+    # Calculate and display annotation histogram
+    annotation_counts = calculate_annotation_counts()
+    dpg.set_value("annotation_histogram_series", [list(range(video_metadata['num_frames'])), annotation_counts.tolist()])
+
     # Call resize_callback once to set initial sizes
     resize_callback(None, [dpg.get_viewport_width(), dpg.get_viewport_height()], None)
 
@@ -1135,6 +1176,7 @@ def main_dpg():
         dpg.set_value("tracking_text", f"Tracking: {'Enabled' if tracking_enabled else 'Disabled'}")
         dpg.set_value("num_calib_frames_text", f"Num calibration frames: {len(calibration_frames)}")
         dpg.set_value("save_video_text", f"Save output video: {'Enabled' if save_output_video else 'Disabled'}")
+        dpg.set_value("current_frame_line", float(frame_idx))
 
         # Frame update logic
         current_frames = []
