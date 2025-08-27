@@ -928,6 +928,9 @@ def create_control_panel():
     dpg.add_button(label="Delete future annotations", callback=clear_future_annotations)
     dpg.add_button(label="Track", callback=toggle_tracking, tag="tracking_button")
     dpg.add_button(label="Record", callback=toggle_record, tag="record_button")
+    dpg.add_separator()
+    dpg.add_text("--- Messages ---")
+    dpg.add_text("", tag="status_message", color=(255, 100, 100), wrap=280, show=False)
 
 def create_video_grid(scene_viz: SceneVisualizer):
     """Creates the grid for video feeds and 3D projection."""
@@ -1137,7 +1140,17 @@ def main_dpg():
                     prev_gray = cv2.cvtColor(prev_frames[i], cv2.COLOR_BGR2GRAY)
                     gray_frame = cv2.cvtColor(current_frames[i], cv2.COLOR_BGR2GRAY)
                     track_points(prev_gray, gray_frame, i)
-            
+            if focus_selected_point:
+                # Check if the selected point is annotated in the current frame in at least two cameras
+                count = np.sum(~np.isnan(annotations[frame_idx, :, selected_point_idx, 0]))
+                if count < 2:
+                    message = f"Selected keypoint '{POINT_NAMES[selected_point_idx]}' is not annotated in at least two cameras. Please annotate more points and continue."
+                    dpg.set_value("status_message", message)
+                    dpg.show_item("status_message")
+                    paused = True
+                else:
+                    dpg.hide_item("status_message")
+
             prev_frame_idx = frame_idx
             prev_frames = current_frames
             needs_3d_reconstruction = True
