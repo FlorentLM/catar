@@ -578,6 +578,9 @@ def run_genetic_step():
     if best_individual is not None:
         mean_params = flat_individual(best_individual)  # Flatten the best individual parameters
     else:
+        dpg.set_value("ga_status_text", "Finding optimal initial permutation... Re-fitting will start automatically.")
+        dpg.set_value("ga_progress_text", "")
+        dpg.render_dearpygui_frame()
         # Initialize the population with random individuals
         population = [create_individual() for _ in range(POPULATION_SIZE)]
         for i in tqdm(population, desc="Finding optimal initial permutation"):
@@ -586,6 +589,8 @@ def run_genetic_step():
         best_individual = None
         pop_fitness = np.array([fitness(ind, annotations) for ind in population])  # (Population,)
         mean_params = flat_individual(population[np.argmin(pop_fitness)])  # Get the best parameters from the population
+        dpg.set_value("ga_status_text", "Running genetic algorithm...")
+
     num_params = mean_params.shape[0]  # Number of parameters in an individual
     noise = np.random.normal(0, std_dev, size=(POPULATION_SIZE, num_params))  # (Population, num_params)
     pop_params = noise + mean_params # Add noise to the best parameters for exploration (Population, num_params)
@@ -602,7 +607,7 @@ def run_genetic_step():
         best_fitness_so_far = fitness_scores[sorted_population_indices[0]]
         best_individual = unflat_individual(pop_params[sorted_population_indices[0]])  # Update the best individual
 
-    print(f"Generation {generation}: Best Fitness (err): {best_fitness_so_far:.2f} Mean Error: {np.nanmean(fitness_scores):.2f} Std Dev: {np.nanstd(fitness_scores):.2f}")
+    dpg.set_value("ga_progress_text", f"Generation {generation}: Best fitness (err): {best_fitness_so_far:.2f} Mean error: {np.nanmean(fitness_scores):.2f} SD: {np.nanstd(fitness_scores):.2f}")
 
     normalised_scores = (fitness_scores - np.nanmean(fitness_scores)) / (np.nanstd(fitness_scores) + 1e-8)  # Normalize scores
     # Update based on evolution strategy
@@ -790,7 +795,7 @@ def on_key_press(sender, app_data):
         case dpg.mvKey_T:
             toggle_tracking()
         case dpg.mvKey_G:
-            toggle_ga(None, None, not train_ga)
+            toggle_ga(sender, app_data, None)
         case dpg.mvKey_H:
             set_human_annotated(sender, app_data, None)
         case dpg.mvKey_D:
@@ -812,6 +817,15 @@ def on_key_press(sender, app_data):
         case dpg.mvKey_Z:
             global focus_selected_point
             focus_selected_point = not focus_selected_point
+            
+def create_ga_popup():
+    """Creates the popup window for the genetic algorithm."""
+    with dpg.window(label="Calibration", modal=False, show=False, tag="ga_popup", width=540, height=120, on_close=toggle_ga_pause):
+        dpg.add_text("Running genetic algorithm...", tag="ga_status_text")
+        dpg.add_text("", tag="ga_progress_text")
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Reset", callback=reset_ga)
+            dpg.add_button(label="Pause", callback=toggle_ga_pause, tag="ga_pause_button")
 
 def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
     """Creates the DearPyGui UI."""
@@ -836,7 +850,7 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
             dpg.add_menu_item(label="Find worst reprojection", callback=find_worst_frame)
             dpg.add_menu_item(label="Add calibration frame", callback=add_to_calib_frames)
 
-
+    create_ga_popup()
     dpg.setup_dearpygui()
     dpg.set_viewport_resize_callback(resize_callback)
 
@@ -863,7 +877,6 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
             dpg.add_theme_color(dpg.mvThemeCol_Button, (255, 0, 0, 255))
             dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (255, 50, 50, 255))
             dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (255, 100, 100, 255))
-            
     with dpg.theme(tag="tracking_button_theme"):
         with dpg.theme_component(dpg.mvButton):
             dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 255, 0, 255))
@@ -1016,12 +1029,24 @@ def toggle_tracking():
 
 def toggle_ga(sender, app_data, user_data):
     global train_ga, best_fitness_so_far, paused
+    train_ga = not train_ga
     paused = True
     dpg.configure_item("play_pause_button", label="Play")
-    train_ga = app_data
     if train_ga:
-        best_fitness_so_far = float('inf')
+        dpg.configure_item("ga_popup", show=True)
+    else:
+        dpg.configure_item("ga_popup", show=False)    
 
+def toggle_ga_pause():
+    global train_ga
+    train_ga = not train_ga
+
+def reset_ga():
+    global generation, best_fitness_so_far, best_individual
+    generation = 0
+    best_fitness_so_far = float('inf')
+    best_individual = None
+    
 def add_to_calib_frames(sender, app_data, user_data):
     global calibration_frames
     if frame_idx not in calibration_frames:
