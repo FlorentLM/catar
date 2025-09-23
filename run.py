@@ -7,9 +7,9 @@ It loads multiple synchronized videos, allows for manual annotation of points, t
 Lucas-Kanade optical flow, and uses a genetic algorithm to solve for camera intrinsics, extrinsics, and
 distortion parameters. The final output is a 3D reconstruction of the tracked points.
 """
-import os
 import cv2
 import numpy as np
+import pathlib
 import pickle
 import json
 import glob
@@ -21,11 +21,14 @@ from typing import TypedDict, List, Tuple, Optional
 from viz_3d import SceneObject, SceneVisualizer
 import dearpygui.dearpygui as dpg
 import tkinter as tk
+from scipy.spatial import ConvexHull
+from segment_anything import sam_model_registry, SamPredictor
+import torch
 
 np.set_printoptions(precision=3, suppress=True, linewidth=120)
 
 # --- Configuration ---
-DATA_FOLDER = 'data'
+DATA_FOLDER = pathlib.Path.cwd() / 'data'
 VIDEO_FORMAT = '*.mp4'
 SKELETON = {
         "thorax": [ "neck", "leg_f_L0", "leg_f_R0", "leg_m_L0", "leg_m_R0" ],
@@ -85,6 +88,7 @@ video_metadata = {
     'num_videos': 0,
     'fps': 30
 }
+current_frames = []
 
 # Data Structures
 # Shape: (num_frames, num_camera, num_points, 2) for (x, y) coordinates
@@ -96,6 +100,13 @@ calibration_frames = []  # Frames selected for calibration, empty if not set
 # Shape: (num_frames, num_points, 3) for (X, Y, Z) coordinates
 reconstructed_3d_points = None
 needs_3d_reconstruction = False
+
+# Seed mesh reconstruction state
+seed_points_2d = []
+reconstructed_seed_mesh = None
+sam_predictor = None
+auto_segment_mode = False
+SAM_MODEL_PATH = DATA_FOLDER / "sam_vit_b_01ec64.pth"
 
 # UI and Control State
 frame_idx = 300
@@ -109,38 +120,38 @@ video_save_output = None
 lk_params = dict(winSize=(9, 9),
                  maxLevel=2,
                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01))
-tracking_enabled = False
+keypoint_tracking_enabled = False
+seed_pose_tracking_enabled = False
 
-# Point colors
 point_colors = np.array([
-    [255, 0, 0],      # P1 - Red
-    [0, 255, 0],      # P2 - Green
-    [0, 0, 255],      # P3 - Blue
-    [255, 255, 0],    # P4 - Yellow
-    [0, 255, 255],    # P5 - Cyan
-    [255, 0, 255],    # P6 - Magenta
-    [192, 192, 192],  # P7 - Silver
-    [255, 128, 0],    # P8 - Orange
-    [128, 0, 255],    # P9 - Purple
-    [255, 128, 128],  # P10 - Light Red
-    [128, 128, 0],    # P11 - Olive
-    [0, 128, 128],    # P12 - Teal
-    [128, 0, 128],    # P13 - Maroon
-    [192, 128, 128],  # P14 - Salmon
-    [128, 192, 128],  # P15 - Light Green
-    [128, 128, 192],  # P16 - Light Blue
-    [192, 192, 128],  # P17 - Khaki
-    [192, 128, 192],  # P18 - Plum
-    [128, 192, 192],  # P19 - Light Cyan
-    [255, 255, 255],  # P20 - White
-    [0, 0, 0],        # P21 - Black
-    [128, 128, 128],  # P22 - Gray
-    [255, 128, 64],   # P23 - Light Orange
-    [128, 64, 255],   # P24 - Light Purple
-    [210, 105, 30],   # P25 - Chocolate
-    [128, 255, 64],   # P26 - Light Yellow
-    [128, 64, 0],     # P27 - Brown
-    [64, 128, 255]    # P28 - Light Blue
+    [255, 0, 0],       # P1 - Red
+    [0, 255, 0],       # P2 - Green
+    [0, 0, 255],       # P3 - Blue
+    [255, 255, 0],     # P4 - Yellow
+    [0, 255, 255],     # P5 - Cyan
+    [255, 0, 255],     # P6 - Magenta
+    [192, 192, 192],   # P7 - Silver
+    [255, 128, 0],     # P8 - Orange
+    [128, 0, 255],     # P9 - Purple
+    [255, 128, 128],   # P10 - Light Red
+    [128, 128, 0],     # P11 - Olive
+    [0, 128, 128],     # P12 - Teal
+    [128, 0, 128],     # P13 - Maroon
+    [192, 128, 128],   # P14 - Salmon
+    [128, 192, 128],   # P15 - Light Green
+    [128, 128, 192],   # P16 - Light Blue
+    [192, 192, 128],   # P17 - Khaki
+    [192, 128, 192],   # P18 - Plum
+    [128, 192, 192],   # P19 - Light Cyan
+    [255, 255, 255],   # P20 - White
+    [0, 0, 0],         # P21 - Black
+    [128, 128, 128],   # P22 - Gray
+    [255, 128, 64],    # P23 - Light Orange
+    [128, 64, 255],    # P24 - Light Purple
+    [210, 105, 30],    # P25 - Chocolate
+    [128, 255, 64],    # P26 - Light Yellow
+    [128, 64, 0],      # P27 - Brown
+    [64, 128, 255]     # P28 - Light Blue
 ], dtype=np.uint8)
 
 assert NUM_POINTS <= len(point_colors), "Not enough colors defined for the number of points."
@@ -267,19 +278,19 @@ def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndar
 
 def load_videos():
     """Loads all videos from the specified data folder."""
-    global annotations, reconstructed_3d_points, human_annotated
-    video_paths = sorted(glob.glob(os.path.join(DATA_FOLDER, VIDEO_FORMAT)))
+    global annotations, reconstructed_3d_points, human_annotated, seed_points_2d
+    video_paths = sorted(DATA_FOLDER.glob(VIDEO_FORMAT))
     if not video_paths:
         print(f"Error: No videos found in '{DATA_FOLDER}/' with format '{VIDEO_FORMAT}'")
         exit()
 
     for path in video_paths:
-        cap = cv2.VideoCapture(path)
+        cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
             print(f"Error: Could not open video {path}")
             continue
         video_captures.append(cap)
-        video_names.append(os.path.basename(path))
+        video_names.append(path.name)
 
     if not video_captures:
         print("Error: No videos were loaded successfully.")
@@ -296,6 +307,7 @@ def load_videos():
     annotations = np.full((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS, 2), np.nan, dtype=np.float32)
     reconstructed_3d_points = np.full((video_metadata['num_frames'], NUM_POINTS, 3), np.nan, dtype=np.float32)
     human_annotated = np.zeros((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS), dtype=bool)
+    seed_points_2d = [[] for _ in range(video_metadata['num_videos'])]
 
     print(f"Loaded {video_metadata['num_videos']} videos.")
     print(f"Resolution: {video_metadata['width']}x{video_metadata['height']}, Frames: {video_metadata['num_frames']}")
@@ -422,7 +434,7 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
 
     if len(calibration_frames) == 0:
         dpg.set_value("status_message", "No calibration frames found / selected.")
-        dpg.show_item("status_message")        
+        dpg.show_item("status_message")
         return float('inf')
     
     # Find frames with at least one valid annotation to process.
@@ -478,7 +490,7 @@ def calculate_all_reprojection_errors() -> List[dict]:
 
     # Pre-calculate masks for valid 3D points and 2D annotations to avoid re-computation
     valid_3d_mask = ~np.isnan(reconstructed_3d_points).any(axis=-1)  # Shape: (num_frames, num_points)
-    valid_2d_mask = ~np.isnan(annotations).any(axis=-1)             # Shape: (num_frames, num_cams, num_points)
+    valid_2d_mask = ~np.isnan(annotations).any(axis=-1)  # Shape: (num_frames, num_cams, num_points)
 
     # Iterate over each camera to calculate its reprojection errors
     for cam_idx in range(video_metadata['num_videos']):
@@ -640,33 +652,62 @@ def update_3d_reconstruction(best_params: List[CameraParams]):
     points_3d = combination_triangulate(frame_annotations[None], proj_matrices)[0]  # (num_points, 3)
     reconstructed_3d_points[frame_idx] = points_3d  # Update the global 3D points for this frame
 
-# --- Visualization ---
+# --- Visualisation ---
 
 def draw_ui(frame, cam_idx):
     """Draws UI elements on the frame."""
-    if best_individual is not None:
-        reprojected = reproject_points(reconstructed_3d_points[frame_idx], best_individual[cam_idx])  # (num_points, 2)
-    # Draw annotated points for the current frame
-    p_idxs = np.arange(NUM_POINTS) if not focus_selected_point else [selected_point_idx]
-    for p_idx in p_idxs:
-        point = annotations[frame_idx, cam_idx, p_idx]
-        if not np.isnan(point).any():
-            if human_annotated[frame_idx, cam_idx, p_idx]:
-                # Draw a while square around annotated points
-                cv2.circle(frame, tuple(point.astype(int)), 5 + 2, (255, 255, 255), -1) # White outline for human
-            cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[p_idx].tolist(), -1)
-            cv2.putText(frame, POINT_NAMES[p_idx], tuple(point.astype(int) + np.array([5, -5])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
-            # Reproject the 3D point back to 2D
-            if best_individual is None:
-                continue
-            point_2d_from_3d = reprojected[p_idx] # (2,)
-            if not np.isnan(point_2d_from_3d).any() and (point_2d_from_3d > 0).all():
-                # Draw a line from the reprojected point to the annotated point
-                cv2.line(frame, tuple(point.astype(int)), tuple(point_2d_from_3d.astype(int)), point_colors[p_idx].tolist(), 1)
-                # Euclidean distance text
-                distance = np.linalg.norm(point - point_2d_from_3d)
-                cv2.putText(frame, f"{distance:.2f}", tuple(point_2d_from_3d.astype(int) + np.array([5, -5])),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 1)
+    if not auto_segment_mode:
+        if best_individual is not None:
+            reprojected = reproject_points(reconstructed_3d_points[frame_idx], best_individual[cam_idx])  # (num_points, 2)
+        # Draw annotated points for the current frame
+        p_idxs = np.arange(NUM_POINTS) if not focus_selected_point else [selected_point_idx]
+        for p_idx in p_idxs:
+            point = annotations[frame_idx, cam_idx, p_idx]
+            if not np.isnan(point).any():
+                if human_annotated[frame_idx, cam_idx, p_idx]:
+                    cv2.circle(frame, tuple(point.astype(int)), 5 + 2, (255, 255, 255), -1) # White outline
+                cv2.circle(frame, tuple(point.astype(int)), 5, point_colors[p_idx].tolist(), -1)
+                cv2.putText(frame, POINT_NAMES[p_idx], tuple(point.astype(int) + np.array([5, -5])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 2)
+                # Reproject the 3D point back to 2D
+                if best_individual is None:
+                    continue
+                point_2d_from_3d = reprojected[p_idx] # (2,)
+                if not np.isnan(point_2d_from_3d).any() and (point_2d_from_3d > 0).all():
+                    # Draw a line from the reprojected point to the annotated point
+                    cv2.line(frame, tuple(point.astype(int)), tuple(point_2d_from_3d.astype(int)), point_colors[p_idx].tolist(), 1)
+                    distance = np.linalg.norm(point - point_2d_from_3d)
+                    cv2.putText(frame, f"{distance:.2f}", tuple(point_2d_from_3d.astype(int) + np.array([5, -5])),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 1)
+
+    if reconstructed_seed_mesh is not None and best_individual is not None:
+        vertices_3d = reconstructed_seed_mesh.get("vertices")
+        faces = reconstructed_seed_mesh.get("faces")
+        if vertices_3d is not None and len(vertices_3d) > 0:
+            reprojected_vertices_2d = reproject_points(vertices_3d, best_individual[cam_idx])
+            if faces is not None and len(faces) > 0:
+                for face in faces:
+                    # Get the 2D coordinates of the face's vertices
+                    p1 = reprojected_vertices_2d[face[0]].astype(int)
+                    p2 = reprojected_vertices_2d[face[1]].astype(int)
+                    p3 = reprojected_vertices_2d[face[2]].astype(int)
+                    # Draw the edges of the face in green
+                    cv2.line(frame, tuple(p1), tuple(p2), (0, 255, 255), 1)
+                    cv2.line(frame, tuple(p2), tuple(p3), (0, 255, 255), 1)
+                    cv2.line(frame, tuple(p3), tuple(p1), (0, 255, 255), 1)
+            else:  # If no faces, draw the convex hull of the points
+                valid_points_mask = ~np.isnan(reprojected_vertices_2d).any(axis=1)
+                if np.any(valid_points_mask):
+                    contour = reprojected_vertices_2d[valid_points_mask].astype(np.int32)
+                    if len(contour) > 2:
+                        hull = cv2.convexHull(contour)
+                        cv2.polylines(frame, [hull], isClosed=True, color=(0, 255, 255), thickness=1)
+
+    if auto_segment_mode and cam_idx < len(seed_points_2d) and reconstructed_seed_mesh is None:
+        if len(seed_points_2d[cam_idx]) > 1:
+            # Draw as a polygon if we have enough points
+            cv2.polylines(frame, [np.array(seed_points_2d[cam_idx], dtype=np.int32)], isClosed=True, color=(0, 255, 255), thickness=1)
+        for point in seed_points_2d[cam_idx]:
+            cv2.circle(frame, tuple(np.intp(point)), 3, (0, 255, 255), -1)
     return frame
 
 def create_camera_visual(
@@ -691,16 +732,14 @@ def create_camera_visual(
     Returns:
         A list of SceneObjects representing the camera.
     """
-    # 1. Get extrinsic parameters (world-to-camera transformation)
+    # Extrinsic parameters (world-to-camera transformation)
     rvec = cam_params['rvec'] # (3,)
     tvec = cam_params['tvec'] # (3,)
-
-    # 2. Get the camera-to-world rotation matrix (inverse of world-to-camera)
+    # Get camera-to-world rotation matrix (inverse of world-to-camera)
     R, _ = cv2.Rodrigues(rvec) # (3, 3)
-
-    # 3. Define a canonical camera pyramid in its local coordinate system
-    #    (apex at the origin, pointing down the +Z axis)
-    #    Note: OpenCV's camera convention is +Y down, +X right.
+    # Define canonical camera pyramid in its local coordinate system
+    #  (apex at the origin, pointing down the +Z axis)
+    #  Note: OpenCV's camera convention is +Y down, +X right.
     w = 0.5 * scale
     h = 0.4 * scale
     depth = 0.8 * scale
@@ -718,17 +757,11 @@ def create_camera_visual(
     # The camera center in the world is C = -R' * t
     # A point in the world is p_w = C + R' * p_c = R' * (p_c - t)
     cam_center_world = -R.T @ tvec # (3,)
-    # pyramid_points_world = (R.T @ (pyramid_points_cam - tvec).T).T # (5, 3)
     pyramid_points_world = (pyramid_points_cam - tvec) @ R # (5, 3)
-
-    # 5. Unpack points for clarity
     p0_w, p1_w, p2_w, p3_w, p4_w = pyramid_points_world
-
-    # 6. Create scene objects for the lines and the center point
     scene_objects: List[SceneObject] = []
 
     # Camera center
-    # scene_objects.append(SceneObject(type='point', coords=p0_w, color=color, label=label))
     scene_objects.append(SceneObject(type='point', coords=cam_center_world, color=color, label=label))
 
     # Pyramid edges (from apex to base corners)
@@ -746,28 +779,30 @@ def create_camera_visual(
     # Add a line to indicate the 'up' direction (+Y is down in camera coords)
     up_color = (255, 255, 255) # White for the 'up' vector
     scene_objects.append(SceneObject(type='line', coords=np.array([p1_w, p2_w]), color=up_color, label=None))
-
     return scene_objects
 
 def save_state():
     """Saves the current state of annotations and 3D points."""
-    np.save(os.path.join(DATA_FOLDER, 'annotations.npy'), annotations)
-    np.save(os.path.join(DATA_FOLDER, 'human_annotated.npy'), human_annotated)
-    np.save(os.path.join(DATA_FOLDER, 'reconstructed_3d_points.npy'), reconstructed_3d_points)
-    json.dump(calibration_frames, open(os.path.join(DATA_FOLDER, 'calibration_frames.json'), 'w'))
+    np.save(DATA_FOLDER / 'annotations.npy', annotations)
+    np.save(DATA_FOLDER / 'human_annotated.npy', human_annotated)
+    np.save(DATA_FOLDER / 'reconstructed_3d_points.npy', reconstructed_3d_points)
+    json.dump(calibration_frames, open(DATA_FOLDER / 'calibration_frames.json', 'w'))
     if best_individual is not None:
-        pickle.dump(best_individual, open(os.path.join(DATA_FOLDER, 'best_individual.pkl'), 'wb'))
+        with open(DATA_FOLDER / 'best_individual.pkl', 'wb') as f:
+            pickle.dump(best_individual, f)
     print("State saved successfully.")
 
 def load_state():
     """Loads the saved state of annotations and 3D points."""
     global annotations, human_annotated, reconstructed_3d_points, best_individual, best_fitness_so_far, calibration_frames
     try:
-        annotations = np.load(os.path.join(DATA_FOLDER, 'annotations.npy'))
-        human_annotated = np.load(os.path.join(DATA_FOLDER, 'human_annotated.npy'))
-        reconstructed_3d_points = np.load(os.path.join(DATA_FOLDER, 'reconstructed_3d_points.npy'))
-        calibration_frames = json.load(open(os.path.join(DATA_FOLDER, 'calibration_frames.json')))
-        best_individual = pickle.load(open(os.path.join(DATA_FOLDER, 'best_individual.pkl'), 'rb'))
+        annotations = np.load(DATA_FOLDER / 'annotations.npy')
+        human_annotated = np.load(DATA_FOLDER / 'human_annotated.npy')
+        reconstructed_3d_points = np.load(DATA_FOLDER / 'reconstructed_3d_points.npy')
+        with open(DATA_FOLDER / 'calibration_frames.json', 'r') as f:
+            calibration_frames = json.load(f)
+        with open(DATA_FOLDER / 'best_individual.pkl', 'rb') as f:
+            best_individual = pickle.load(f)
         best_fitness_so_far = fitness(best_individual, annotations)  # Recalculate fitness
         print("State loaded successfully.")
     except FileNotFoundError as e:
@@ -796,6 +831,10 @@ def resize_callback(sender, app_data, user_data):
 
 def on_key_press(sender, app_data):
     """Key press handler."""
+    allowed_keys = {dpg.mvKey_Q, dpg.mvKey_S, dpg.mvKey_P} # In autosegment mode
+    if auto_segment_mode and app_data not in allowed_keys:    
+        return
+        
     match app_data:
         case dpg.mvKey_Spacebar:
             toggle_pause(sender, app_data, None)
@@ -808,7 +847,9 @@ def on_key_press(sender, app_data):
         case dpg.mvKey_Down:
             set_selected_point(None, POINT_NAMES[(selected_point_idx + 1) % NUM_POINTS], None)
         case dpg.mvKey_T:
-            toggle_tracking()
+            toggle_keypoint_tracking()
+        case dpg.mvKey_P:
+            toggle_seed_pose_tracking()            
         case dpg.mvKey_G:
             toggle_ga(sender, app_data, None)
         case dpg.mvKey_H:
@@ -864,6 +905,10 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
             dpg.add_menu_item(label="Find worst calibration", callback=find_worst_frame)
             dpg.add_menu_item(label="Find worst reprojection", callback=find_worst_reprojection)
             dpg.add_menu_item(label="Add calibration frame", callback=add_to_calib_frames)
+        with dpg.menu(label="Segmentation"):
+            dpg.add_menu_item(label="Enable 2D auto-segmentation", callback=lambda: toggle_auto_segment_mode(), check=True, tag="auto_segment_checkbox")
+            dpg.add_menu_item(label="Reconstruct 3D mesh", callback=reconstruct_seed_mesh)
+            dpg.add_menu_item(label="Clear segmentation points", callback=clear_seed_points)
 
     create_ga_popup()
     dpg.setup_dearpygui()
@@ -934,7 +979,8 @@ def create_control_panel():
     dpg.add_text(f"Frame: {frame_idx}/{video_metadata['num_frames']}", tag="frame_text")
     dpg.add_text(f"Status: {'Paused' if paused else 'Playing'}", tag="status_text")
     dpg.add_text(f"Save output video: {'Enabled' if save_output_video else 'Disabled'}", tag="save_video_text")
-    dpg.add_text(f"Tracking: {'Enabled' if tracking_enabled else 'Disabled'}", tag="tracking_text")
+    dpg.add_text(f"Autosegment mode: {'Enabled' if auto_segment_mode else 'Disabled'}", tag="autosegment_text")
+    dpg.add_text(f"Tracking: {'Enabled' if (keypoint_tracking_enabled or seed_pose_tracking_enabled) else 'Disabled'}", tag="tracking_text")
     dpg.add_text(f"Focus mode: {'Enabled' if focus_selected_point else 'Disabled'}", tag="focus_text")
     dpg.add_text(f"Annotating keypoint: {POINT_NAMES[selected_point_idx]}", tag="annotating_point_text")
     dpg.add_spacing(count=5)
@@ -953,12 +999,16 @@ def create_control_panel():
     dpg.add_combo(label="Keypoint", items=POINT_NAMES, default_value=POINT_NAMES[selected_point_idx], callback=set_selected_point, tag="point_combo")
     dpg.add_button(label="Set all previous to 'human annotated'", callback=set_human_annotated)
     dpg.add_button(label="Delete future annotations", callback=clear_future_annotations)
-    dpg.add_button(label="Track", callback=toggle_tracking, tag="tracking_button")
+    dpg.add_button(label="Track keypoints", callback=toggle_keypoint_tracking, tag="keypoint_tracking_button")
+    dpg.add_button(label="Track seed pose", callback=toggle_seed_pose_tracking, tag="seed_pose_tracking_button")
     dpg.add_button(label="Record", callback=toggle_record, tag="record_button")
     dpg.add_checkbox(label="Show histogram", default_value=True, callback=toggle_histogram)
     dpg.add_separator()
     dpg.add_text("--- Messages ---")
     dpg.add_text("", tag="status_message", color=(255, 100, 100), wrap=280, show=False)
+    with dpg.group(horizontal=True):
+        dpg.add_spacer(width=125)
+        dpg.add_loading_indicator(tag="sam_loading_indicator", show=False, style=1, speed=0.5)
 
 def create_video_grid(scene_viz: SceneVisualizer):
     """Creates the grid for video feeds and 3D projection."""
@@ -1050,13 +1100,25 @@ def clear_future_annotations(sender, app_data, user_data):
         human_annotated[frame_idx:, :, selected_point_idx] = False
         print(f"Cleared all annotations for {POINT_NAMES[selected_point_idx]} from frame {frame_idx}")
 
-def toggle_tracking():
-    global tracking_enabled
-    tracking_enabled = not tracking_enabled
-    if tracking_enabled:
-        dpg.bind_item_theme("tracking_button", "tracking_button_theme")
+def toggle_keypoint_tracking():
+    global keypoint_tracking_enabled, seed_pose_tracking_enabled
+    keypoint_tracking_enabled = not keypoint_tracking_enabled
+    if keypoint_tracking_enabled:
+        dpg.bind_item_theme("keypoint_tracking_button", "tracking_button_theme")
+        seed_pose_tracking_enabled = False
+        dpg.bind_item_theme("seed_pose_tracking_button", 0)
     else:
-        dpg.bind_item_theme("tracking_button", 0)
+        dpg.bind_item_theme("keypoint_tracking_button", 0)
+
+def toggle_seed_pose_tracking():
+    global seed_pose_tracking_enabled, keypoint_tracking_enabled
+    seed_pose_tracking_enabled = not seed_pose_tracking_enabled
+    if seed_pose_tracking_enabled:
+        dpg.bind_item_theme("seed_pose_tracking_button", "tracking_button_theme")
+        keypoint_tracking_enabled = False
+        dpg.bind_item_theme("keypoint_tracking_button", 0)
+    else:
+        dpg.bind_item_theme("seed_pose_tracking_button", 0)
 
 def toggle_ga(sender, app_data, user_data):
     global train_ga, best_fitness_so_far, paused
@@ -1066,7 +1128,7 @@ def toggle_ga(sender, app_data, user_data):
     if train_ga:
         dpg.configure_item("ga_popup", show=True)
     else:
-        dpg.configure_item("ga_popup", show=False)    
+        dpg.configure_item("ga_popup", show=False)
 
 def toggle_ga_pause():
     global train_ga
@@ -1086,7 +1148,7 @@ def add_to_calib_frames(sender, app_data, user_data):
 
 def image_click_callback(sender, app_data, user_data):
     """Callback function for handling mouse clicks on video images."""
-    global needs_3d_reconstruction
+    global needs_3d_reconstruction, current_frames
     cam_idx = user_data
     image_tag = f"video_image_{cam_idx}"
     # Mouse pos in absolute window coords
@@ -1103,6 +1165,23 @@ def image_click_callback(sender, app_data, user_data):
     # Clip coordinates within frame bounds
     mouse_pos = (max(0, min(video_metadata['width'] - 1, scaled_x)),
                  max(0, min(video_metadata['height'] - 1, scaled_y)))
+    
+    if auto_segment_mode:
+        if app_data[0] == 0: # Left-click to auto-segment
+            dpg.show_item("sam_loading_indicator")
+            try:
+                print(f"Running auto-segmentation for camera {cam_idx} with prompt at {mouse_pos}...")
+                frame_to_segment = current_frames[cam_idx] # Get current frame for segmentation
+                contour_points = get_sam_segmentation(frame_to_segment, mouse_pos)
+                if contour_points is not None:
+                    seed_points_2d[cam_idx] = contour_points.tolist() # Replace the old points with new contour
+                    # print(f"Successfully segmented seed with {len(contour_points)} points.")
+                else:
+                    print("Auto-segmentation failed.")
+            finally:
+                dpg.hide_item("sam_loading_indicator")
+        return # Don't allow other functionality whilst in autosegment mode
+
     if app_data[0] == 0:  # Left click to annotate
         annotations[frame_idx, cam_idx, selected_point_idx] = (float(mouse_pos[0]), float(mouse_pos[1]))
         human_annotated[frame_idx, cam_idx, selected_point_idx] = True
@@ -1113,6 +1192,107 @@ def image_click_callback(sender, app_data, user_data):
         human_annotated[frame_idx, cam_idx, selected_point_idx] = False
         print(f"Removed annotation for {POINT_NAMES[selected_point_idx]} in Cam {cam_idx} at frame {frame_idx}")
         needs_3d_reconstruction = True
+
+def clear_seed_points():
+    """Clears all selected sam-segmented seed points."""
+    global seed_points_2d, reconstructed_seed_mesh, needs_3d_reconstruction
+    for i in range(len(seed_points_2d)):
+        seed_points_2d[i].clear()
+    reconstructed_seed_mesh = None
+    needs_3d_reconstruction = True
+
+def resample_contour(contour: np.ndarray, num_points: int) -> np.ndarray:
+    """Resamples a 2D contour to have a specific number of points."""
+    # Calculate cumulative distance along the contour
+    distances = np.cumsum(np.sqrt(np.sum(np.diff(contour, axis=0)**2, axis=1)))
+    distances = np.insert(distances, 0, 0)
+    total_length = distances[-1]
+    if total_length == 0: # Handle case of single point contour
+        return np.repeat(contour, num_points, axis=0)
+    resampled_distances = np.linspace(0, total_length, num_points)
+    resampled_x = np.interp(resampled_distances, distances, contour[:, 0])
+    resampled_y = np.interp(resampled_distances, distances, contour[:, 1])
+    return np.vstack((resampled_x, resampled_y)).T
+
+def reconstruct_seed_mesh():
+    """Reconstructs a 3D mesh from the 2D seed contours using triangulation
+    and find the best correspondence between contour points."""
+    print("hello")
+    global reconstructed_seed_mesh, needs_3d_reconstruction
+    if best_individual is None:
+        dpg.set_value("status_message", "Error: Provide calibration before reconstructing mesh.")
+        dpg.show_item("status_message")
+        return
+
+    cams_with_points = [i for i, pts in enumerate(seed_points_2d) if len(pts) > 2]
+    if len(cams_with_points) < 2:
+        dpg.set_value("status_message", "Error: Segment object in at least two views.")
+        dpg.show_item("status_message")
+        return
+
+    proj_matrices = np.array([get_projection_matrix(cam) for cam in best_individual])
+    camera_pairs = list(itertools.combinations(cams_with_points, 2))
+    all_3d_points = []
+    num_resampled_points = 50
+    for cam_idx_1, cam_idx_2 in camera_pairs:
+        print(f"Processing pair: Camera {cam_idx_1} and Camera {cam_idx_2}")
+        contour1_orig = np.array(seed_points_2d[cam_idx_1], dtype=np.float32)
+        contour2_orig = np.array(seed_points_2d[cam_idx_2], dtype=np.float32)
+        contour1 = resample_contour(contour1_orig, num_resampled_points)
+        contour2 = resample_contour(contour2_orig, num_resampled_points)
+
+        # Find the best rotational alignment by minimising reprojection error
+        min_error = float('inf')
+        best_offset = 0
+        for offset in range(num_resampled_points):
+            contour2_rolled = np.roll(contour2, offset, axis=0)
+            contour1_undistorted = undistort_points(contour1, best_individual[cam_idx_1])
+            contour2_rolled_undistorted = undistort_points(contour2_rolled, best_individual[cam_idx_2])
+            points_4d_hom = cv2.triangulatePoints(proj_matrices[cam_idx_1], proj_matrices[cam_idx_2], contour1_undistorted.T, contour2_rolled_undistorted.T)
+            points_3d = (points_4d_hom[:3] / points_4d_hom[3]).T
+            if np.any(np.isinf(points_3d)) or np.any(np.isnan(points_3d)):
+                continue # Skip if any points are at infinity
+
+            reproj1 = reproject_points(points_3d, best_individual[cam_idx_1])
+            reproj2 = reproject_points(points_3d, best_individual[cam_idx_2])
+            error1 = np.linalg.norm(contour1 - reproj1, axis=1).sum()
+            error2 = np.linalg.norm(contour2_rolled - reproj2, axis=1).sum()
+            total_error = error1 + error2
+            if total_error < min_error:
+                min_error = total_error
+                best_offset = offset
+        print(f"  - Found best alignment with offset {best_offset} and error {min_error:.2f}")
+
+        # Triangulate with the best alignment using undistorted points for final accuracy
+        contour2_aligned = np.roll(contour2, best_offset, axis=0)
+        contour1_final_undistorted = undistort_points(contour1, best_individual[cam_idx_1])
+        contour2_aligned_final_undistorted = undistort_points(contour2_aligned, best_individual[cam_idx_2])
+
+        points_4d_hom = cv2.triangulatePoints(proj_matrices[cam_idx_1], proj_matrices[cam_idx_2], contour1_final_undistorted.T, contour2_aligned_final_undistorted.T)
+        points_3d = (points_4d_hom[:3] / points_4d_hom[3]).T
+        all_3d_points.append(points_3d)
+
+    if not all_3d_points:
+        dpg.set_value("status_message", "Error: Triangulation failed.")
+        dpg.show_item("status_message")
+        return
+
+    final_points_3d = np.vstack(all_3d_points)
+    try:
+        hull = ConvexHull(final_points_3d)
+        vertices = final_points_3d
+        faces = hull.simplices
+        reconstructed_seed_mesh = {"vertices": vertices, "faces": faces}
+        needs_3d_reconstruction = True # Trigger redraw
+        print(f"Successfully reconstructed seed into a mesh with {len(vertices)} vertices and {len(faces)} faces.")
+        dpg.set_value("status_message", "Seed mesh reconstructed.")
+        dpg.show_item("status_message")
+    except Exception as e:
+        print(f"Error creating Convex Hull: {e}. Storing as point cloud.")
+        reconstructed_seed_mesh = {"vertices": final_points_3d, "faces": []} # Store as point cloud if hull fails
+        needs_3d_reconstruction = True
+        dpg.set_value("status_message", "Could not form mesh, showing point cloud.")
+        dpg.show_item("status_message")
 
 # --- Main Loop (DPG) ---
 
@@ -1144,10 +1324,65 @@ def toggle_histogram(sender, app_data, user_data):
         dpg.configure_item("video_grid_window", height=-150)
         dpg.show_item("histogram_window")
 
+def initialise_sam_model():
+    """Loads the SAM model into memory and prepares it for inference."""
+    global sam_predictor
+    if not SAM_MODEL_PATH.exists():
+        print(f"SAM model checkpoint not found at '{SAM_MODEL_PATH}'.")
+        print("Please download it and place it in the 'data' folder.")
+        return
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        sam = sam_model_registry["vit_b"](checkpoint=str(SAM_MODEL_PATH))
+        sam.to(device=device)
+        sam_predictor = SamPredictor(sam)
+    except Exception as e:
+        print(f"Error loading SAM model: {e}")
+        sam_predictor = None
+
+def get_sam_segmentation(frame, point_prompt):
+    """Uses the SAM model to segment an object based on a single point prompt."""
+    if sam_predictor is None:
+        print("SAM model is not initialized.")
+        return None
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    sam_predictor.set_image(rgb_frame)
+    input_point = np.array([point_prompt])
+    input_label = np.array([1]) # 1 indicates a foreground point
+    masks, scores, logits = sam_predictor.predict(
+        point_coords=input_point,
+        point_labels=input_label,
+        multimask_output=False, # We want the single best mask
+    )
+    if masks is None or len(masks) == 0:
+        return None
+    mask = masks[0].astype(np.uint8) # Convert the boolean mask to contour points
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    largest_contour = max(contours, key=cv2.contourArea)
+    return largest_contour.squeeze(axis=1) # Shape: (N, 2)
+
+def toggle_auto_segment_mode():
+    """Toggles the automatic seed segmentation mode."""
+    global auto_segment_mode
+    auto_segment_mode = not auto_segment_mode
+    if auto_segment_mode and sam_predictor is None:
+        initialise_sam_model() # Load the model when mode is first enabled
+        if sam_predictor is None:
+            auto_segment_mode = False
+            dpg.set_value("status_message", "Loading of SAM2 model failed. Please check its .pth file is in 'data'.")
+    dpg.set_value("auto_segment_checkbox", auto_segment_mode)
+    if auto_segment_mode:
+        dpg.set_value("status_message", "Left-click in a video frame to segment an object.")
+    else:
+        dpg.set_value("status_message", "")
+    dpg.show_item("status_message")
+    print(f"Auto-segment mode: {'On' if auto_segment_mode else 'Off'}")
+
 def main_dpg():
     """Main loop for the DearPyGui application."""
-    global frame_idx, paused, needs_3d_reconstruction, best_individual, tracking_enabled, focus_selected_point, save_output_video
-    
+    global frame_idx, paused, needs_3d_reconstruction, best_individual, keypoint_tracking_enabled, seed_pose_tracking_enabled, focus_selected_point, save_output_video, current_frames
     load_videos()
     load_state()
 
@@ -1171,12 +1406,13 @@ def main_dpg():
         # Update UI text
         dpg.set_value("frame_text", f"Frame: {frame_idx}/{video_metadata['num_frames']}")
         dpg.set_value("status_text", f"Status: {'Paused' if paused else 'Playing'}")
-        dpg.set_value("annotating_point_text", f"Annotating keypoint: {POINT_NAMES[selected_point_idx]}")
+        dpg.set_value("annotating_point_text", f"Annotating keypoint: {POINT_NAMES[selected_point_idx] if not auto_segment_mode else 'Disabled'}") # TODO: disable other functions
         dpg.set_value("focus_text", f"Focus mode: {'Enabled' if focus_selected_point else 'Disabled'}")
         dpg.set_value("fitness_text", f"Best fitness: {best_fitness_so_far:.2f}")
         dpg.set_value("num_annotations_text", f"Num annotations: {np.sum(~np.isnan(annotations[frame_idx])) // 2} / {NUM_POINTS * len(video_names)}")
         dpg.set_value("num_3d_points_text", f"Num 3D points: {np.sum(~np.isnan(reconstructed_3d_points[frame_idx]).any(axis=1))} / {NUM_POINTS}")
-        dpg.set_value("tracking_text", f"Tracking: {'Enabled' if tracking_enabled else 'Disabled'}")
+        dpg.set_value("tracking_text", f"Tracking: {'Enabled' if (keypoint_tracking_enabled or seed_pose_tracking_enabled) else 'Disabled'}")
+        dpg.set_value("autosegment_text", f"Autosegment mode: {'Enabled' if auto_segment_mode else 'Disabled'}")
         dpg.set_value("num_calib_frames_text", f"Num calibration frames: {len(calibration_frames)}")
         dpg.set_value("save_video_text", f"Save output video: {'Enabled' if save_output_video else 'Disabled'}")
         dpg.set_value("current_frame_line", float(frame_idx))
@@ -1206,13 +1442,12 @@ def main_dpg():
                     frame_idx = max(0, frame_idx - 1)
                     continue
                 current_frames.append(frame)
-
-            if tracking_enabled and prev_frame_idx != -1 and prev_frame_idx == frame_idx - 1 and prev_frames and prev_frames[0] is not None:
+            if keypoint_tracking_enabled and prev_frame_idx != -1 and prev_frame_idx == frame_idx - 1 and prev_frames and prev_frames[0] is not None:
                 for i in range(video_metadata['num_videos']):
                     prev_gray = cv2.cvtColor(prev_frames[i], cv2.COLOR_BGR2GRAY)
                     gray_frame = cv2.cvtColor(current_frames[i], cv2.COLOR_BGR2GRAY)
                     track_points(prev_gray, gray_frame, i)
-            if focus_selected_point and tracking_enabled:
+            if focus_selected_point and keypoint_tracking_enabled:
                 # Check if the selected point is annotated in the current frame in at least two cameras
                 count = np.sum(~np.isnan(annotations[frame_idx, :, selected_point_idx, 0]))
                 if count < 2:
@@ -1222,7 +1457,6 @@ def main_dpg():
                     paused = True
                 else:
                     dpg.hide_item("status_message")
-
             prev_frame_idx = frame_idx
             prev_frames = current_frames
             needs_3d_reconstruction = True
@@ -1232,7 +1466,7 @@ def main_dpg():
         if needs_3d_reconstruction and best_individual is not None:
             needs_3d_reconstruction = False
             update_3d_reconstruction(best_individual)
-            scene = []
+            scene.clear()
             for i, cam in enumerate(best_individual):
                 cam_viz = create_camera_visual(cam_params=cam, scale=1.0, color=point_colors[i % len(point_colors)], label=video_names[i])
                 scene.extend(cam_viz)
@@ -1245,6 +1479,17 @@ def main_dpg():
                     to_id = POINT_NAMES.index(to)
                     if not np.isnan(point).any() and not np.isnan(points_3d[to_id]).any():
                         scene.append(SceneObject(type='line', coords=np.array([point, points_3d[to_id]]), color=point_colors[i % len(point_colors)], label=None))
+            
+            if reconstructed_seed_mesh is not None:
+                vertices = reconstructed_seed_mesh["vertices"]
+                faces = reconstructed_seed_mesh["faces"]
+                for face in faces:
+                    p1 = vertices[face[0]]
+                    p2 = vertices[face[1]]
+                    p3 = vertices[face[2]]
+                    scene.append(SceneObject(type='line', coords=np.array([p1, p2]), color=(0, 255, 255), label=None))
+                    scene.append(SceneObject(type='line', coords=np.array([p2, p3]), color=(0, 255, 255), label=None))
+                    scene.append(SceneObject(type='line', coords=np.array([p3, p1]), color=(0, 255, 255), label=None))
 
         # Update video textures
         if current_frames:
@@ -1253,17 +1498,19 @@ def main_dpg():
                 # Convert BGR to RGBA, then to float32 and normalize
                 rgba_frame = cv2.cvtColor(frame_with_ui, cv2.COLOR_BGR2RGBA) # (H, W, 4)
                 textures[i, :, :, :] = rgba_frame.astype(np.float32) / 255.0
+                dpg.set_value(f"video_texture_{i}", textures[i].ravel())
                 # Place the frame in the recording buffer
                 row = i // GRID_COLS
                 col = i % GRID_COLS
                 y_start = row * video_metadata['height']
                 x_start = col * video_metadata['width']
-                video_recording_buffer[y_start:y_start + video_metadata['height'], x_start:x_start + video_metadata['width']] = frame_with_ui                
-                               
+                video_recording_buffer[y_start:y_start + video_metadata['height'], x_start:x_start + video_metadata['width']] = frame_with_ui
+
         # Update 3D projection texture
         viz_3d_frame = scene_viz.draw_scene(scene)
         rgba_3d_frame = cv2.cvtColor(viz_3d_frame, cv2.COLOR_BGR2RGBA)
         textures[-1, :, :, :] = rgba_3d_frame.astype(np.float32) / 255.0
+        dpg.set_value("3d_texture", textures[-1].ravel())
         
         # Place the 3D visualization in the recording buffer
         row = (num_videos-1) // GRID_COLS
@@ -1297,7 +1544,7 @@ def main_dpg():
         video_save_output.release()
 
 if __name__ == '__main__':
-    if not os.path.exists(DATA_FOLDER):
-        os.makedirs(DATA_FOLDER)
+    if not DATA_FOLDER.exists():
+        DATA_FOLDER.mkdir(parents=True)
         print(f"Created '{DATA_FOLDER}' directory. Please add your videos there.")
     main_dpg()
