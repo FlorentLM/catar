@@ -22,6 +22,7 @@ from viz_3d import SceneObject, SceneVisualizer
 import dearpygui.dearpygui as dpg
 import tkinter as tk
 from scipy.spatial import ConvexHull
+from scipy.optimize import minimize
 from segment_anything import sam_model_registry, SamPredictor
 import torch
 
@@ -107,12 +108,13 @@ reconstructed_seed_mesh = None
 sam_predictor = None
 auto_segment_mode = False
 SAM_MODEL_PATH = DATA_FOLDER / "sam_vit_b_01ec64.pth"
+seed_mesh_poses: np.ndarray = None  # (num_frames, 6) for (tvec, rvec) which is (tx, ty, tz, rx, ry, rz)
 
 # UI and Control State
 frame_idx = 300
 paused = True
 selected_point_idx = 0  # Default to P1
-focus_selected_point = False  # Whether to focus on the selected point in the visualization
+focus_selected_point = False  # Whether to focus on the selected point in the visualisation
 save_output_video = False
 video_save_output = None
 
@@ -278,7 +280,7 @@ def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndar
 
 def load_videos():
     """Loads all videos from the specified data folder."""
-    global annotations, reconstructed_3d_points, human_annotated, seed_points_2d
+    global annotations, reconstructed_3d_points, human_annotated, seed_points_2d, seed_mesh_poses
     video_paths = sorted(DATA_FOLDER.glob(VIDEO_FORMAT))
     if not video_paths:
         print(f"Error: No videos found in '{DATA_FOLDER}/' with format '{VIDEO_FORMAT}'")
@@ -308,6 +310,7 @@ def load_videos():
     reconstructed_3d_points = np.full((video_metadata['num_frames'], NUM_POINTS, 3), np.nan, dtype=np.float32)
     human_annotated = np.zeros((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS), dtype=bool)
     seed_points_2d = [[] for _ in range(video_metadata['num_videos'])]
+    seed_mesh_poses = np.zeros((video_metadata['num_frames'], 6), dtype=np.float32)  # (num_frames, 6) for (tx, ty, tz, rx, ry, rz)
 
     print(f"Loaded {video_metadata['num_videos']} videos.")
     print(f"Resolution: {video_metadata['width']}x{video_metadata['height']}, Frames: {video_metadata['num_frames']}")
@@ -322,37 +325,30 @@ def track_points(prev_gray, current_gray, cam_idx):
         # Only track the selected point
         valid_points_indices[:] = False
         valid_points_indices[selected_point_idx] = True
-
     if not np.any(valid_points_indices):
         return
-
     p0_valid = p0[valid_points_indices].reshape(-1, 1, 2)
-
     # Calculate optical flow
     p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, current_gray, p0_valid, None, **lk_params)
-
     # Update annotations with tracked points
     if p1 is not None and st.any():
         good_new = p1[st == 1]
-
         # Get original indices of good points
         original_indices = np.where(valid_points_indices)[0]
         good_original_indices = original_indices[st.flatten() == 1]
-
         for i, idx in enumerate(good_original_indices):
             # Only update if the point is not already manually annotated in the current frame
             if np.isnan(annotations[frame_idx, cam_idx, idx]).any() or not human_annotated[frame_idx, cam_idx, idx]:
                 annotations[frame_idx, cam_idx, idx] = good_new[i]
 
 
-# --- Genetic Algorithm for Camera Calibration ---
+# --- Genetic algorithm for camera calibration ---
 
 def create_individual() -> List[CameraParams]:
     """Creates a single individual with a robust lookAt orientation."""
     w, h = video_metadata['width'], video_metadata['height']
     num_cameras = video_metadata['num_videos']
     radius = 5  # Initial guess for camera distance from origin
-
     individual = []
     for i in range(num_cameras):
         # Intrinsics
@@ -360,20 +356,16 @@ def create_individual() -> List[CameraParams]:
         fy = random.uniform(h * 0.8, h * 1.5)
         cx = w / 2 + random.uniform(-w * 0.05, w * 0.05)
         cy = h / 2 + random.uniform(-h * 0.05, h * 0.05)
-
         # Distortion (keep it small initially)
         dist = np.random.normal(0.0, 0.001, size=NUM_DIST_COEFFS).astype(np.float32)
-
-        # 1. Calculate tvec: Position the camera in a circle
+        # Calculate tvec: position the camera in a circle
         angle = (2 * np.pi / num_cameras) * i
         x = radius * np.cos(angle) + random.uniform(-0.1, 0.1)
         y = 2 + random.uniform(-0.5, 0.5)
         z = radius * np.sin(angle) + random.uniform(-0.1, 0.1)
         cam_in_world = np.array([x, y, z], dtype=np.float32)
-
-        # 2. Calculate rvec: Make the camera "look at" the target
+        # Calculate rvec: make the camera "look at" the target
         # Forward vector (from camera to target)
-
         # The point all cameras are looking at
         target = np.array([0, 0, 0], dtype=np.float32)
         world_up = np.array([0, 1, 0], dtype=np.float32)
@@ -385,9 +377,7 @@ def create_individual() -> List[CameraParams]:
         R = np.array([right, cap_up, forward])
         rvec, _ = cv2.Rodrigues(R)  # Convert rotation matrix to rotation vector
         tvec = -R @ cam_in_world  # Translation vector to move the camera to the origin
-
         individual.append(CameraParams(fx=fx, fy=fy, cx=cx, cy=cy, dist=dist, rvec=rvec.flatten(), tvec=tvec.flatten()))
-
     return individual
 
 def mutate(individual: List[CameraParams]) -> List[CameraParams]:
@@ -400,20 +390,15 @@ def mutate(individual: List[CameraParams]) -> List[CameraParams]:
         fy = cam_params['fy'] + np.random.normal(0, alpha)
         cx = cam_params['cx'] + np.random.normal(0, alpha)
         cy = cam_params['cy'] + np.random.normal(0, alpha)
-
         # Mutate distortion
         dist = cam_params['dist'] + np.random.normal(0, alpha, size=cam_params['dist'].shape[0])
-
         # Mutate extrinsics
         rvec = cam_params['rvec'] + np.random.normal(0, np.pi/180, size=3)
         tvec = cam_params['tvec'] + np.random.normal(0, alpha, size=3)
-
         mutated.append(CameraParams(fx=fx, fy=fy, cx=cx, cy=cy, dist=dist, rvec=rvec, tvec=tvec))
-
     # Anchor camera 0 to the origin
     # mutated[0]['rvec'] = np.zeros(3, dtype=np.float32)  # No rotation
     # mutated[0]['tvec'] = np.zeros(3, dtype=np.float32)  # No translation
-
     return mutated
 
 def fitness(individual: List[CameraParams], annotations: np.ndarray):
@@ -424,12 +409,9 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
     Lower reprojection error results in a higher fitness score.
     """
     reprojection_errors = []
-
     num_cams = annotations.shape[1]
-
-    # --- Pre-computation for Efficiency ---
     # Get projection matrices and camera parameters once to avoid redundant calculations in the loop.
-    # **We are ignoring the intrinsics because we undistort the points before triangulation.**
+    # We are ignoring the intrinsics because we undistort the points before triangulation.
     proj_matrices = np.array([get_projection_matrix(i) for i in individual]) # (num_cams, 3, 4)
 
     if len(calibration_frames) == 0:
@@ -472,14 +454,11 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
 
 def calculate_all_reprojection_errors() -> List[dict]:
     """Finds the top_k worst reprojection errors across all frames, cameras, and points."""
-    # Check if the camera parameters (best_individual) are available
     if 'best_individual' not in globals() or best_individual is None:
         print("Optimized camera parameters ('best_individual') not found.")
         return []
-
     # Compute reconstruction
     undistorted_annotations = np.full_like(annotations, np.nan, dtype=np.float32)  # (frames, num_cams, num_points, 2)
-
     for c in range(video_metadata['num_videos']):
         undistorted_annotations[:, c] = undistort_points(annotations[:, c], best_individual[c])  # (frames, num_points, 2)
     proj_matrices = np.array([get_projection_matrix(i) for i in best_individual])
@@ -487,7 +466,6 @@ def calculate_all_reprojection_errors() -> List[dict]:
     reconstructed_3d_points[:] = points_3d  # Update the global 3D points for this frame
 
     all_errors = []
-
     # Pre-calculate masks for valid 3D points and 2D annotations to avoid re-computation
     valid_3d_mask = ~np.isnan(reconstructed_3d_points).any(axis=-1)  # Shape: (num_frames, num_points)
     valid_2d_mask = ~np.isnan(annotations).any(axis=-1)  # Shape: (num_frames, num_cams, num_points)
@@ -496,10 +474,8 @@ def calculate_all_reprojection_errors() -> List[dict]:
     for cam_idx in range(video_metadata['num_videos']):
         # Find points that are valid in both the 3D data and this camera's 2D annotations
         common_mask = valid_3d_mask & valid_2d_mask[:, cam_idx]
-
         # Get the (frame_idx, point_idx) coordinates for all valid points
         frame_indices, point_indices = np.where(common_mask)
-
         # If no valid points exist for this camera, skip to the next one
         if frame_indices.size == 0:
             continue
@@ -507,7 +483,6 @@ def calculate_all_reprojection_errors() -> List[dict]:
         # Select the corresponding 3D points and 2D ground truth annotations
         points_3d = reconstructed_3d_points[frame_indices, point_indices]
         points_2d = annotations[frame_indices, cam_idx, point_indices]
-
         # Reproject the 3D points onto the current camera's 2D image plane
         reprojected_points = reproject_points(points_3d, best_individual[cam_idx]) # (num_valid_points, 2)
 
@@ -518,11 +493,9 @@ def calculate_all_reprojection_errors() -> List[dict]:
         points_2d = points_2d[valid_reprojection_mask]
         frame_indices = frame_indices[valid_reprojection_mask]
         point_indices = point_indices[valid_reprojection_mask]
-
         # Calculate the Euclidean distance (L2 norm) between reprojected and annotated points
         errors = np.square(reprojected_points - points_2d)
         errors = np.sqrt(np.sum(errors, axis=-1))  # Shape: (num_valid_points,)
-
         # Store each error along with its full context (frame, camera, point index)
         for i in range(len(errors)):
             all_errors.append({
@@ -600,7 +573,7 @@ def run_genetic_step():
         print("Not enough annotations to run calibration. Please annotate more points.")
         return None
 
-    # 2. Fitness Evaluation
+    # Fitness evaluation
     std_dev = 0.001
     if best_individual is not None:
         mean_params = flat_individual(best_individual)  # Flatten the best individual parameters
@@ -608,11 +581,11 @@ def run_genetic_step():
         dpg.set_value("ga_status_text", "Finding optimal initial permutation... Re-fitting will start automatically.")
         dpg.set_value("ga_progress_text", "")
         dpg.render_dearpygui_frame()
-        # Initialize the population with random individuals
+        # Initialise the population with random individuals
         population = [create_individual() for _ in range(POPULATION_SIZE)]
         for i in tqdm(population, desc="Finding optimal initial permutation"):
             permutation_optimization(i)
-        best_fitness_so_far = float('inf')  # Initialize to a very high value
+        best_fitness_so_far = float('inf')  # Initialise to a very high value
         best_individual = None
         pop_fitness = np.array([fitness(ind, annotations) for ind in population])  # (Population,)
         mean_params = flat_individual(population[np.argmin(pop_fitness)])  # Get the best parameters from the population
@@ -627,15 +600,12 @@ def run_genetic_step():
         temp_individual = unflat_individual(pop_params[i])  # Unflatten the parameters
         fitness_scores[i] = fitness(temp_individual, annotations)  # Calculate fitness for the individual
 
-    # 3. Selection (Elitism + Tournament)
+    # Selection (elitism + tournament)
     sorted_population_indices = np.argsort(fitness_scores)  # Sort in ascending order
-
     if fitness_scores[sorted_population_indices[0]] < best_fitness_so_far:
         best_fitness_so_far = fitness_scores[sorted_population_indices[0]]
         best_individual = unflat_individual(pop_params[sorted_population_indices[0]])  # Update the best individual
-
     dpg.set_value("ga_progress_text", f"Generation {generation}: Best fitness (err): {best_fitness_so_far:.2f} Mean error: {np.nanmean(fitness_scores):.2f} SD: {np.nanstd(fitness_scores):.2f}")
-
     normalised_scores = (fitness_scores - np.nanmean(fitness_scores)) / (np.nanstd(fitness_scores) + 1e-8)  # Normalize scores
     # Update based on evolution strategy
     mean_params = mean_params + 0.1 * np.sum(noise * -normalised_scores[:, None], axis=0) / (POPULATION_SIZE * std_dev)  # Weighted sum of noise
@@ -651,6 +621,88 @@ def update_3d_reconstruction(best_params: List[CameraParams]):
         undistorted_annotations[c] = undistort_points(frame_annotations[c], best_params[c])  # (num_points, 2)
     points_3d = combination_triangulate(frame_annotations[None], proj_matrices)[0]  # (num_points, 3)
     reconstructed_3d_points[frame_idx] = points_3d  # Update the global 3D points for this frame
+
+# --- Segmentation ---
+
+def translate_rotate_seed_mesh_3d(pose: np.ndarray) -> np.ndarray:
+    """Translates and rotates the seed mesh points based on the current frame's seed mesh pose."""
+    # pose (6,) tx, ty, tz, rx, ry, rz
+    if reconstructed_seed_mesh is None:
+        return
+    points_3d = reconstructed_seed_mesh['points']  # (points, 3)
+    tvec = pose[:3]
+    rvec = pose[3:]
+    R, _ = cv2.Rodrigues(rvec)
+    transformed_points = (R @ points_3d.T).T + tvec  # Apply rotation and translation
+    return transformed_points  # (points, 3)
+
+def reproject_seed_segmentation_as_contour(cam_idx: int, pose: np.ndarray) -> np.ndarray:
+    """Reproject 2d seed contour (shadow) from 3d reconstructed mesh."""
+    if reconstructed_seed_mesh is None or best_individual is None:
+        return
+    points_3d = translate_rotate_seed_mesh_3d(pose) # (points, 3)
+    vertex_points_3d = points_3d[reconstructed_seed_mesh['vertices']] # (vertices, 3)
+    reprojected = reproject_points(vertex_points_3d, best_individual[cam_idx]) # (vertices, 2)
+    hull = ConvexHull(reprojected)
+    hull = reprojected[hull.vertices]  # (hull_points, 2)
+    return hull
+
+def resample_contour(contour: np.ndarray, num_points: int) -> np.ndarray:
+    """Resamples a 2D contour to have a specific number of points."""
+    closed_contour = np.vstack([contour, contour[0]])
+    distances = np.cumsum(np.sqrt(np.sum(np.diff(closed_contour, axis=0)**2, axis=1)))
+    distances = np.insert(distances, 0, 0)
+    total_length = distances[-1]
+    if total_length < 1e-6: # Handle case of single or identical points
+        return np.repeat(contour[:1], num_points, axis=0)
+    resampled_distances = np.linspace(0, total_length, num_points, endpoint=False) # Use endpoint=False for closed loop
+    resampled_x = np.interp(resampled_distances, distances, closed_contour[:, 0])
+    resampled_y = np.interp(resampled_distances, distances, closed_contour[:, 1])
+    return np.vstack((resampled_x, resampled_y)).T
+
+
+def estimate_seed_pose():
+    """Estimates the seed mesh pose for the current frame using PnP."""
+    if reconstructed_seed_mesh is None or best_individual is None:
+        return
+    def calc_error(pose: np.ndarray) -> float:
+        # Assume seed_points_2d, reproject_seed_segmentation_as_contour,
+        # and resample_contour are defined elsewhere.
+        cameras_with_seed_segmentation = [i for i, seeds in enumerate(seed_points_2d) if len(seeds) > 0]
+        total_error = 0
+        count = 0
+        for i in cameras_with_seed_segmentation:
+            contour_2d = reproject_seed_segmentation_as_contour(i, pose)
+            if contour_2d is None or len(contour_2d) < 5:
+                continue
+            seed_2d = np.array(seed_points_2d[i], dtype=np.float32)
+            if len(seed_2d) < 5:
+                continue
+            # Resample both contours to a fixed number of points
+            resampled_projected = resample_contour(contour_2d, 100)
+            resampled_observed = resample_contour(seed_2d, 100)
+            # Find the best alignment by shifting the starting point
+            best_error_for_cam = float('inf')
+            for offset in range(len(resampled_projected)):
+                rolled_contour = np.roll(resampled_projected, offset, axis=0)
+                pointwise_distances = np.linalg.norm(resampled_observed - rolled_contour, axis=1)
+                # Use the 90th percentile instead of the mean to ignore the worst 10% of errors (outliers)
+                error = np.percentile(pointwise_distances, 90)                
+                if error < best_error_for_cam:
+                    best_error_for_cam = error
+            total_error += best_error_for_cam
+            count += 1
+        print("Total robust seed reprojection error:", total_error, "Count:", count, "pose", pose)
+        return total_error / count if count > 0 else float('inf') 
+    # Initial guess for pose
+    initial_pose = seed_mesh_poses[frame_idx]
+    print("Optimizing seed mesh pose for frame", frame_idx)
+    result = minimize(calc_error, initial_pose, method='Nelder-Mead', options={'maxiter': 1000, 'xatol': 1e-2, 'fatol': 1e-2, 'disp': False})
+    print("Result", result)
+    if result.success:
+        seed_mesh_poses[frame_idx] = result.x
+    else:
+        print("Seed mesh pose optimization failed for frame", frame_idx)
 
 # --- Visualisation ---
 
@@ -679,35 +731,45 @@ def draw_ui(frame, cam_idx):
                     cv2.putText(frame, f"{distance:.2f}", tuple(point_2d_from_3d.astype(int) + np.array([5, -5])),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, point_colors[p_idx].tolist(), 1)
 
+    # Draw 3D reconstructed mesh reprojected back down to 2d cameras
     if reconstructed_seed_mesh is not None and best_individual is not None:
-        vertices_3d = reconstructed_seed_mesh.get("vertices")
-        faces = reconstructed_seed_mesh.get("faces")
-        if vertices_3d is not None and len(vertices_3d) > 0:
-            reprojected_vertices_2d = reproject_points(vertices_3d, best_individual[cam_idx])
-            if faces is not None and len(faces) > 0:
-                for face in faces:
-                    # Get the 2D coordinates of the face's vertices
-                    p1 = reprojected_vertices_2d[face[0]].astype(int)
-                    p2 = reprojected_vertices_2d[face[1]].astype(int)
-                    p3 = reprojected_vertices_2d[face[2]].astype(int)
-                    # Draw the edges of the face in green
-                    cv2.line(frame, tuple(p1), tuple(p2), (0, 255, 255), 1)
-                    cv2.line(frame, tuple(p2), tuple(p3), (0, 255, 255), 1)
-                    cv2.line(frame, tuple(p3), tuple(p1), (0, 255, 255), 1)
-            else:  # If no faces, draw the convex hull of the points
-                valid_points_mask = ~np.isnan(reprojected_vertices_2d).any(axis=1)
-                if np.any(valid_points_mask):
-                    contour = reprojected_vertices_2d[valid_points_mask].astype(np.int32)
-                    if len(contour) > 2:
-                        hull = cv2.convexHull(contour)
-                        cv2.polylines(frame, [hull], isClosed=True, color=(0, 255, 255), thickness=1)
+        contour_2d = reproject_seed_segmentation_as_contour(cam_idx, seed_mesh_poses[frame_idx])
+        if contour_2d is not None and len(contour_2d) > 0:
+            cv2.drawContours(frame, [contour_2d.astype(np.int32)], -1, (0, 255, 0), 1)
+            # resampled_contour = resample_contour(contour_2d, 100)
+            # for point in resampled_contour:
+            #     cv2.circle(frame, tuple(point.astype(int)), 2, (255, 255, 0), -1)
+        # points_3d = reconstructed_seed_mesh.get("points") # (points, 3)
+        # faces = reconstructed_seed_mesh.get("faces") # (faces, 3) the 3 is the index of the vertex that make up the triangle face
+        # if points_3d is not None and len(points_3d) > 0:
+        #     reprojected_points_2d = reproject_points(points_3d, best_individual[cam_idx])
+        #     if faces is not None and len(faces) > 0:
+        #         # for face in faces:
+        #         #     # Get the 2D coords of the face's vertices
+        #         #     p1 = reprojected_points_2d[face[0]].astype(int)
+        #         #     p2 = reprojected_points_2d[face[1]].astype(int)
+        #         #     p3 = reprojected_points_2d[face[2]].astype(int)
+        #         #     # Draw the edges of the face in yellow
+        #         #     cv2.line(frame, tuple(p1), tuple(p2), (0, 255, 255), 1)
+        #         #     cv2.line(frame, tuple(p2), tuple(p3), (0, 255, 255), 1)
+        #         #     cv2.line(frame, tuple(p3), tuple(p1), (0, 255, 255), 1)
+        #         projected_vertices = reprojected_points_2d[reconstructed_seed_mesh['vertices']]
+        #         hull = cv2.convexHull(projected_vertices.astype(np.int32))
+        #         cv2.drawContours(frame, [hull], -1, (0, 255, 0), 1)
+        #     else:  # If no faces, draw the convex hull of the points
+        #         valid_points_mask = ~np.isnan(reprojected_points_2d).any(axis=1)
+        #         if np.any(valid_points_mask):
+        #             contour = reprojected_points_2d[valid_points_mask].astype(np.int32)
+        #             if len(contour) > 2:
+        #                 hull = cv2.convexHull(contour)
+        #                 cv2.polylines(frame, [hull], isClosed=True, color=(0, 255, 255), thickness=1)
 
-    if auto_segment_mode and cam_idx < len(seed_points_2d) and reconstructed_seed_mesh is None:
-        if len(seed_points_2d[cam_idx]) > 1:
-            # Draw as a polygon if we have enough points
-            cv2.polylines(frame, [np.array(seed_points_2d[cam_idx], dtype=np.int32)], isClosed=True, color=(0, 255, 255), thickness=1)
-        for point in seed_points_2d[cam_idx]:
-            cv2.circle(frame, tuple(np.intp(point)), 3, (0, 255, 255), -1)
+    # Draw 2D segmentations
+    if auto_segment_mode and cam_idx < len(seed_points_2d):
+        contour = np.array(seed_points_2d[cam_idx], dtype=np.int32)
+        if len(contour) > 5:
+            cv2.drawContours(frame, [contour], -1, (0, 255, 255), 1)
+
     return frame
 
 def create_camera_visual(
@@ -909,6 +971,7 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
             dpg.add_menu_item(label="Enable 2D auto-segmentation", callback=lambda: toggle_auto_segment_mode(), check=True, tag="auto_segment_checkbox")
             dpg.add_menu_item(label="Reconstruct 3D mesh", callback=reconstruct_seed_mesh)
             dpg.add_menu_item(label="Clear segmentation points", callback=clear_seed_points)
+            dpg.add_menu_item(label="Estimate seed pose in current frame", callback=estimate_seed_pose)
 
     create_ga_popup()
     dpg.setup_dearpygui()
@@ -1000,7 +1063,7 @@ def create_control_panel():
     dpg.add_button(label="Set all previous to 'human annotated'", callback=set_human_annotated)
     dpg.add_button(label="Delete future annotations", callback=clear_future_annotations)
     dpg.add_button(label="Track keypoints", callback=toggle_keypoint_tracking, tag="keypoint_tracking_button")
-    dpg.add_button(label="Track seed pose", callback=toggle_seed_pose_tracking, tag="seed_pose_tracking_button")
+    # dpg.add_button(label="Track seed pose", callback=toggle_seed_pose_tracking, tag="seed_pose_tracking_button")
     dpg.add_button(label="Record", callback=toggle_record, tag="record_button")
     dpg.add_checkbox(label="Show histogram", default_value=True, callback=toggle_histogram)
     dpg.add_separator()
@@ -1008,7 +1071,7 @@ def create_control_panel():
     dpg.add_text("", tag="status_message", color=(255, 100, 100), wrap=280, show=False)
     with dpg.group(horizontal=True):
         dpg.add_spacer(width=125)
-        dpg.add_loading_indicator(tag="sam_loading_indicator", show=False, style=1, speed=0.5)
+        dpg.add_loading_indicator(tag="loading_indicator", show=False, style=1, speed=0.5)
 
 def create_video_grid(scene_viz: SceneVisualizer):
     """Creates the grid for video feeds and 3D projection."""
@@ -1037,7 +1100,7 @@ def create_video_grid(scene_viz: SceneVisualizer):
                                 dpg.add_item_clicked_handler(callback=scene_viz.dpg_drag_start)
                             dpg.bind_item_handler_registry("3d_image", "3d_image_handler")
 
-# --- DPG Callbacks ---
+# --- DearPyGui callbacks ---
 
 def toggle_record():
     global save_output_video, video_save_output
@@ -1046,7 +1109,7 @@ def toggle_record():
         dpg.bind_item_theme("record_button", "record_button_theme")
     else:
         dpg.bind_item_theme("record_button", 0) # 0 resets to the default theme
-    if save_output_video:  # Initialize video writer
+    if save_output_video:  # Initialise video writer
         num_rows = video_metadata["num_videos"] // GRID_COLS + (1 if video_metadata["num_videos"] % GRID_COLS > 0 else 0)
         fourcc = cv2.VideoWriter_fourcc(*'hvc1')
         video_save_output = cv2.VideoWriter("recording.mp4", fourcc, 30.0, 
@@ -1168,7 +1231,7 @@ def image_click_callback(sender, app_data, user_data):
     
     if auto_segment_mode:
         if app_data[0] == 0: # Left-click to auto-segment
-            dpg.show_item("sam_loading_indicator")
+            dpg.show_item("loading_indicator")
             try:
                 print(f"Running auto-segmentation for camera {cam_idx} with prompt at {mouse_pos}...")
                 frame_to_segment = current_frames[cam_idx] # Get current frame for segmentation
@@ -1179,7 +1242,7 @@ def image_click_callback(sender, app_data, user_data):
                 else:
                     print("Auto-segmentation failed.")
             finally:
-                dpg.hide_item("sam_loading_indicator")
+                dpg.hide_item("loading_indicator")
         return # Don't allow other functionality whilst in autosegment mode
 
     if app_data[0] == 0:  # Left click to annotate
@@ -1198,26 +1261,12 @@ def clear_seed_points():
     global seed_points_2d, reconstructed_seed_mesh, needs_3d_reconstruction
     for i in range(len(seed_points_2d)):
         seed_points_2d[i].clear()
-    reconstructed_seed_mesh = None
+    # reconstructed_seed_mesh = None
     needs_3d_reconstruction = True
-
-def resample_contour(contour: np.ndarray, num_points: int) -> np.ndarray:
-    """Resamples a 2D contour to have a specific number of points."""
-    # Calculate cumulative distance along the contour
-    distances = np.cumsum(np.sqrt(np.sum(np.diff(contour, axis=0)**2, axis=1)))
-    distances = np.insert(distances, 0, 0)
-    total_length = distances[-1]
-    if total_length == 0: # Handle case of single point contour
-        return np.repeat(contour, num_points, axis=0)
-    resampled_distances = np.linspace(0, total_length, num_points)
-    resampled_x = np.interp(resampled_distances, distances, contour[:, 0])
-    resampled_y = np.interp(resampled_distances, distances, contour[:, 1])
-    return np.vstack((resampled_x, resampled_y)).T
 
 def reconstruct_seed_mesh():
     """Reconstructs a 3D mesh from the 2D seed contours using triangulation
     and find the best correspondence between contour points."""
-    print("hello")
     global reconstructed_seed_mesh, needs_3d_reconstruction
     if best_individual is None:
         dpg.set_value("status_message", "Error: Provide calibration before reconstructing mesh.")
@@ -1234,6 +1283,7 @@ def reconstruct_seed_mesh():
     camera_pairs = list(itertools.combinations(cams_with_points, 2))
     all_3d_points = []
     num_resampled_points = 50
+    dpg.show_item("loading_indicator")
     for cam_idx_1, cam_idx_2 in camera_pairs:
         print(f"Processing pair: Camera {cam_idx_1} and Camera {cam_idx_2}")
         contour1_orig = np.array(seed_points_2d[cam_idx_1], dtype=np.float32)
@@ -1271,7 +1321,6 @@ def reconstruct_seed_mesh():
         points_4d_hom = cv2.triangulatePoints(proj_matrices[cam_idx_1], proj_matrices[cam_idx_2], contour1_final_undistorted.T, contour2_aligned_final_undistorted.T)
         points_3d = (points_4d_hom[:3] / points_4d_hom[3]).T
         all_3d_points.append(points_3d)
-
     if not all_3d_points:
         dpg.set_value("status_message", "Error: Triangulation failed.")
         dpg.show_item("status_message")
@@ -1280,19 +1329,19 @@ def reconstruct_seed_mesh():
     final_points_3d = np.vstack(all_3d_points)
     try:
         hull = ConvexHull(final_points_3d)
-        vertices = final_points_3d
         faces = hull.simplices
-        reconstructed_seed_mesh = {"vertices": vertices, "faces": faces}
+        reconstructed_seed_mesh = {"points": final_points_3d, "faces": faces, "vertices": hull.vertices}
         needs_3d_reconstruction = True # Trigger redraw
-        print(f"Successfully reconstructed seed into a mesh with {len(vertices)} vertices and {len(faces)} faces.")
+        print(f"Successfully reconstructed seed into a mesh with {len(final_points_3d)} vertices and {len(faces)} faces.")
         dpg.set_value("status_message", "Seed mesh reconstructed.")
         dpg.show_item("status_message")
     except Exception as e:
         print(f"Error creating Convex Hull: {e}. Storing as point cloud.")
-        reconstructed_seed_mesh = {"vertices": final_points_3d, "faces": []} # Store as point cloud if hull fails
+        reconstructed_seed_mesh = {"points": final_points_3d, "faces": []} # Store as point cloud if hull fails
         needs_3d_reconstruction = True
         dpg.set_value("status_message", "Could not form mesh, showing point cloud.")
         dpg.show_item("status_message")
+    dpg.hide_item("loading_indicator")
 
 # --- Main Loop (DPG) ---
 
@@ -1481,12 +1530,12 @@ def main_dpg():
                         scene.append(SceneObject(type='line', coords=np.array([point, points_3d[to_id]]), color=point_colors[i % len(point_colors)], label=None))
             
             if reconstructed_seed_mesh is not None:
-                vertices = reconstructed_seed_mesh["vertices"]
+                points_3d = translate_rotate_seed_mesh_3d(seed_mesh_poses[frame_idx]) # (N, 3)
                 faces = reconstructed_seed_mesh["faces"]
                 for face in faces:
-                    p1 = vertices[face[0]]
-                    p2 = vertices[face[1]]
-                    p3 = vertices[face[2]]
+                    p1 = points_3d[face[0]]
+                    p2 = points_3d[face[1]]
+                    p3 = points_3d[face[2]]
                     scene.append(SceneObject(type='line', coords=np.array([p1, p2]), color=(0, 255, 255), label=None))
                     scene.append(SceneObject(type='line', coords=np.array([p2, p3]), color=(0, 255, 255), label=None))
                     scene.append(SceneObject(type='line', coords=np.array([p3, p1]), color=(0, 255, 255), label=None))
