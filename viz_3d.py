@@ -29,8 +29,19 @@ class SceneVisualizer:
         self.is_dragging = False
         self.last_mouse_pos = {'x': 0, 'y': 0}
 
+        # Store the initial camera state
+        self.initial_distance = self.distance
+        self.initial_azimuth = self.azimuth
+        self.initial_elevation = self.elevation
+
         # cv2.namedWindow(self.window_name)
         # cv2.setMouseCallback(self.window_name, self.mouse_callback)
+
+    def reset_view(self, sender=None, app_data=None, user_data=None):
+        """Resets the camera to its default position, rotation, and zoom."""
+        self.distance = self.initial_distance
+        self.azimuth = self.initial_azimuth
+        self.elevation = self.initial_elevation
 
     def mouse_callback(self, event, x, y, flags, param):
         """Handles mouse events for rotation and zooming."""
@@ -67,7 +78,6 @@ class SceneVisualizer:
         if self.is_dragging:
             # dx, dy = app_data[0], app_data[1] # dx, dy are in app_data for this handler
             dx, dy = dpg.get_mouse_drag_delta()
-            
             self.azimuth -= dx * 0.0005
             self.elevation -= dy * 0.0005
 
