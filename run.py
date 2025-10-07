@@ -112,6 +112,10 @@ reconstructed_seed_mesh = None
 seed_mesh_poses: np.ndarray = None  # (num_frames, 6) for (tvec, rvec) which is (tx, ty, tz, rx, ry, rz)
 initial_seed_axis_info = {}  # Stores the axis info of the seed mesh when initially reconstructed
 
+# Ground plane state
+ground_plane_mode = False
+ground_plane_data = None
+
 # UI and Control State
 frame_idx = 300
 paused = True
@@ -128,34 +132,34 @@ keypoint_tracking_enabled = False
 seed_pose_tracking_enabled = False
 
 point_colors = np.array([
-    [255, 0, 0],       # P1 - Red
-    [0, 255, 0],       # P2 - Green
-    [0, 0, 255],       # P3 - Blue
-    [255, 255, 0],     # P4 - Yellow
-    [0, 255, 255],     # P5 - Cyan
-    [255, 0, 255],     # P6 - Magenta
-    [192, 192, 192],   # P7 - Silver
-    [255, 128, 0],     # P8 - Orange
-    [128, 0, 255],     # P9 - Purple
-    [255, 128, 128],   # P10 - Light Red
-    [128, 128, 0],     # P11 - Olive
-    [0, 128, 128],     # P12 - Teal
-    [128, 0, 128],     # P13 - Maroon
-    [192, 128, 128],   # P14 - Salmon
-    [128, 192, 128],   # P15 - Light Green
-    [128, 128, 192],   # P16 - Light Blue
-    [192, 192, 128],   # P17 - Khaki
-    [192, 128, 192],   # P18 - Plum
-    [128, 192, 192],   # P19 - Light Cyan
-    [255, 255, 255],   # P20 - White
-    [0, 0, 0],         # P21 - Black
-    [128, 128, 128],   # P22 - Gray
-    [255, 128, 64],    # P23 - Light Orange
-    [128, 64, 255],    # P24 - Light Purple
-    [210, 105, 30],    # P25 - Chocolate
-    [128, 255, 64],    # P26 - Light Yellow
-    [128, 64, 0],      # P27 - Brown
-    [64, 128, 255]     # P28 - Light Blue
+    [255, 0, 0],      # P1 - Red
+    [0, 255, 0],      # P2 - Green
+    [0, 0, 255],      # P3 - Blue
+    [255, 255, 0],    # P4 - Yellow
+    [0, 255, 255],    # P5 - Cyan
+    [255, 0, 255],    # P6 - Magenta
+    [192, 192, 192],  # P7 - Silver
+    [255, 128, 0],    # P8 - Orange
+    [128, 0, 255],    # P9 - Purple
+    [255, 128, 128],  # P10 - Light Red
+    [128, 128, 0],    # P11 - Olive
+    [0, 128, 128],    # P12 - Teal
+    [128, 0, 128],    # P13 - Maroon
+    [192, 128, 128],  # P14 - Salmon
+    [128, 192, 128],  # P15 - Light Green
+    [128, 128, 192],  # P16 - Light Blue
+    [192, 192, 128],  # P17 - Khaki
+    [192, 128, 192],  # P18 - Plum
+    [128, 192, 192],  # P19 - Light Cyan
+    [255, 255, 255],  # P20 - White
+    [0, 0, 0],        # P21 - Black
+    [128, 128, 128],  # P22 - Gray
+    [255, 128, 64],   # P23 - Light Orange
+    [128, 64, 255],   # P24 - Light Purple
+    [210, 105, 30],   # P25 - Chocolate
+    [128, 255, 64],   # P26 - Light Yellow
+    [128, 64, 0],     # P27 - Brown
+    [64, 128, 255]    # P28 - Light Blue
 ], dtype=np.uint8)
 
 assert NUM_POINTS <= len(point_colors), "Not enough colors defined for the number of points."
@@ -282,7 +286,7 @@ def reproject_points(points_3d: np.ndarray, cam_params: CameraParams) -> np.ndar
 
 def load_videos():
     """Loads all videos from the specified data folder."""
-    global annotations, reconstructed_3d_points, human_annotated, seed_points_2d, seed_mesh_poses
+    global annotations, reconstructed_3d_points, human_annotated, seed_points_2d, seed_mesh_poses, ground_plane_data
     video_paths = sorted(DATA_FOLDER.glob(VIDEO_FORMAT))
     if not video_paths:
         print(f"Error: No videos found in '{DATA_FOLDER}/' with format '{VIDEO_FORMAT}'")
@@ -313,6 +317,11 @@ def load_videos():
     human_annotated = np.zeros((video_metadata['num_frames'], video_metadata['num_videos'], NUM_POINTS), dtype=bool)
     seed_points_2d = [[] for _ in range(video_metadata['num_videos'])]
     seed_mesh_poses = np.zeros((video_metadata['num_frames'], 6), dtype=np.float32)  # (num_frames, 6) for (tx, ty, tz, rx, ry, rz)
+    ground_plane_data = {
+        'frame': -1,
+        'points_2d': [[] for _ in range(video_metadata['num_videos'])],
+        'plane_model': None
+    }
 
     print(f"Loaded {video_metadata['num_videos']} videos.")
     print(f"Resolution: {video_metadata['width']}x{video_metadata['height']}, Frames: {video_metadata['num_frames']}")
@@ -420,7 +429,6 @@ def fitness(individual: List[CameraParams], annotations: np.ndarray):
         dpg.set_value("status_message", "No calibration frames found / selected.")
         dpg.show_item("status_message")
         return float('inf')
-    
     # Find frames with at least one valid annotation to process.
     valid_frames_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3)) & np.any(human_annotated, axis=(1, 2)) # (num_frames,)
     calibration_frames_mask = np.zeros_like(valid_frames_mask, dtype=bool)  # (num_frames,)
@@ -611,7 +619,6 @@ def run_genetic_step():
     normalised_scores = (fitness_scores - np.nanmean(fitness_scores)) / (np.nanstd(fitness_scores) + 1e-8)  # Normalize scores
     # Update based on evolution strategy
     mean_params = mean_params + 0.1 * np.sum(noise * -normalised_scores[:, None], axis=0) / (POPULATION_SIZE * std_dev)  # Weighted sum of noise
-
     generation += 1
 
 def update_3d_reconstruction(best_params: List[CameraParams]):
@@ -662,7 +669,6 @@ def resample_contour(contour: np.ndarray, num_points: int) -> np.ndarray:
     resampled_y = np.interp(resampled_distances, distances, closed_contour[:, 1])
     return np.vstack((resampled_x, resampled_y)).T
 
-
 def estimate_seed_pose():
     """Estimates the seed mesh pose for the current frame using PnP."""
     if reconstructed_seed_mesh is None or best_individual is None:
@@ -687,13 +693,13 @@ def estimate_seed_pose():
                 rolled_contour = np.roll(resampled_projected, offset, axis=0)
                 pointwise_distances = np.linalg.norm(resampled_observed - rolled_contour, axis=1)
                 # Use the 90th percentile instead of the mean to ignore the worst 10% of errors (outliers)
-                error = np.percentile(pointwise_distances, 90)                
+                error = np.percentile(pointwise_distances, 90)
                 if error < best_error_for_cam:
                     best_error_for_cam = error
             total_error += best_error_for_cam
             count += 1
         print("Total robust seed reprojection error:", total_error, "Count:", count, "pose", pose)
-        return total_error / count if count > 0 else float('inf') 
+        return total_error / count if count > 0 else float('inf')
     # Initial guess for pose
     initial_pose = seed_mesh_poses[frame_idx]
     print("Optimizing seed mesh pose for frame", frame_idx)
@@ -702,13 +708,52 @@ def estimate_seed_pose():
     if result.success:
         seed_mesh_poses[frame_idx] = result.x
     else:
-        print("Seed mesh pose optimization failed for frame", frame_idx)
+        print("Seed mesh pose optimisation failed for frame", frame_idx)
+
+def toggle_ground_plane():
+    """Toggles the ground plane estimation mode."""
+    global ground_plane_mode
+    ground_plane_mode = not ground_plane_mode
+    if ground_plane_mode:
+        dpg.set_value("status_message", "Select four points on the ground plane in at least two views (in the same order).")
+        dpg.show_item("status_message")
+        for i in range(video_metadata['num_videos']):
+            ground_plane_data['points_2d'][i].clear()  # Clear previous points
+    else:
+        dpg.hide_item("status_message")
+
+def draw_ground_plane(scene: list):
+    """Adds the ground plane visualization to the 3D scene."""
+    normal = ground_plane_data['plane_model']['normal']
+    d = ground_plane_data['plane_model']['d']    
+    # Create a large rectangle on the estimated plane
+    if np.allclose(normal, [0, 1, 0]) or np.allclose(normal, [0, -1, 0]):
+        u = np.array([1, 0, 0])
+    else:
+        u = np.cross(normal, [0, 1, 0])
+    u /= np.linalg.norm(u)
+    v = np.cross(normal, u)
+    v /= np.linalg.norm(v)
+    # Center of the plane (can be approximated from the points used for estimation)
+    # For now, let's assume it's around the origin for simplicity
+    center = -d * normal # A point on the plane
+
+    size = 1.5 # Size of the rectangle
+    p1 = center + size * u + size * v
+    p2 = center - size * u + size * v
+    p3 = center - size * u - size * v
+    p4 = center + size * u - size * v
+    color = (128, 128, 128, 200)
+    scene.append(SceneObject(type='line', coords=np.array([p1, p2]), color=color, label=None))
+    scene.append(SceneObject(type='line', coords=np.array([p2, p3]), color=color, label=None))
+    scene.append(SceneObject(type='line', coords=np.array([p3, p4]), color=color, label=None))
+    scene.append(SceneObject(type='line', coords=np.array([p4, p1]), color=color, label=None))
 
 # --- Visualisation ---
 
 def draw_ui(frame, cam_idx):
     """Draws UI elements on the frame."""
-    if not auto_segment_mode:
+    if not auto_segment_mode and not ground_plane_mode:
         if best_individual is not None:
             reprojected = reproject_points(reconstructed_3d_points[frame_idx], best_individual[cam_idx])  # (num_points, 2)
         # Draw annotated points for the current frame
@@ -742,6 +787,11 @@ def draw_ui(frame, cam_idx):
         contour = np.array(seed_points_2d[cam_idx], dtype=np.int32)
         if len(contour) > 5:
             cv2.drawContours(frame, [contour], -1, (0, 255, 255), 1)
+            
+    # Draw ground plane selected points
+    if ground_plane_mode and ground_plane_data:
+        for point in ground_plane_data['points_2d'][cam_idx]:
+            cv2.circle(frame, tuple(np.array(point, dtype=int)), 5, (0, 255, 0), -1)
 
     return frame
 
@@ -825,11 +875,20 @@ def save_state():
     if best_individual is not None:
         with open(DATA_FOLDER / 'best_individual.pkl', 'wb') as f:
             pickle.dump(best_individual, f)
+    if ground_plane_data is not None:
+        with open(DATA_FOLDER / 'ground_plane.pkl', 'wb') as f:
+            pickle.dump(ground_plane_data, f)
+    np.save(DATA_FOLDER / 'seed_mesh_poses.npy', seed_mesh_poses)
+    with open(DATA_FOLDER / 'initial_seed_axis_info.pkl', 'wb') as f:
+        pickle.dump(initial_seed_axis_info, f)
+    with open(DATA_FOLDER / 'reconstructed_seed_mesh.pkl', 'wb') as f:
+        pickle.dump(reconstructed_seed_mesh, f)
     print("State saved successfully.")
 
 def load_state():
     """Loads the saved state of annotations and 3D points."""
-    global annotations, human_annotated, reconstructed_3d_points, best_individual, best_fitness_so_far, calibration_frames
+    global annotations, human_annotated, reconstructed_3d_points, best_individual, best_fitness_so_far, calibration_frames, ground_plane_data
+    global seed_mesh_poses, initial_seed_axis_info, reconstructed_seed_mesh
     try:
         annotations = np.load(DATA_FOLDER / 'annotations.npy')
         human_annotated = np.load(DATA_FOLDER / 'human_annotated.npy')
@@ -839,6 +898,13 @@ def load_state():
             best_individual = pickle.load(f)
         best_fitness_so_far = fitness(best_individual, annotations)  # Recalculate fitness
         reconstructed_3d_points = np.load(DATA_FOLDER / 'reconstructed_3d_points.npy')
+        with open(DATA_FOLDER / 'ground_plane.pkl', 'rb') as f:
+            ground_plane_data = pickle.load(f)
+        seed_mesh_poses[:] = np.load(DATA_FOLDER / 'seed_mesh_poses.npy')
+        with open(DATA_FOLDER / 'initial_seed_axis_info.pkl', 'rb') as f:
+            initial_seed_axis_info = pickle.load(f)
+        with open(DATA_FOLDER / 'reconstructed_seed_mesh.pkl', 'rb') as f:
+            reconstructed_seed_mesh = pickle.load(f)
         print("State loaded successfully.")
     except FileNotFoundError as e:
         print(f"Error loading state: {e}")
@@ -867,9 +933,9 @@ def resize_callback(sender, app_data, user_data):
 def on_key_press(sender, app_data):
     """Key press handler."""
     allowed_keys = {dpg.mvKey_Q, dpg.mvKey_S, dpg.mvKey_P} # In autosegment mode
-    if auto_segment_mode and app_data not in allowed_keys:    
+    if (auto_segment_mode or ground_plane_mode) and app_data not in allowed_keys:
         return
-        
+
     match app_data:
         case dpg.mvKey_Spacebar:
             toggle_pause(sender, app_data, None)
@@ -884,7 +950,7 @@ def on_key_press(sender, app_data):
         case dpg.mvKey_T:
             toggle_keypoint_tracking()
         case dpg.mvKey_P:
-            toggle_seed_pose_tracking()            
+            toggle_seed_pose_tracking()
         case dpg.mvKey_G:
             toggle_ga(sender, app_data, None)
         case dpg.mvKey_H:
@@ -908,7 +974,7 @@ def on_key_press(sender, app_data):
         case dpg.mvKey_Z:
             global focus_selected_point
             focus_selected_point = not focus_selected_point
-            
+
 def create_ga_popup():
     """Creates the popup window for the genetic algorithm."""
     with dpg.window(label="Calibration", modal=False, show=False, tag="ga_popup", width=540, height=120, on_close=toggle_ga_pause):
@@ -930,7 +996,6 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
     y_pos = int((screen_height - viewport_height) * 0.5)
 
     dpg.create_viewport(title="CATAR", width=viewport_width, height=viewport_height, x_pos=x_pos, y_pos=y_pos)
-    
     with dpg.viewport_menu_bar():
         with dpg.menu(label="File"):
             dpg.add_menu_item(label="Save state", callback=save_state)
@@ -946,6 +1011,8 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
             dpg.add_menu_item(label="Clear segmentation points", callback=clear_seed_points)
             dpg.add_menu_item(label="Lock 3D seed mesh to 2D seed annotations", callback=lock_mesh_to_annotations)
             dpg.add_menu_item(label="Estimate seed pose in current frame", callback=estimate_seed_pose)
+        with dpg.menu(label="Ground plane"):
+            dpg.add_menu_item(label="Estimate ground plane", callback=toggle_ground_plane)
 
     create_ga_popup()
     dpg.setup_dearpygui()
@@ -955,16 +1022,16 @@ def create_dpg_ui(textures: np.ndarray, scene_viz: SceneVisualizer):
     with dpg.texture_registry():
         for i in range(video_metadata['num_videos']):
             dpg.add_raw_texture(
-                width=video_metadata['width'], 
-                height=video_metadata['height'], 
+                width=video_metadata['width'],
+                height=video_metadata['height'],
                 default_value=textures[i].ravel(),
                 tag=f"video_texture_{i}",
                 format=dpg.mvFormat_Float_rgba
             )
         dpg.add_raw_texture(
-            width=video_metadata['width'], 
-            height=video_metadata['height'], 
-            default_value=textures[-1].ravel(), 
+            width=video_metadata['width'],
+            height=video_metadata['height'],
+            default_value=textures[-1].ravel(),
             tag="3d_texture",
             format=dpg.mvFormat_Float_rgba
         )
@@ -1089,9 +1156,9 @@ def toggle_record():
     if save_output_video:  # Initialise video writer
         num_rows = video_metadata["num_videos"] // GRID_COLS + (1 if video_metadata["num_videos"] % GRID_COLS > 0 else 0)
         fourcc = cv2.VideoWriter_fourcc(*'hvc1')
-        video_save_output = cv2.VideoWriter("recording.mp4", fourcc, 30.0, 
-                                            (video_metadata['width'] * GRID_COLS, 
-                                            video_metadata['height'] * num_rows))
+        video_save_output = cv2.VideoWriter("recording.mp4", fourcc, 30.0,
+                                            (video_metadata['width'] * GRID_COLS,
+                                             video_metadata['height'] * num_rows))
     print(f"Recording toggled: {save_output_video}")
 
 def toggle_pause(sender, app_data, user_data):
@@ -1185,7 +1252,7 @@ def reset_ga():
     generation = 0
     best_fitness_so_far = float('inf')
     best_individual = None
-    
+
 def add_to_calib_frames(sender, app_data, user_data):
     global calibration_frames
     if frame_idx not in calibration_frames:
@@ -1211,7 +1278,7 @@ def image_click_callback(sender, app_data, user_data):
     # Clip coordinates within frame bounds
     mouse_pos = (max(0, min(video_metadata['width'] - 1, scaled_x)),
                  max(0, min(video_metadata['height'] - 1, scaled_y)))
-    
+
     if auto_segment_mode:
         if app_data[0] == 0: # Left-click to auto-segment
             dpg.show_item("loading_indicator")
@@ -1229,6 +1296,36 @@ def image_click_callback(sender, app_data, user_data):
             finally:
                 dpg.hide_item("loading_indicator")
         return # Don't allow other functionality whilst in autosegment mode
+
+    if ground_plane_mode:
+        if app_data[0] == 0 and len(ground_plane_data['points_2d'][cam_idx]) < 4:
+            ground_plane_data['points_2d'][cam_idx].append(mouse_pos)
+            print(f"Added ground plane point {len(ground_plane_data['points_2d'][cam_idx])}/4 for camera {cam_idx}")
+            if len(ground_plane_data['points_2d'][cam_idx]) == 4:
+                # Once 4 points are selected, check if we have enough data to calculate the plane
+                cams_with_4_points = [i for i, pts in enumerate(ground_plane_data['points_2d']) if len(pts) == 4]
+                if len(cams_with_4_points) >= 2:
+                    cam1_idx, cam2_idx = cams_with_4_points[0], cams_with_4_points[1]
+                    # Undistort the four 2d points for both cameras and get 3D projection coords
+                    p1_2d = np.array(ground_plane_data['points_2d'][cam1_idx], dtype=np.float32)
+                    p2_2d = np.array(ground_plane_data['points_2d'][cam2_idx], dtype=np.float32)
+                    p1_undistorted = undistort_points(p1_2d, best_individual[cam1_idx])
+                    p2_undistorted = undistort_points(p2_2d, best_individual[cam2_idx])
+                    proj_matrices = np.array([get_projection_matrix(cam) for cam in best_individual])
+                    points_4d_hom = cv2.triangulatePoints(proj_matrices[cam1_idx], proj_matrices[cam2_idx], p1_undistorted.T, p2_undistorted.T)
+                    points_3d = (points_4d_hom[:3] / points_4d_hom[3]).T
+                    # Fit a plane to the 3D points
+                    centroid = np.mean(points_3d, axis=0)
+                    centered_points = points_3d - centroid
+                    _, _, vh = np.linalg.svd(centered_points)
+                    normal = vh[-1]
+                    d = -np.dot(normal, centroid)
+                    # Store data
+                    ground_plane_data['plane_model'] = {'normal': normal, 'd': d, 'points_3d': points_3d}
+                    ground_plane_data['frame'] = frame_idx
+                    toggle_ground_plane() # Toggle back to normal mode
+                    needs_3d_reconstruction = True
+        return  # Don't allow other functionality whilst estimating ground plane
 
     if app_data[0] == 0:  # Left click to annotate
         annotations[frame_idx, cam_idx, selected_point_idx] = (float(mouse_pos[0]), float(mouse_pos[1]))
@@ -1488,7 +1585,6 @@ def main_dpg():
     scene_viz = SceneVisualizer(frame_size=(video_metadata['width'], video_metadata['height']))
     textures = np.zeros((video_metadata['num_videos'] + 1, video_metadata['height'], video_metadata['width'], 4), dtype=np.float32) # RGBA
     create_dpg_ui(textures, scene_viz)
-    
     # Call resize_callback once to set initial sizes
     resize_callback(None, [dpg.get_viewport_width(), dpg.get_viewport_height()], None)
 
@@ -1578,7 +1674,7 @@ def main_dpg():
                     to_id = POINT_NAMES.index(to)
                     if not np.isnan(point).any() and not np.isnan(points_3d[to_id]).any():
                         scene.append(SceneObject(type='line', coords=np.array([point, points_3d[to_id]]), color=point_colors[i % len(point_colors)], label=None))
-            
+
             if reconstructed_seed_mesh is not None and frame_idx >= initial_seed_axis_info.get('frame_idx', -1):
                 points_3d = translate_rotate_seed_mesh_3d(seed_mesh_poses[frame_idx]) # (N, 3)
                 faces = reconstructed_seed_mesh["faces"]
@@ -1589,6 +1685,9 @@ def main_dpg():
                     scene.append(SceneObject(type='line', coords=np.array([p1, p2]), color=(0, 255, 255), label=None))
                     scene.append(SceneObject(type='line', coords=np.array([p2, p3]), color=(0, 255, 255), label=None))
                     scene.append(SceneObject(type='line', coords=np.array([p3, p1]), color=(0, 255, 255), label=None))
+
+            if ground_plane_data and ground_plane_data['plane_model']:
+                draw_ground_plane(scene)
 
         # Update video textures
         if current_frames:
@@ -1610,14 +1709,13 @@ def main_dpg():
         rgba_3d_frame = cv2.cvtColor(viz_3d_frame, cv2.COLOR_BGR2RGBA)
         textures[-1, :, :, :] = rgba_3d_frame.astype(np.float32) / 255.0
         dpg.set_value("3d_texture", textures[-1].ravel())
-        
+
         # Place the 3D visualization in the recording buffer
         row = (num_videos-1) // GRID_COLS
         col = (num_videos-1) % GRID_COLS
         y_start = row * video_metadata['height']
         x_start = col * video_metadata['width']
         video_recording_buffer[y_start:y_start + video_metadata['height'], x_start:x_start + video_metadata['width']] = viz_3d_frame
-        
         if save_output_video and video_save_output is not None and last_written_frame != frame_idx:
             video_save_output.write(video_recording_buffer)
             last_written_frame = frame_idx
@@ -1633,7 +1731,7 @@ def main_dpg():
                 paused = True
                 dpg.configure_item("play_pause_button", label="Play")
             dpg.set_value("frame_slider", frame_idx)
-        
+
         dpg.render_dearpygui_frame()
 
     dpg.destroy_context()
