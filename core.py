@@ -158,67 +158,39 @@ def update_3d_reconstruction(app_state: AppState):
 # Visualization helpers
 
 def draw_ui(frame: np.ndarray, cam_idx: int, app_state: AppState) -> np.ndarray:
-    """Draws points and reprojections on a single video frame."""
+    """Draws complex UI elements like reprojection lines on a single video frame."""
 
     with app_state.lock:
         frame_idx = app_state.frame_idx
-        selected_point_idx = app_state.selected_point_idx
-        focus_selected_point = app_state.focus_selected_point
         best_individual = app_state.best_individual
         annotations_for_frame = app_state.annotations[frame_idx, cam_idx]
-        human_annotated_for_frame = app_state.human_annotated[frame_idx, cam_idx]
         points_3d_for_frame = app_state.reconstructed_3d_points[frame_idx]
-        point_names = app_state.POINT_NAMES
         point_colors = app_state.point_colors
 
-    points_to_draw = [selected_point_idx] if focus_selected_point else range(app_state.num_points)
+    # Only draw if we have a calibrated camera
+    if not best_individual:
+        return frame
 
-    for p_idx in points_to_draw:
-        point_2d = annotations_for_frame[p_idx]
+    cam_params = best_individual[cam_idx]
+    valid_3d_points_mask = ~np.isnan(points_3d_for_frame).any(axis=1)
 
-        if not np.isnan(point_2d).any():
-            center = tuple(point_2d.astype(int))
+    if np.any(valid_3d_points_mask):
+        points_to_reproject = points_3d_for_frame[valid_3d_points_mask]
+        reprojected_pts = reproject_points(points_to_reproject, cam_params)
+        original_indices = np.where(valid_3d_points_mask)[0]
+
+        for i, p_idx in enumerate(original_indices):
+            # Only draw line if the original 2D point exists
+            if np.isnan(annotations_for_frame[p_idx]).any():
+                continue
+
+            annotated_pt = tuple(annotations_for_frame[p_idx].astype(int))
+            reprojected_pt = tuple(reprojected_pts[i].astype(int))
             color = point_colors[p_idx].tolist()
 
-            if human_annotated_for_frame[p_idx]:
-                cv2.circle(frame, center, 7, (255, 255, 255), -1)
+            cv2.line(frame, annotated_pt, reprojected_pt, color, 1)
+            cv2.circle(frame, reprojected_pt, 3, color, -1) # Draw a small circle at the reprojected end
 
-            cv2.circle(frame, center, 5, color, -1)
-            cv2.putText(frame, point_names[p_idx], (center[0] + 8, center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-    if best_individual:
-
-        cam_params = best_individual[cam_idx]
-        valid_3d_points_mask = ~np.isnan(points_3d_for_frame).any(axis=1)
-
-        if np.any(valid_3d_points_mask):
-            points_to_reproject = points_3d_for_frame[valid_3d_points_mask]
-            reprojected_pts = reproject_points(points_to_reproject, cam_params)
-
-            original_indices = np.where(valid_3d_points_mask)[0]
-            for i, p_idx in enumerate(original_indices):
-                if p_idx not in points_to_draw or np.isnan(annotations_for_frame[p_idx]).any():
-                    continue
-
-                # Get original annotated point and scale it down
-                annotated_pt_original = annotations_for_frame[p_idx]
-                annotated_pt_display = (
-                    int(annotated_pt_original[0]),
-                    int(annotated_pt_original[1])
-                )
-
-                # Get original reprojected point and scale it down
-                reprojected_pt_original = reprojected_pts[i]
-                reprojected_pt_display = (
-                    int(reprojected_pt_original[0]),
-                    int(reprojected_pt_original[1])
-                )
-
-                color = point_colors[p_idx].tolist()
-
-                # Draw the line and circle using the SCALED display coordinates
-                cv2.line(frame, annotated_pt_display, reprojected_pt_display, color, 1)
-                cv2.circle(frame, reprojected_pt_display, 3, color, -1)
     return frame
 
 def create_camera_visual(cam_params: Dict[str, Any], label: str) -> List[SceneObject]:

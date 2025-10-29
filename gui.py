@@ -19,6 +19,22 @@ def create_dpg_ui(
 ):
     dpg.create_context()
 
+    GRID_COLS = 3
+    CONTROL_PANEL_WIDTH = 320  # A bit of extra padding
+    TARGET_ITEM_HEIGHT = 280  # The desired height for each video feed
+    PADDING = 20  # Padding around grid items
+
+    num_videos = app_state.video_metadata['num_videos']
+    num_items = num_videos + 1
+    num_rows = (num_items + GRID_COLS - 1) // GRID_COLS
+
+    video_ar = app_state.video_metadata['width'] / app_state.video_metadata['height']
+    target_item_width = TARGET_ITEM_HEIGHT * video_ar
+
+    # Calculate the total dimensions needed
+    initial_width = int(CONTROL_PANEL_WIDTH + (target_item_width * GRID_COLS) + (PADDING * GRID_COLS))
+    initial_height = int((TARGET_ITEM_HEIGHT * num_rows) + (PADDING * num_rows) + 80)  # +80 for menu bar etc
+
     # Initial setup for viewport and textures
     _create_textures(app_state.video_metadata)
     _create_themes()
@@ -38,15 +54,12 @@ def create_dpg_ui(
 
     _create_ga_popup(app_state, ga_command_queue)
 
-    dpg.create_viewport(title="CATAR - Refactored", width=1600, height=900)
-    dpg.set_viewport_resize_callback(_resize_video_widgets, user_data={"app_state": app_state})
+    dpg.create_viewport(title="CATAR - Refactored", width=initial_width, height=initial_height)
+    dpg.set_viewport_resize_callback(resize_video_widgets, user_data={"app_state": app_state})
 
     dpg.setup_dearpygui()
     dpg.set_primary_window("main_window", True)
     dpg.show_viewport()
-
-    # set initial sizes
-    _resize_video_widgets(None, None, user_data={"app_state": app_state})
 
 
 # UI helpers
@@ -184,7 +197,7 @@ def _create_video_grid(app_state: AppState, scene_visualizer: SceneVisualizer, c
                             dpg.bind_item_handler_registry("3d_image", "3d_image_handler")
 
 
-def _resize_video_widgets(sender, app_data, user_data):
+def resize_video_widgets(sender, app_data, user_data):
     """Callback to dynamically resize video images to fit the window."""
 
     app_state = user_data["app_state"]
@@ -203,6 +216,53 @@ def _resize_video_widgets(sender, app_data, user_data):
 
     dpg.configure_item("3d_image", width=item_width, height=item_height)
 
+
+def update_annotation_overlays(app_state: AppState):
+    """
+    Draws simple 2D annotations directly on the GUI thread for immediate feedback.
+    This runs every frame.
+    """
+    with app_state.lock:
+        frame_idx = app_state.frame_idx
+        num_videos = app_state.video_metadata['num_videos']
+        video_w = app_state.video_metadata['width']
+        video_h = app_state.video_metadata['height']
+        annotations = app_state.annotations[frame_idx]
+        human_annotated = app_state.human_annotated[frame_idx]
+        point_names = app_state.POINT_NAMES
+        point_colors = app_state.point_colors
+
+    for cam_idx in range(num_videos):
+        layer_tag = f"annotation_layer_{cam_idx}"
+        drawlist_tag = f"drawlist_{cam_idx}"
+
+        # Clear previous drawings from this layer
+        dpg.delete_item(layer_tag, children_only=True)
+
+        # Get the current size of the display widget to scale the points
+        widget_size = dpg.get_item_rect_size(drawlist_tag)
+        if widget_size[0] == 0 or widget_size[1] == 0:
+            continue
+
+        scale_x = widget_size[0] / video_w
+        scale_y = widget_size[1] / video_h
+
+        for p_idx in range(app_state.num_points):
+            point_2d = annotations[cam_idx, p_idx]
+            if not np.isnan(point_2d).any():
+                # Scale from original video coords to displayed widget coords
+                center_x = point_2d[0] * scale_x
+                center_y = point_2d[1] * scale_y
+
+                color = point_colors[p_idx].tolist()
+
+                # Draw a white outline for points that were manually placed
+                if human_annotated[cam_idx, p_idx]:
+                    dpg.draw_circle(center=(center_x, center_y), radius=7, color=(255, 255, 255), parent=layer_tag)
+
+                dpg.draw_circle(center=(center_x, center_y), radius=5, color=color, fill=color, parent=layer_tag)
+                dpg.draw_text(pos=(center_x + 8, center_y - 8), text=point_names[p_idx], color=color, size=14,
+                              parent=layer_tag)
 
 def _create_ga_popup(app_state, ga_command_queue):
     """Creates the popup window for the genetic algorithm."""
@@ -304,14 +364,15 @@ def _image_click_callback(sender, app_data, user_data):
     """Handles clicks on a video feed."""
 
     app_state = user_data["app_state"]
-    command_queue = user_data["command_queue"]
     cam_idx = user_data["cam_idx"]
 
-    # Calculate scaled mouse position
-    image_tag = f"video_image_{cam_idx}"
+    # The container that was clicked is the drawlist
+    drawlist_tag = f"drawlist_{cam_idx}"
+
+    # Calculate scaled mouse position relative to the drawlist container
     mouse_pos_abs = dpg.get_mouse_pos(local=False)
-    image_pos_abs = dpg.get_item_rect_min(image_tag)
-    local_pos = (mouse_pos_abs[0] - image_pos_abs[0], mouse_pos_abs[1] - image_pos_abs[1])
+    container_pos_abs = dpg.get_item_rect_min(drawlist_tag) # Get rect of the drawlist
+    local_pos = (mouse_pos_abs[0] - container_pos_abs[0], mouse_pos_abs[1] - container_pos_abs[1])
 
     with app_state.lock:
         video_w = app_state.video_metadata['width']
@@ -319,23 +380,30 @@ def _image_click_callback(sender, app_data, user_data):
         frame_idx = app_state.frame_idx
         selected_point_idx = app_state.selected_point_idx
 
-    image_size = dpg.get_item_rect_size(f"video_image_{cam_idx}")
+    # Get the current size of the drawlist container
+    container_size = dpg.get_item_rect_size(drawlist_tag)
+    if container_size[0] == 0 or container_size[1] == 0:
+        return # Avoid division by zero if the widget is not yet sized
 
-    scaled_pos_x = local_pos[0] * video_w / image_size[0]
-    scaled_pos_y = local_pos[1] * video_h / image_size[1]
+    # Scale the local click position to the original video's resolution
+    scaled_pos_x = local_pos[0] * video_w / container_size[0]
+    scaled_pos_y = local_pos[1] * video_h / container_size[1]
     original_resolution_pos = (scaled_pos_x, scaled_pos_y)
 
-    # Update state and request reconstruction
+    # Update state and flag that a 3D reconstruction is needed
     with app_state.lock:
         if app_data[0] == 0:  # Left click to annotate
             app_state.annotations[frame_idx, cam_idx, selected_point_idx] = original_resolution_pos
             app_state.human_annotated[frame_idx, cam_idx, selected_point_idx] = True
             app_state.needs_3d_reconstruction = True
+            print(f"Annotated point {selected_point_idx} on cam {cam_idx} at {original_resolution_pos}")
+
 
         elif app_data[0] == 1:  # Right click to delete
             app_state.annotations[frame_idx, cam_idx, selected_point_idx] = np.nan
             app_state.human_annotated[frame_idx, cam_idx, selected_point_idx] = False
             app_state.needs_3d_reconstruction = True
+            print(f"Deleted point {selected_point_idx} on cam {cam_idx}")
 
 
 def _save_state_callback(sender, app_data, user_data):

@@ -6,7 +6,7 @@ import multiprocessing
 import dearpygui.dearpygui as dpg
 import numpy as np
 from state import AppState
-from gui import create_dpg_ui
+from gui import create_dpg_ui, resize_video_widgets, update_annotation_overlays
 from workers import VideoReaderWorker, TrackingWorker, GAWorker, RenderingWorker
 from viz_3d import SceneVisualizer
 
@@ -129,13 +129,20 @@ def main():
 
     create_dpg_ui(app_state, command_queue, ga_command_queue, scene_visualizer)
 
+    initial_resize_counter = 5
+
     # Main GUI loop
     while dpg.is_dearpygui_running():
+
+        if initial_resize_counter > 0:
+            resize_video_widgets(None, None, user_data={"app_state": app_state})
+            initial_resize_counter -= 1
+
         try:
             # Get the final rendered frames from the RenderingWorker
             processed_data = results_queue.get_nowait()
 
-            # Update video textures with overlays
+            # Update video textures (these no longer have 2D annotations drawn on them)
             for i, frame_bgr in enumerate(processed_data['video_frames_bgr']):
                 rgba_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
                 dpg.set_value(f"video_texture_{i}", rgba_frame.ravel())
@@ -146,6 +153,8 @@ def main():
 
         except queue.Empty:
             pass  # No new frame, continue
+
+        update_annotation_overlays(app_state)
 
         # Update UI widgets from the app state
         with app_state.lock:
