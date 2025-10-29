@@ -85,9 +85,14 @@ class VideoReaderWorker(threading.Thread):
                 }
 
                 for q in self.output_queues:
-                    # Clear the queue to prevent consumers from lagging behind
+                    # Clear the queue to prevent consumers from lagging behind.
+                    # This is a non-blocking way to discard old frames.
                     while not q.empty():
-                        q.get_nowait()
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+                    # Put the newest frame data onto the now-clear queue.
                     q.put(output_data)
 
                 prev_frame_idx = current_frame_idx
@@ -234,6 +239,7 @@ class RenderingWorker(threading.Thread):
                 self.shutdown_event.set()
 
         print("Rendering worker shut down.")
+
 
     def _prepare_3d_scene(self) -> List[SceneObject]:
         """Prepares the list of 3D objects for rendering from the AppState."""

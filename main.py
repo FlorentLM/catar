@@ -6,10 +6,9 @@ import multiprocessing
 import dearpygui.dearpygui as dpg
 import numpy as np
 from state import AppState
-from gui import create_dpg_ui, resize_video_widgets, update_annotation_overlays
+from gui import create_dpg_ui, resize_video_widgets, update_annotation_overlays, update_histogram
 from workers import VideoReaderWorker, TrackingWorker, GAWorker, RenderingWorker
 from viz_3d import SceneVisualizer
-
 
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
@@ -51,11 +50,12 @@ SKELETON_CONFIG = {
 
 def load_videos(data_folder: Path, video_format: str):
     video_paths = sorted(data_folder.glob(video_format))
+
     if not video_paths:
         print(f"Error: No videos found in '{data_folder}/' with format '{video_format}'")
         sys.exit(1)
-
     cap = cv2.VideoCapture(str(video_paths[0]))
+
     if not cap.isOpened():
         print("Error: Could not open the first video file.")
         sys.exit(1)
@@ -67,68 +67,40 @@ def load_videos(data_folder: Path, video_format: str):
         'num_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
         'fps': cap.get(cv2.CAP_PROP_FPS)
     }
-    cap.release()  # release it immediately
 
+    cap.release()
     video_names = [path.name for path in video_paths]
     return [str(p) for p in video_paths], video_metadata, video_names
 
 
 def main():
-
     video_paths, video_metadata, video_names = load_videos(DATA_FOLDER, VIDEO_FORMAT)
-
     app_state = AppState(video_metadata, SKELETON_CONFIG)
     app_state.video_names = video_names
-    app_state.load_data_from_files(DATA_FOLDER)  # Load any previously saved state
+    app_state.load_data_from_files(DATA_FOLDER)
 
-    # Communication queues
-    # GUI -> VideoReaderWorker (for commands like forcing a frame jump)
+    # Queues
     command_queue = queue.Queue()
-
-    # VideoReaderWorker -> TrackingWorker (fan-out queue 1)
     frames_for_tracking_queue = queue.Queue(maxsize=2)
-
-    # VideoReaderWorker -> RenderingWorker (fan-out queue 2)
     frames_for_rendering_queue = queue.Queue(maxsize=2)
-
-    # RenderingWorker -> GUI (for final display frames)
     results_queue = queue.Queue(maxsize=2)
-
-    # Queues for the GA process
     ga_command_queue = multiprocessing.Queue()
     ga_progress_queue = multiprocessing.Queue()
-
     scene_visualizer = SceneVisualizer(frame_size=(DISPLAY_WIDTH, DISPLAY_HEIGHT))
 
-    # Start workers
-    # Video Reader (Producer)
-    video_reader = VideoReaderWorker(
-        app_state,
-        video_paths,
-        command_queue,
-        output_queues=[frames_for_tracking_queue, frames_for_rendering_queue]
-    )
-    video_reader.start()
-
-    # Tracking Worker (consumer 1)
+    # Workers
+    video_reader = VideoReaderWorker(app_state, video_paths, command_queue,
+                                     [frames_for_tracking_queue, frames_for_rendering_queue])
     tracking_worker = TrackingWorker(app_state, frames_for_tracking_queue)
-    tracking_worker.start()
-
-    # Rendering Worker (Cconsumer 2)
-    rendering_worker = RenderingWorker(
-        app_state,
-        scene_visualizer,
-        frames_for_rendering_queue,
-        results_queue
-    )
-    rendering_worker.start()
-
-    # Genetic Algorithm Worker
+    rendering_worker = RenderingWorker(app_state, scene_visualizer, frames_for_rendering_queue, results_queue)
     ga_worker = GAWorker(ga_command_queue, ga_progress_queue)
+
+    video_reader.start()
+    tracking_worker.start()
+    rendering_worker.start()
     ga_worker.start()
 
     create_dpg_ui(app_state, command_queue, ga_command_queue, scene_visualizer)
-
     initial_resize_counter = 5
 
     # Main GUI loop
@@ -139,41 +111,41 @@ def main():
             initial_resize_counter -= 1
 
         try:
-            # Get the final rendered frames from the RenderingWorker
             processed_data = results_queue.get_nowait()
 
-            # Update video textures (these no longer have 2D annotations drawn on them)
             for i, frame_bgr in enumerate(processed_data['video_frames_bgr']):
                 rgba_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
                 dpg.set_value(f"video_texture_{i}", rgba_frame.ravel())
 
-            # Update 3D texture
             rgba_3d = cv2.cvtColor(processed_data['3d_frame_bgr'], cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
             dpg.set_value("3d_texture", rgba_3d.ravel())
 
         except queue.Empty:
-            pass  # No new frame, continue
+            pass
 
+        # Update UI elements
         update_annotation_overlays(app_state)
+        update_histogram(app_state)
 
-        # Update UI widgets from the app state
+        # Update UI widgets from the latest app state
         with app_state.lock:
             dpg.set_value("frame_slider", app_state.frame_idx)
-            dpg.set_value("frame_text", f"Frame: {app_state.frame_idx}/{video_metadata['num_frames']}")
-            dpg.set_value("status_text", f"Status: {'Paused' if app_state.paused else 'Playing'}")
+            dpg.set_value("current_frame_line", float(app_state.frame_idx))
             dpg.configure_item("play_pause_button", label="Play" if app_state.paused else "Pause")
-            dpg.set_value("tracking_text",f"Tracking: {'Enabled' if app_state.keypoint_tracking_enabled else 'Disabled'}")
-            dpg.set_value("annotating_point_text", f"Annotating: {app_state.POINT_NAMES[app_state.selected_point_idx]}")
+            dpg.set_value("point_combo", app_state.POINT_NAMES[app_state.selected_point_idx])
+            dpg.set_value("focus_text", f"Focus Mode: {'Enabled' if app_state.focus_selected_point else 'Disabled'}")
+            dpg.set_value("num_calib_frames_text", f"Calibration Frames: {len(app_state.calibration_frames)}")
             dpg.set_value("fitness_text", f"Best Fitness: {app_state.best_fitness:.2f}")
 
         dpg.render_dearpygui_frame()
 
     # Shutdown
     print("Shutting down application...")
-    command_queue.put({"action": "shutdown"})  # to VideoReader
-    frames_for_tracking_queue.put({"action": "shutdown"})  # to TrackingWorker
-    frames_for_rendering_queue.put({"action": "shutdown"})  # to RenderingWorker
-    ga_command_queue.put({"action": "shutdown"})  # to GAWorker
+
+    command_queue.put({"action": "shutdown"})
+    frames_for_tracking_queue.put({"action": "shutdown"})
+    frames_for_rendering_queue.put({"action": "shutdown"})
+    ga_command_queue.put({"action": "shutdown"})
 
     video_reader.join(timeout=2)
     tracking_worker.join(timeout=2)
@@ -181,12 +153,15 @@ def main():
     ga_worker.join(timeout=2)
 
     dpg.destroy_context()
+
     print("Shutdown complete.")
 
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()    # this guard is importantt for multiprocessing
+    multiprocessing.freeze_support()
+
     if not DATA_FOLDER.exists():
         DATA_FOLDER.mkdir(parents=True)
         print(f"Created '{DATA_FOLDER}' directory. Please add your videos and data there.")
+
     main()

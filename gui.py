@@ -9,6 +9,7 @@ from viz_3d import SceneVisualizer
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
 
+
 # Main UI
 
 def create_dpg_ui(
@@ -19,42 +20,47 @@ def create_dpg_ui(
 ):
     dpg.create_context()
 
+    # Window size calculation
     GRID_COLS = 3
-    CONTROL_PANEL_WIDTH = 320  # A bit of extra padding
-    TARGET_ITEM_HEIGHT = 280  # The desired height for each video feed
-    PADDING = 20  # Padding around grid items
+    CONTROL_PANEL_WIDTH = 320
+    BOTTOM_PANEL_HEIGHT = 200  # Initial height for bottom panel
+    PADDING = 20
 
     num_videos = app_state.video_metadata['num_videos']
     num_items = num_videos + 1
     num_rows = (num_items + GRID_COLS - 1) // GRID_COLS
 
     video_ar = app_state.video_metadata['width'] / app_state.video_metadata['height']
-    target_item_width = TARGET_ITEM_HEIGHT * video_ar
+    # Start with a reasonable width for each video item
+    target_item_width = 480
+    target_item_height = target_item_width / video_ar
 
-    # Calculate the total dimensions needed
-    initial_width = int(CONTROL_PANEL_WIDTH + (target_item_width * GRID_COLS) + (PADDING * GRID_COLS))
-    initial_height = int((TARGET_ITEM_HEIGHT * num_rows) + (PADDING * num_rows) + 80)  # +80 for menu bar etc
+    initial_width = int(CONTROL_PANEL_WIDTH + (target_item_width * GRID_COLS) + (PADDING * (GRID_COLS + 2)))
+    initial_height = int((target_item_height * num_rows) + BOTTOM_PANEL_HEIGHT + 100)
 
-    # Initial setup for viewport and textures
     _create_textures(app_state.video_metadata)
     _create_themes()
-
-    # DPG event handlers for global key/mouse events
     _register_event_handlers(app_state, command_queue, ga_command_queue, scene_visualizer)
 
-    # Window & widget layout
+    # Window layout
     with dpg.window(label="Main Window", tag="main_window"):
         _create_menu_bar(app_state, command_queue, ga_command_queue)
 
-        with dpg.group(horizontal=True):
-            with dpg.child_window(width=300, tag="control_panel_window"):
-                _create_control_panel(app_state, command_queue, ga_command_queue)
-            with dpg.child_window(width=-1, tag="video_grid_window"):
-                _create_video_grid(app_state, scene_visualizer, command_queue)
+        # Main content area
+        with dpg.child_window(tag="main_content_window", height=-BOTTOM_PANEL_HEIGHT):
+            with dpg.group(horizontal=True):
+                with dpg.child_window(width=300, tag="control_panel_window"):
+                    _create_control_panel(app_state)
+                with dpg.child_window(width=-1, tag="video_grid_window"):
+                    _create_video_grid(app_state, scene_visualizer, command_queue)
+
+        # Bottom panel for histogram and player controls
+        with dpg.child_window(tag="bottom_panel_window", height=BOTTOM_PANEL_HEIGHT):
+            _create_bottom_panel(app_state)
 
     _create_ga_popup(app_state, ga_command_queue)
 
-    dpg.create_viewport(title="CATAR - Refactored", width=initial_width, height=initial_height)
+    dpg.create_viewport(title="CATAR", width=initial_width, height=initial_height)
     dpg.set_viewport_resize_callback(resize_video_widgets, user_data={"app_state": app_state})
 
     dpg.setup_dearpygui()
@@ -65,8 +71,6 @@ def create_dpg_ui(
 # UI helpers
 
 def _create_textures(video_meta):
-    """Creates raw textures for video feeds and the 3D projection."""
-
     with dpg.texture_registry():
         for i in range(video_meta['num_videos']):
             black_screen = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 4), dtype=np.float32)
@@ -74,8 +78,6 @@ def _create_textures(video_meta):
                 width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT,
                 default_value=black_screen.ravel(), tag=f"video_texture_{i}", format=dpg.mvFormat_Float_rgba
             )
-
-        # 3D view texture
         black_screen_3d = np.zeros((DISPLAY_HEIGHT, DISPLAY_WIDTH, 4), dtype=np.float32)
         dpg.add_raw_texture(
             width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT,
@@ -84,7 +86,6 @@ def _create_textures(video_meta):
 
 
 def _create_themes():
-    """Creates themes for buttons."""
 
     with dpg.theme(tag="record_button_theme"):
         with dpg.theme_component(dpg.mvButton):
@@ -96,42 +97,40 @@ def _create_themes():
             dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 200, 0, 255))
             dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (0, 255, 0, 255))
 
+    with dpg.theme(tag="purple_slider_theme"):
+        with dpg.theme_component(dpg.mvSliderInt):
+            # The main color of the slider grab handle
+            dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, (200, 135, 255, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_SliderGrabActive, (215, 85, 255, 255))
+            # The color of the filled-in part of the bar
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (230, 165, 255, 75))
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (230, 165, 255, 75))
+
 
 def _create_menu_bar(app_state, command_queue, ga_command_queue):
-    """Creates the main menu bar."""
 
     with dpg.viewport_menu_bar():
         with dpg.menu(label="File"):
-            dpg.add_menu_item(label="Save State", callback=_save_state_callback, user_data={"app_state": app_state})
+            dpg.add_menu_item(label="Save State (S)", callback=_save_state_callback, user_data={"app_state": app_state})
+            dpg.add_menu_item(label="Load State (L)", callback=_load_state_callback, user_data={"app_state": app_state})
+
         with dpg.menu(label="Calibration"):
             dpg.add_menu_item(label="Run Genetic Algorithm", callback=_start_ga_callback,
                               user_data={"app_state": app_state, "ga_command_queue": ga_command_queue})
+            dpg.add_menu_item(label="Add Frame to Calibration Set (C)", callback=_add_to_calib_frames_callback,
+                              user_data={"app_state": app_state})
 
 
-def _create_control_panel(app_state, command_queue, ga_command_queue):
-    """Creates the control panel."""
-
-    user_data = {"app_state": app_state, "command_queue": command_queue}
+def _create_control_panel(app_state: AppState):
+    user_data = {"app_state": app_state}
 
     dpg.add_text("--- Info ---")
-    dpg.add_text("Frame: 0/0", tag="frame_text")
-    dpg.add_text("Status: Paused", tag="status_text")
-    dpg.add_text("Tracking: Disabled", tag="tracking_text")
-    dpg.add_text(f"Annotating: {app_state.POINT_NAMES[0]}", tag="annotating_point_text")
-    dpg.add_separator()
+    dpg.add_text("Focus Mode: Disabled", tag="focus_text")
+    dpg.add_text("Calibration Frames: 0", tag="num_calib_frames_text")
     dpg.add_text("Best Fitness: inf", tag="fitness_text")
     dpg.add_separator()
 
     dpg.add_text("--- Controls ---")
-    with dpg.group(horizontal=True):
-        dpg.add_button(label="< Prev", callback=_prev_frame_callback, user_data=user_data)
-        dpg.add_button(label="Play", callback=_toggle_pause_callback, user_data=user_data, tag="play_pause_button")
-        dpg.add_button(label="Next >", callback=_next_frame_callback, user_data=user_data)
-
-    dpg.add_slider_int(
-        label="Frame", min_value=0, max_value=app_state.video_metadata['num_frames'] - 1,
-        default_value=0, callback=_set_frame_callback, user_data=user_data, tag="frame_slider"
-    )
     dpg.add_combo(
         label="Keypoint", items=app_state.POINT_NAMES, default_value=app_state.POINT_NAMES[0],
         callback=_set_selected_point_callback, user_data=user_data, tag="point_combo"
@@ -139,19 +138,70 @@ def _create_control_panel(app_state, command_queue, ga_command_queue):
     dpg.add_button(label="Track Keypoints", callback=_toggle_tracking_callback, user_data=user_data,
                    tag="keypoint_tracking_button")
 
+    dpg.add_separator()
+
+    dpg.add_button(label="Set Prev as Annotated (H)", callback=_set_human_annotated_callback, user_data=user_data)
+    dpg.add_button(label="Delete Future Annots (D)", callback=_clear_future_annotations_callback, user_data=user_data)
+
+    dpg.add_separator()
+
+    dpg.add_checkbox(label="Show Histogram", default_value=True, tag="show_histogram_checkbox",
+                     callback=_toggle_histogram_visibility_callback)
+
+
+def _create_bottom_panel(app_state: AppState):
+    """Creates the bottom panel with player controls and histogram."""
+
+    user_data = {"app_state": app_state}
+
+    # Player controls
+    with dpg.group():
+        # A single horizontal group for all player controls
+        with dpg.group(horizontal=True):
+            # Group the buttons on the left
+            dpg.add_button(label="<| Prev", callback=_prev_frame_callback, user_data=user_data)
+            dpg.add_button(label="Play", callback=_toggle_pause_callback, user_data=user_data, tag="play_pause_button")
+            dpg.add_button(label="Next |>", callback=_next_frame_callback, user_data=user_data)
+
+            # The slider will automatically take up the remaining horizontal space
+            slider = dpg.add_slider_int(
+                label="Frame",
+                min_value=0, max_value=app_state.video_metadata['num_frames'] - 1,
+                default_value=0, callback=_set_frame_callback,
+                user_data=user_data, tag="frame_slider", width=-1  # width=-1 makes it fill space
+            )
+            dpg.bind_item_theme(slider, "purple_slider_theme")
+
+    dpg.add_separator(tag="histogram_separator")
+
+    # Histogram
+    with dpg.plot(label="Annotation Histogram", height=-1, width=-1, no_menus=True, no_box_select=True,
+                  no_mouse_pos=True, tag="annotation_plot"):
+        dpg.add_plot_legend()
+        dpg.add_plot_axis(dpg.mvXAxis, label="Frame", tag="histogram_x_axis")
+        dpg.add_plot_axis(dpg.mvYAxis, label="Annotations", tag="histogram_y_axis")
+        dpg.add_bar_series(list(range(app_state.video_metadata['num_frames'])),
+                           [0] * app_state.video_metadata['num_frames'], label="Annotation Count",
+                           parent="histogram_y_axis", tag="annotation_histogram_series")
+
+        # Callback to link the drag line to the frame index
+        dpg.add_drag_line(label="Current Frame", color=[215, 85, 255], vertical=True, default_value=0,
+                          tag="current_frame_line",
+                          callback=_set_frame_callback, user_data=user_data)
+
+    with dpg.item_handler_registry(tag="histogram_handler"):
+        dpg.add_item_clicked_handler(callback=_on_histogram_click, user_data=user_data)
+    dpg.bind_item_handler_registry("annotation_plot", "histogram_handler")
+
 
 def _create_video_grid(app_state: AppState, scene_visualizer: SceneVisualizer, command_queue: Queue):
-    """Creates a dynamic grid for video feeds and the 3D projection."""
 
     GRID_COLS = 3
     num_videos = app_state.video_metadata['num_videos']
-    num_items = num_videos + 1  # (videos + 3D view)
+    num_items = num_videos + 1
 
     with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingStretchProp):
-
-        for _ in range(GRID_COLS):
-            dpg.add_table_column()
-
+        for _ in range(GRID_COLS): dpg.add_table_column()
         num_rows = (num_items + GRID_COLS - 1) // GRID_COLS
 
         for i in range(num_rows):
@@ -162,50 +212,35 @@ def _create_video_grid(app_state: AppState, scene_visualizer: SceneVisualizer, c
                     if idx < num_videos:
                         with dpg.table_cell():
                             dpg.add_text(app_state.video_names[idx])
-
-                            # Group the image and its drawlist together
                             with dpg.drawlist(width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT, tag=f"drawlist_{idx}"):
-
-                                dpg.draw_image(f"video_texture_{idx}",
-                                               pmin=(0, 0),
-                                               pmax=(DISPLAY_WIDTH, DISPLAY_HEIGHT),
-                                               tag=f"video_image_{idx}")
-
+                                dpg.draw_image(f"video_texture_{idx}", pmin=(0, 0),
+                                               pmax=(DISPLAY_WIDTH, DISPLAY_HEIGHT), tag=f"video_image_{idx}")
                                 dpg.add_draw_layer(tag=f"annotation_layer_{idx}")
 
                             with dpg.item_handler_registry(tag=f"image_handler_{idx}"):
-                                dpg.add_item_clicked_handler(
-                                    callback=_image_click_callback,
-                                    user_data={
-                                        "cam_idx": idx,
-                                        "app_state": app_state,
-                                        "command_queue": command_queue
-                                    }
-                                )
-
-                            # We need to bind the handler to the drawlist (not the image inside it)
+                                dpg.add_item_clicked_handler(callback=_image_click_callback,
+                                                             user_data={"cam_idx": idx, "app_state": app_state})
                             dpg.bind_item_handler_registry(f"drawlist_{idx}", f"image_handler_{idx}")
 
                     elif idx == num_videos:
-                        # This grid cell is the 3D projection
-
                         with dpg.table_cell():
                             dpg.add_text("3D Projection")
                             dpg.add_image("3d_texture", tag="3d_image", width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT)
+
                             with dpg.item_handler_registry(tag="3d_image_handler"):
                                 dpg.add_item_clicked_handler(callback=scene_visualizer.dpg_drag_start)
                             dpg.bind_item_handler_registry("3d_image", "3d_image_handler")
 
 
 def resize_video_widgets(sender, app_data, user_data):
-    """Callback to dynamically resize video images to fit the window."""
 
     app_state = user_data["app_state"]
     GRID_COLS = 3
     grid_width = dpg.get_item_rect_size("video_grid_window")[0]
-
     item_width = (grid_width / GRID_COLS) - 20
-    if item_width <= 0: return
+
+    if item_width <= 0:
+        return
 
     aspect_ratio = app_state.video_metadata['width'] / app_state.video_metadata['height']
     item_height = item_width / aspect_ratio
@@ -218,45 +253,36 @@ def resize_video_widgets(sender, app_data, user_data):
 
 
 def update_annotation_overlays(app_state: AppState):
-    """
-    Draws simple 2D annotations directly on the GUI thread for immediate feedback.
-    This runs every frame.
-    """
+
     with app_state.lock:
         frame_idx = app_state.frame_idx
+
         num_videos = app_state.video_metadata['num_videos']
         video_w = app_state.video_metadata['width']
         video_h = app_state.video_metadata['height']
+
         annotations = app_state.annotations[frame_idx]
         human_annotated = app_state.human_annotated[frame_idx]
         point_names = app_state.POINT_NAMES
         point_colors = app_state.point_colors
 
     for cam_idx in range(num_videos):
-        layer_tag = f"annotation_layer_{cam_idx}"
-        drawlist_tag = f"drawlist_{cam_idx}"
-
-        # Clear previous drawings from this layer
+        layer_tag, drawlist_tag = f"annotation_layer_{cam_idx}", f"drawlist_{cam_idx}"
         dpg.delete_item(layer_tag, children_only=True)
-
-        # Get the current size of the display widget to scale the points
         widget_size = dpg.get_item_rect_size(drawlist_tag)
-        if widget_size[0] == 0 or widget_size[1] == 0:
+
+        if widget_size[0] == 0:
             continue
 
-        scale_x = widget_size[0] / video_w
-        scale_y = widget_size[1] / video_h
+        scale_x, scale_y = widget_size[0] / video_w, widget_size[1] / video_h
 
         for p_idx in range(app_state.num_points):
             point_2d = annotations[cam_idx, p_idx]
-            if not np.isnan(point_2d).any():
-                # Scale from original video coords to displayed widget coords
-                center_x = point_2d[0] * scale_x
-                center_y = point_2d[1] * scale_y
 
+            if not np.isnan(point_2d).any():
+                center_x, center_y = point_2d[0] * scale_x, point_2d[1] * scale_y
                 color = point_colors[p_idx].tolist()
 
-                # Draw a white outline for points that were manually placed
                 if human_annotated[cam_idx, p_idx]:
                     dpg.draw_circle(center=(center_x, center_y), radius=7, color=(255, 255, 255), parent=layer_tag)
 
@@ -264,10 +290,31 @@ def update_annotation_overlays(app_state: AppState):
                 dpg.draw_text(pos=(center_x + 8, center_y - 8), text=point_names[p_idx], color=color, size=14,
                               parent=layer_tag)
 
-def _create_ga_popup(app_state, ga_command_queue):
-    """Creates the popup window for the genetic algorithm."""
 
+def update_histogram(app_state: AppState):
+
+    with app_state.lock:
+        focus_mode = app_state.focus_selected_point
+        selected_idx = app_state.selected_point_idx
+        point_name = app_state.POINT_NAMES[selected_idx]
+        annotations = app_state.annotations.copy()
+
+    if focus_mode:
+        counts = np.sum(~np.isnan(annotations[:, :, selected_idx, 0]), axis=1)
+        dpg.configure_item("histogram_y_axis", label=f"'{point_name}' Annots")
+        dpg.set_axis_limits("histogram_y_axis", 0, app_state.video_metadata['num_videos'])
+    else:
+        counts = np.sum(~np.isnan(annotations[:, :, :, 0]), axis=(1, 2))
+        dpg.configure_item("histogram_y_axis", label="Total Annots")
+        if counts.max() > 0:
+            dpg.set_axis_limits_auto("histogram_y_axis")
+
+    dpg.set_value("annotation_histogram_series", [list(range(len(counts))), counts.tolist()])
+
+
+def _create_ga_popup(app_state, ga_command_queue):
     user_data = {"app_state": app_state, "ga_command_queue": ga_command_queue}
+
     with dpg.window(label="Calibration Progress", modal=True, show=False, tag="ga_popup", width=400, height=150,
                     no_close=True):
         dpg.add_text("Running Genetic Algorithm...", tag="ga_status_text")
@@ -278,8 +325,6 @@ def _create_ga_popup(app_state, ga_command_queue):
 
 
 def _register_event_handlers(app_state, command_queue, ga_command_queue, scene_visualizer):
-    """Registers global event handlers for keyboard and mouse."""
-
     with dpg.handler_registry():
         dpg.add_key_press_handler(callback=_on_key_press, user_data={"app_state": app_state})
         dpg.add_mouse_wheel_handler(callback=scene_visualizer.dpg_on_mouse_wheel, user_data="3d_image")
@@ -290,29 +335,55 @@ def _register_event_handlers(app_state, command_queue, ga_command_queue, scene_v
 # Callbacks
 
 def _on_key_press(sender, app_data, user_data):
-    """Handles global key presses for shortcuts."""
+    app_state = user_data["app_state"]
 
-    if app_data == dpg.mvKey_Spacebar:
-        _toggle_pause_callback(sender, app_data, user_data)
+    match app_data:
+        case dpg.mvKey_Spacebar:
+            _toggle_pause_callback(sender, app_data, user_data)
+        case dpg.mvKey_Right:
+            _next_frame_callback(sender, app_data, user_data)
+        case dpg.mvKey_Left:
+            _prev_frame_callback(sender, app_data, user_data)
+        case dpg.mvKey_Up:
+            with app_state.lock:
+                new_idx = (app_state.selected_point_idx - 1) % app_state.num_points
+                app_state.selected_point_idx = new_idx
+        case dpg.mvKey_Down:
+            with app_state.lock:
+                new_idx = (app_state.selected_point_idx + 1) % app_state.num_points
+                app_state.selected_point_idx = new_idx
+        case dpg.mvKey_S:
+            _save_state_callback(sender, app_data, user_data)
+        case dpg.mvKey_L:
+            _load_state_callback(sender, app_data, user_data)
+        case dpg.mvKey_C:
+            _add_to_calib_frames_callback(sender, app_data, user_data)
+        case dpg.mvKey_Z:
+            _toggle_focus_mode_callback(sender, app_data, user_data)
+        case dpg.mvKey_H:
+            _set_human_annotated_callback(sender, app_data, user_data)
+        case dpg.mvKey_D:
+            _clear_future_annotations_callback(sender, app_data, user_data)
 
-    elif app_data == dpg.mvKey_Right:
-        _next_frame_callback(sender, app_data, user_data)
 
-    elif app_data == dpg.mvKey_Left:
-        _prev_frame_callback(sender, app_data, user_data)
+def _on_histogram_click(sender, app_data, user_data):
+    app_state = user_data["app_state"]
+    mouse_pos = dpg.get_plot_mouse_pos()
+    if mouse_pos:
+        clicked_frame = int(mouse_pos[0])
+        with app_state.lock:
+            if 0 <= clicked_frame < app_state.video_metadata['num_frames']:
+                app_state.frame_idx = clicked_frame
+                app_state.paused = True
 
 
 def _toggle_pause_callback(sender, app_data, user_data):
-    """Toggles paused state."""
-
     app_state = user_data["app_state"]
     with app_state.lock:
         app_state.paused = not app_state.paused
 
 
 def _next_frame_callback(sender, app_data, user_data):
-    """Goes to next frame."""
-
     app_state = user_data["app_state"]
     with app_state.lock:
         app_state.paused = True
@@ -320,128 +391,163 @@ def _next_frame_callback(sender, app_data, user_data):
         if app_state.frame_idx < num_frames - 1:
             app_state.frame_idx += 1
 
-def _prev_frame_callback(sender, app_data, user_data):
-    """Goes to previous frame."""
 
+def _prev_frame_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
     with app_state.lock:
         app_state.paused = True
         if app_state.frame_idx > 0:
             app_state.frame_idx -= 1
 
-def _set_frame_callback(sender, app_data, user_data):
-    """Sets frame index from the slider."""
 
+def _set_frame_callback(sender, app_data, user_data):
+    """Sets frame index from the slider or the histogram drag line."""
     app_state = user_data["app_state"]
+
+    new_frame_idx = dpg.get_value(sender)
+
+    if new_frame_idx is None:  # Safety check
+        return
+
     with app_state.lock:
         app_state.paused = True
-        app_state.frame_idx = app_data
+
+        # bounds check to be safe
+        num_frames = app_state.video_metadata['num_frames']
+        if 0 <= new_frame_idx < num_frames:
+            app_state.frame_idx = int(new_frame_idx)
 
 
 def _set_selected_point_callback(sender, app_data, user_data):
-    """Sets the currently active keypoint."""
-
     app_state = user_data["app_state"]
     with app_state.lock:
         app_state.selected_point_idx = app_state.POINT_NAMES.index(app_data)
 
 
 def _toggle_tracking_callback(sender, app_data, user_data):
-    """Toggles the Lucas-Kanade optic flow tracking."""
-
     app_state = user_data["app_state"]
     with app_state.lock:
         app_state.keypoint_tracking_enabled = not app_state.keypoint_tracking_enabled
         is_enabled = app_state.keypoint_tracking_enabled
-    # update the button
     if is_enabled:
         dpg.bind_item_theme("keypoint_tracking_button", "tracking_button_theme")
     else:
         dpg.bind_item_theme("keypoint_tracking_button", 0)
 
 
-def _image_click_callback(sender, app_data, user_data):
-    """Handles clicks on a video feed."""
+def _toggle_histogram_visibility_callback(sender, app_data, user_data):
+    show = dpg.get_value("show_histogram_checkbox")
+    dpg.configure_item("annotation_plot", show=show)
+    dpg.configure_item("histogram_separator", show=show)
 
+    # Dynamically adjust the height of the main content window to reclaim space
+    BOTTOM_PANEL_HEIGHT_FULL = 200
+    BOTTOM_PANEL_HEIGHT_COLLAPSED = 75  # Height for just the player controls
+    if show:
+        dpg.configure_item("main_content_window", height=-BOTTOM_PANEL_HEIGHT_FULL)
+    else:
+        dpg.configure_item("main_content_window", height=-BOTTOM_PANEL_HEIGHT_COLLAPSED)
+
+
+def _toggle_focus_mode_callback(sender, app_data, user_data):
+    app_state = user_data["app_state"]
+
+    with app_state.lock:
+        app_state.focus_selected_point = not app_state.focus_selected_point
+        print(f"Focus mode: {'Enabled' if app_state.focus_selected_point else 'Disabled'}")
+
+
+def _add_to_calib_frames_callback(sender, app_data, user_data):
+    app_state = user_data["app_state"]
+
+    with app_state.lock:
+        if app_state.frame_idx not in app_state.calibration_frames:
+            app_state.calibration_frames.append(app_state.frame_idx)
+            print(f"Frame {app_state.frame_idx} added to calibration set.")
+
+
+def _set_human_annotated_callback(sender, app_data, user_data):
+    app_state = user_data["app_state"]
+
+    with app_state.lock:
+        if not app_state.focus_selected_point:
+            print("Enable Focus Mode (Z) to use this feature.")
+            return
+
+        frame_idx = app_state.frame_idx
+        p_idx = app_state.selected_point_idx
+        app_state.human_annotated[:frame_idx + 1, :, p_idx] = True
+        print(f"Marked all previous frames as human-annotated for point {app_state.POINT_NAMES[p_idx]}.")
+
+
+def _clear_future_annotations_callback(sender, app_data, user_data):
+    app_state = user_data["app_state"]
+
+    with app_state.lock:
+        if not app_state.focus_selected_point:
+            print("Enable Focus Mode (Z) to use this feature.")
+            return
+
+        frame_idx = app_state.frame_idx
+        p_idx = app_state.selected_point_idx
+        app_state.annotations[frame_idx + 1:, :, p_idx] = np.nan
+        app_state.human_annotated[frame_idx + 1:, :, p_idx] = False
+        print(f"Cleared future annotations for point {app_state.POINT_NAMES[p_idx]}.")
+
+
+def _image_click_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
     cam_idx = user_data["cam_idx"]
-
-    # The container that was clicked is the drawlist
     drawlist_tag = f"drawlist_{cam_idx}"
 
-    # Calculate scaled mouse position relative to the drawlist container
     mouse_pos_abs = dpg.get_mouse_pos(local=False)
-    container_pos_abs = dpg.get_item_rect_min(drawlist_tag) # Get rect of the drawlist
+
+    container_pos_abs = dpg.get_item_rect_min(drawlist_tag)
     local_pos = (mouse_pos_abs[0] - container_pos_abs[0], mouse_pos_abs[1] - container_pos_abs[1])
 
     with app_state.lock:
-        video_w = app_state.video_metadata['width']
-        video_h = app_state.video_metadata['height']
-        frame_idx = app_state.frame_idx
-        selected_point_idx = app_state.selected_point_idx
+        video_w, video_h = app_state.video_metadata['width'], app_state.video_metadata['height']
+        frame_idx, p_idx = app_state.frame_idx, app_state.selected_point_idx
 
-    # Get the current size of the drawlist container
     container_size = dpg.get_item_rect_size(drawlist_tag)
-    if container_size[0] == 0 or container_size[1] == 0:
-        return # Avoid division by zero if the widget is not yet sized
+    if container_size[0] == 0: return
+    scaled_pos = (local_pos[0] * video_w / container_size[0], local_pos[1] * video_h / container_size[1])
 
-    # Scale the local click position to the original video's resolution
-    scaled_pos_x = local_pos[0] * video_w / container_size[0]
-    scaled_pos_y = local_pos[1] * video_h / container_size[1]
-    original_resolution_pos = (scaled_pos_x, scaled_pos_y)
-
-    # Update state and flag that a 3D reconstruction is needed
     with app_state.lock:
-        if app_data[0] == 0:  # Left click to annotate
-            app_state.annotations[frame_idx, cam_idx, selected_point_idx] = original_resolution_pos
-            app_state.human_annotated[frame_idx, cam_idx, selected_point_idx] = True
+        if app_data[0] == 0:  # Left click
+            app_state.annotations[frame_idx, cam_idx, p_idx] = scaled_pos
+            app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
             app_state.needs_3d_reconstruction = True
-            print(f"Annotated point {selected_point_idx} on cam {cam_idx} at {original_resolution_pos}")
 
-
-        elif app_data[0] == 1:  # Right click to delete
-            app_state.annotations[frame_idx, cam_idx, selected_point_idx] = np.nan
-            app_state.human_annotated[frame_idx, cam_idx, selected_point_idx] = False
+        elif app_data[0] == 1:  # Right click
+            app_state.annotations[frame_idx, cam_idx, p_idx] = np.nan
+            app_state.human_annotated[frame_idx, cam_idx, p_idx] = False
             app_state.needs_3d_reconstruction = True
-            print(f"Deleted point {selected_point_idx} on cam {cam_idx}")
 
 
 def _save_state_callback(sender, app_data, user_data):
-    """Triggers saving of the application state."""
-
-    app_state = user_data["app_state"]
-
-    # For now we hardcode the data folder # TODO: add a file dialog
     from main import DATA_FOLDER
+    user_data["app_state"].save_data_to_files(DATA_FOLDER)
 
-    app_state.save_data_to_files(DATA_FOLDER)
+
+def _load_state_callback(sender, app_data, user_data):
+    from main import DATA_FOLDER
+    user_data["app_state"].load_data_from_files(DATA_FOLDER)
 
 
 def _start_ga_callback(sender, app_data, user_data):
-    """Starts the Genetic Algorithm worker."""
-
     app_state = user_data["app_state"]
     ga_command_queue = user_data["ga_command_queue"]
-
     with app_state.lock:
         app_state.is_ga_running = True
         ga_snapshot = app_state.get_ga_state_snapshot()
-
-    ga_command_queue.put({
-        "action": "start",
-        "ga_state_snapshot": ga_snapshot
-    })
+    ga_command_queue.put({"action": "start", "ga_state_snapshot": ga_snapshot})
     dpg.show_item("ga_popup")
 
 
 def _stop_ga_callback(sender, app_data, user_data):
-    """Stops the Genetic Algorithm worker."""
-
     app_state = user_data["app_state"]
     ga_command_queue = user_data["ga_command_queue"]
-
-    with app_state.lock:
-        app_state.is_ga_running = False
-
+    with app_state.lock: app_state.is_ga_running = False
     ga_command_queue.put({"action": "stop"})
     dpg.hide_item("ga_popup")
