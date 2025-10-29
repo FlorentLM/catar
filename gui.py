@@ -183,29 +183,26 @@ def _create_video_grid(app_state: AppState, scene_visualizer: SceneVisualizer, c
                                 dpg.add_item_clicked_handler(callback=scene_visualizer.dpg_drag_start)
                             dpg.bind_item_handler_registry("3d_image", "3d_image_handler")
 
+
 def _resize_video_widgets(sender, app_data, user_data):
     """Callback to dynamically resize video images to fit the window."""
 
     app_state = user_data["app_state"]
     GRID_COLS = 3
-
-    # Get the width of the container that holds the video grid
     grid_width = dpg.get_item_rect_size("video_grid_window")[0]
 
-    # Width for each image (with a litttle padding)
     item_width = (grid_width / GRID_COLS) - 20
-
-    # If window is too small, prevent negative width
-    if item_width <= 0:
-        return
+    if item_width <= 0: return
 
     aspect_ratio = app_state.video_metadata['width'] / app_state.video_metadata['height']
     item_height = item_width / aspect_ratio
 
     for i in range(app_state.video_metadata['num_videos']):
-        dpg.configure_item(f"video_image_{i}", width=item_width, height=item_height)
+        dpg.configure_item(f"drawlist_{i}", width=item_width, height=item_height)
+        dpg.configure_item(f"video_image_{i}", pmax=(item_width, item_height))
 
     dpg.configure_item("3d_image", width=item_width, height=item_height)
+
 
 def _create_ga_popup(app_state, ga_command_queue):
     """Creates the popup window for the genetic algorithm."""
