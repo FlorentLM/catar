@@ -47,7 +47,6 @@ class VideoReaderWorker(threading.Thread):
             prev_frame_idx = -1
 
             while not self.shutdown_event.is_set():
-                # Check for a shutdown command
                 try:
                     command = self.command_queue.get_nowait()
                     if command.get("action") == "shutdown":
@@ -60,43 +59,32 @@ class VideoReaderWorker(threading.Thread):
                     current_frame_idx = self.app_state.frame_idx
                     is_paused = self.app_state.paused
 
-                # If paused and the frame hasn't been changed by the user, do nothing
-                if prev_frame_idx == current_frame_idx and is_paused:
-                    time.sleep(0.01)
-                    continue
+                # Only read new frames if the index has actually changed.
+                if current_frame_idx != prev_frame_idx:
+                    is_sequential = (current_frame_idx == prev_frame_idx + 1)
+                    if is_sequential:
+                        current_frames = self._read_next_frames()
+                    else:
+                        current_frames = self._read_frames_for_idx(current_frame_idx)
 
-                # The core logic: if the requested frame is not the next sequential one,
-                # we must perform a slow 'seek'. Otherwise, we do a fast 'read'.
-                is_sequential = (current_frame_idx == prev_frame_idx + 1)
-                if is_sequential:
-                    current_frames = self._read_next_frames()
-                else:
-                    current_frames = self._read_frames_for_idx(current_frame_idx)
+                    if not current_frames:
+                        with self.app_state.lock: self.app_state.paused = True
+                        continue
 
-                if not current_frames:
-                    with self.app_state.lock:
-                        self.app_state.paused = True  # Stop playback at the end of the video
-                    continue
+                    output_data = {"frame_idx": current_frame_idx, "raw_frames": current_frames,
+                                   "was_sequential": is_sequential}
 
-                output_data = {
-                    "frame_idx": current_frame_idx,
-                    "raw_frames": current_frames,
-                    "was_sequential": is_sequential,
-                }
+                    for q in self.output_queues:
+                        while not q.empty():
+                            try:
+                                q.get_nowait()
+                            except queue.Empty:
+                                break
+                        q.put(output_data)
 
-                for q in self.output_queues:
-                    # Clear the queue to prevent consumers from lagging behind.
-                    # This is a non-blocking way to discard old frames.
-                    while not q.empty():
-                        try:
-                            q.get_nowait()
-                        except queue.Empty:
-                            break
-                    # Put the newest frame data onto the now-clear queue.
-                    q.put(output_data)
+                    prev_frame_idx = current_frame_idx
 
-                prev_frame_idx = current_frame_idx
-
+                # Advance the frame counter if we are not paused
                 if not is_paused:
                     with self.app_state.lock:
                         num_frames = self.app_state.video_metadata['num_frames']
@@ -104,6 +92,10 @@ class VideoReaderWorker(threading.Thread):
                             self.app_state.frame_idx += 1
                         else:
                             self.app_state.paused = True
+                else:
+                    # If we are paused, sleep a bit to yield the CPU
+                    time.sleep(0.01)
+
         finally:
             for cap in self.video_captures:
                 cap.release()
@@ -111,10 +103,11 @@ class VideoReaderWorker(threading.Thread):
 
     def _read_frames_for_idx(self, frame_idx: int) -> List[np.ndarray]:
         frames = []
-        for cap in self.video_captures:
+        for c, cap in enumerate(self.video_captures):
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
-            if not ret: return []
+            if not ret:
+                return []
             frames.append(frame)
         return frames
 
@@ -122,7 +115,8 @@ class VideoReaderWorker(threading.Thread):
         frames = []
         for cap in self.video_captures:
             ret, frame = cap.read()
-            if not ret: return []
+            if not ret:
+                return []
             frames.append(frame)
         return frames
 
@@ -223,12 +217,18 @@ class RenderingWorker(threading.Thread):
                 final_video_frames = [cv2.resize(f, (DISPLAY_WIDTH, DISPLAY_HEIGHT)) for f in rendered_video_frames]
                 final_3d_frame = cv2.resize(rendered_3d_frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
 
-                if self.results_out_queue.empty():
-                    self.results_out_queue.put({
-                        'frame_idx': data['frame_idx'],
-                        'video_frames_bgr': final_video_frames,
-                        '3d_frame_bgr': final_3d_frame,
-                    })
+                # Clear any old frame that the GUI hasn't gotten to yet
+                while not self.results_out_queue.empty():
+                    try:
+                        self.results_out_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                # Put the newest frame on the queue
+                self.results_out_queue.put({
+                    'frame_idx': data['frame_idx'],
+                    'video_frames_bgr': final_video_frames,
+                    '3d_frame_bgr': final_3d_frame,
+                })
 
             except queue.Empty:
                 continue
