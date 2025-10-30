@@ -75,34 +75,44 @@ def undistort_points(points_2d: np.ndarray, cam_params: Dict[str, Any]) -> np.nd
 
 
 def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, int], np.ndarray]:
-
+    """
+    Calculates the fundamental matrix for each pair of cameras.
+    `rvec` and `tvec` for each camera represent a CAMERA-TO-WORLD transformation
+    """
     num_cams = len(calibration)
     f_mats = {}
 
-    # Pre-calculate camera matrices and extrinsics
+    # Pre-calculate intrinsics (K) and camera-to-world extrinsics (R, t)
     Ks = [get_camera_matrix(cam) for cam in calibration]
-    Es = []
+    Rs_c2w = []
+    ts_c2w = []
     for cam in calibration:
         R, _ = cv2.Rodrigues(cam['rvec'])
-        t = cam['tvec'].reshape(3, 1)
-        Es.append(np.hstack([R, t]))
+        t = cam['tvec'].flatten()
+        Rs_c2w.append(R)
+        ts_c2w.append(t)
 
     for i, j in itertools.product(range(num_cams), repeat=2):
         if i == j:
             continue
 
-        # Get world-to-camera extrinsic matrices
-        E_w2c_i = np.vstack([Es[i], [0, 0, 0, 1]])
-        E_w2c_j = np.vstack([Es[j], [0, 0, 0, 1]])
+        # Get params for camera `i` (from) and `j` (to)
+        K_i, K_j = Ks[i], Ks[j]
+        R_i, t_i = Rs_c2w[i], ts_c2w[i]  # Pose of camera i in the world
+        R_j, t_j = Rs_c2w[j], ts_c2w[j]  # Pose of camera j in the world
 
-        # Get camera-to-world by inverting
-        E_c2w_i = np.linalg.inv(E_w2c_i)
+        # To find the Fundamental Matrix F_ji that maps points from camera i to lines in camera j,
+        # we need the relative pose T_j<-i, which transforms points from i's frame to j's frame.
+        # T_j<-i = T_j<-w * T_w<-i = (T_w<-j)^-1 * T_w<-i
 
-        # Get the relative transformation from camera i to camera j
-        E_i_to_j = E_w2c_j @ E_c2w_i
-        R_rel, t_rel = E_i_to_j[:3, :3], E_i_to_j[:3, 3]
+        # Relative rotation (from frame i to frame j)
+        R_rel = R_j.T @ R_i
 
-        # Essential Matrix E = [t_x]R
+        # Relative translation (position of i's origin in j's coordinate system)
+        # This is the baseline vector required for the Essential Matrix.
+        t_rel = R_j.T @ (t_i - t_j)
+
+        # Essential Matrix E = [t]_x R
         t_skew = np.array([
             [0, -t_rel[2], t_rel[1]],
             [t_rel[2], 0, -t_rel[0]],
@@ -111,8 +121,15 @@ def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, i
         Essential = t_skew @ R_rel
 
         # Fundamental Matrix F = K_j^-T * E * K_i^-1
-        F = np.linalg.inv(Ks[j]).T @ Essential @ np.linalg.inv(Ks[i])
-        f_mats[(i, j)] = F
+        F = np.linalg.inv(K_j).T @ Essential @ np.linalg.inv(K_i)
+
+        # Enforce the rank-2 constraint on F using SVD
+        U, S, Vt = np.linalg.svd(F)
+        S[2] = 0.0  # Zero out the smallest singular value
+        F_corrected = U @ np.diag(S) @ Vt
+
+        # Store the matrix that maps points from `i` to lines in `j`.
+        f_mats[(i, j)] = F_corrected
 
     return f_mats
 

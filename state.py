@@ -21,6 +21,12 @@ class AppState:
         self.POINT_NAMES = skeleton_config['point_names']
         self.SKELETON = skeleton_config['skeleton']
         self.point_colors = skeleton_config['point_colors']
+        self.camera_colors = [
+                       (255, 255, 0), (0, 255, 255), (255, 0, 255), (255, 128, 0),
+                       (128, 0, 255), (0, 255, 128), (255, 255, 255), (0, 255, 0),
+                       (128, 128, 0), (0, 128, 128), (128, 0, 128), (128, 128, 128)
+                                                                      ]
+        # TODO: Use mokap colours
         self.num_points = len(self.POINT_NAMES)
         self.video_names: List[str] = []
 

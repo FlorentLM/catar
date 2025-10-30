@@ -267,6 +267,7 @@ def update_annotation_overlays(app_state: AppState):
         all_human_annotated = app_state.human_annotated[frame_idx]
         point_names = app_state.POINT_NAMES
         point_colors = app_state.point_colors
+        camera_colors = app_state.camera_colors
 
         # Selected point only, for special visualizations
         p_idx = app_state.selected_point_idx
@@ -288,40 +289,60 @@ def update_annotation_overlays(app_state: AppState):
         # Draw special overlays for the selected point
         if best_individual and f_mats:
             valid_annot_mask = ~np.isnan(selected_annots).any(axis=1)
-            num_views = np.sum(valid_annot_mask)
 
-            if num_views == 1:
-                # One view annotated -> draw epipolar lines
-                from_cam_idx = np.where(valid_annot_mask)[0][0]
-                if cam_idx != from_cam_idx:
-                    point_2d = selected_annots[from_cam_idx]
+            # --- Epipolar Lines ---
+            # An epipolar line is drawn on the current view (`cam_idx`) for every *other*
+            # view (`from_cam_idx`) that has an annotation.
+            for from_cam_idx in range(num_videos):
+                if cam_idx == from_cam_idx:
+                    continue
+
+                point_2d = selected_annots[from_cam_idx]
+                if not np.isnan(point_2d).any():
                     F = f_mats.get((from_cam_idx, cam_idx))
                     if F is not None:
-                        line = cv2.computeCorrespondEpilines(point_2d.reshape(1, 1, 2), 1, F).reshape(3)
+                        # Convert point to homogeneous coordinates: p' = [x, y, 1]
+                        p_hom = np.array([point_2d[0], point_2d[1], 1.0])
+
+                        # The epipolar line is given by l = F @ p'
+                        # l is a 3-element vector [a, b, c] for the line equation ax + by + c = 0
+                        line = F @ p_hom
                         a, b, c = line
 
-                        p1_orig, p2_orig = (0, -c / b), (video_w, -(c + a * video_w) / b)
-                        if abs(b) < 1e-6:  # Handle vertical line
-                            p1_orig, p2_orig = (-c / a, 0), (-c / a, video_h)
+                        # Calculate two points on the line that are at the edges of the video frame
+                        # We solve ax + by + c = 0 for y: y = (-ax - c) / b
+                        if abs(b) > 1e-6: # Avoid division by zero for horizontal lines
+                            x0, x1 = 0, video_w
+                            y0 = (-a * x0 - c) / b
+                            y1 = (-a * x1 - c) / b
+                            p1_orig, p2_orig = (x0, y0), (x1, y1)
+                        else: # Handle vertical lines by solving for x: x = (-by - c) / a
+                            y0, y1 = 0, video_h
+                            x0 = (-b * y0 - c) / a
+                            x1 = (-b * y1 - c) / a
+                            p1_orig, p2_orig = (x0, y0), (x1, y1)
 
+                        # Scale points to the widget's current size
                         p1_scaled = (p1_orig[0] * scale_x, p1_orig[1] * scale_y)
                         p2_scaled = (p2_orig[0] * scale_x, p2_orig[1] * scale_y)
-                        dpg.draw_line(p1_scaled, p2_scaled, color=(255, 255, 0), thickness=1, parent=layer_tag)
+                        color = camera_colors[from_cam_idx % len(camera_colors)]
+                        dpg.draw_line(p1_scaled, p2_scaled, color=color, thickness=1, parent=layer_tag)
 
-            elif num_views >= 2 and not np.isnan(point_3d).any():
-                # 2+ views annotated -> Draw reprojection
+            # Reprojection and Error lines
+            # if a 3D point has been reconstructed, show where it projects back to
+            if not np.isnan(point_3d).any():
                 reproj_2d = reproject_points(point_3d, best_individual[cam_idx])
                 if reproj_2d.size > 0:
                     reproj_scaled = (reproj_2d[0] * scale_x, reproj_2d[1] * scale_y)
                     color = point_colors[p_idx].tolist()
 
-                    # Draw red X
+                    # Draw a red X to mark the reprojected point
                     dpg.draw_line((reproj_scaled[0] - 5, reproj_scaled[1] - 5),
-                                  (reproj_scaled[0] + 5, reproj_scaled[1] + 5), color=(0, 0, 255), parent=layer_tag)
+                                  (reproj_scaled[0] + 5, reproj_scaled[1] + 5), color=(255, 0, 0), parent=layer_tag)
                     dpg.draw_line((reproj_scaled[0] - 5, reproj_scaled[1] + 5),
-                                  (reproj_scaled[0] + 5, reproj_scaled[1] - 5), color=(0, 0, 255), parent=layer_tag)
+                                  (reproj_scaled[0] + 5, reproj_scaled[1] - 5), color=(255, 0, 0), parent=layer_tag)
 
-                    # Draw error line if this view is annotated
+                    # If current view also has an annotation, draw a line showing the reprojection error
                     if valid_annot_mask[cam_idx]:
                         annot_scaled = (selected_annots[cam_idx, 0] * scale_x, selected_annots[cam_idx, 1] * scale_y)
                         dpg.draw_line(annot_scaled, reproj_scaled, color=color, thickness=1, parent=layer_tag)
