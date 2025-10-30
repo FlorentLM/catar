@@ -2,9 +2,13 @@ import random
 import cv2
 import numpy as np
 import itertools
-from typing import List, Dict, Any
-from state import AppState
+from typing import List, Dict, Any, Tuple
+
 from viz_3d import SceneObject
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from state import AppState
 
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
@@ -70,9 +74,52 @@ def undistort_points(points_2d: np.ndarray, cam_params: Dict[str, Any]) -> np.nd
     return undistorted_full
 
 
+def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, int], np.ndarray]:
+
+    num_cams = len(calibration)
+    f_mats = {}
+
+    # Pre-calculate camera matrices and extrinsics
+    Ks = [get_camera_matrix(cam) for cam in calibration]
+    Es = []
+    for cam in calibration:
+        R, _ = cv2.Rodrigues(cam['rvec'])
+        t = cam['tvec'].reshape(3, 1)
+        Es.append(np.hstack([R, t]))
+
+    for i, j in itertools.product(range(num_cams), repeat=2):
+        if i == j:
+            continue
+
+        # Get world-to-camera extrinsic matrices
+        E_w2c_i = np.vstack([Es[i], [0, 0, 0, 1]])
+        E_w2c_j = np.vstack([Es[j], [0, 0, 0, 1]])
+
+        # Get camera-to-world by inverting
+        E_c2w_i = np.linalg.inv(E_w2c_i)
+
+        # Get the relative transformation from camera i to camera j
+        E_i_to_j = E_w2c_j @ E_c2w_i
+        R_rel, t_rel = E_i_to_j[:3, :3], E_i_to_j[:3, 3]
+
+        # Essential Matrix E = [t_x]R
+        t_skew = np.array([
+            [0, -t_rel[2], t_rel[1]],
+            [t_rel[2], 0, -t_rel[0]],
+            [-t_rel[1], t_rel[0], 0]
+        ])
+        Essential = t_skew @ R_rel
+
+        # Fundamental Matrix F = K_j^-T * E * K_i^-1
+        F = np.linalg.inv(Ks[j]).T @ Essential @ np.linalg.inv(Ks[i])
+        f_mats[(i, j)] = F
+
+    return f_mats
+
+
 # Point Tracking (Optic flow)
 
-def track_points(app_state: AppState, prev_frames: List[np.ndarray], current_frames: List[np.ndarray]):
+def track_points(app_state: 'AppState', prev_frames: List[np.ndarray], current_frames: List[np.ndarray]):
     """Tracks keypoints from previous to current frames using Lucas-Kanade algo."""
 
     with app_state.lock:
@@ -138,7 +185,7 @@ def combination_triangulate(frame_annotations: np.ndarray, proj_matrices: np.nda
 
     return np.nanmean(points_3d_votes, axis=0)
 
-def update_3d_reconstruction(app_state: AppState):
+def update_3d_reconstruction(app_state: 'AppState'):
     """Uses the best camera parameters to reconstruct 3D points for the current frame."""
 
     with app_state.lock:
@@ -156,42 +203,6 @@ def update_3d_reconstruction(app_state: AppState):
 
 
 # Visualization helpers
-
-def draw_ui(frame: np.ndarray, cam_idx: int, app_state: AppState) -> np.ndarray:
-    """Draws complex UI elements like reprojection lines on a single video frame."""
-
-    with app_state.lock:
-        frame_idx = app_state.frame_idx
-        best_individual = app_state.best_individual
-        annotations_for_frame = app_state.annotations[frame_idx, cam_idx]
-        points_3d_for_frame = app_state.reconstructed_3d_points[frame_idx]
-        point_colors = app_state.point_colors
-
-    # Only draw if we have a calibrated camera
-    if not best_individual:
-        return frame
-
-    cam_params = best_individual[cam_idx]
-    valid_3d_points_mask = ~np.isnan(points_3d_for_frame).any(axis=1)
-
-    if np.any(valid_3d_points_mask):
-        points_to_reproject = points_3d_for_frame[valid_3d_points_mask]
-        reprojected_pts = reproject_points(points_to_reproject, cam_params)
-        original_indices = np.where(valid_3d_points_mask)[0]
-
-        for i, p_idx in enumerate(original_indices):
-            # Only draw line if the original 2D point exists
-            if np.isnan(annotations_for_frame[p_idx]).any():
-                continue
-
-            annotated_pt = tuple(annotations_for_frame[p_idx].astype(int))
-            reprojected_pt = tuple(reprojected_pts[i].astype(int))
-            color = point_colors[p_idx].tolist()
-
-            cv2.line(frame, annotated_pt, reprojected_pt, color, 1)
-            cv2.circle(frame, reprojected_pt, 3, color, -1) # Draw a small circle at the reprojected end
-
-    return frame
 
 def create_camera_visual(cam_params: Dict[str, Any], label: str) -> List[SceneObject]:
     """Generates a list of SceneObjects to represent a camera's pose as a pyramid."""

@@ -5,10 +5,14 @@ import queue
 import multiprocessing
 import dearpygui.dearpygui as dpg
 import numpy as np
-from state import AppState
+import tomllib
 from gui import create_dpg_ui, resize_video_widgets, update_annotation_overlays, update_histogram
 from workers import VideoReaderWorker, TrackingWorker, GAWorker, RenderingWorker
 from viz_3d import SceneVisualizer
+from state import AppState
+from scipy.optimize import linear_sum_assignment
+import Levenshtein
+
 
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
@@ -48,6 +52,71 @@ SKELETON_CONFIG = {
 }
 
 
+def load_and_match_data(data_folder: Path, video_format: str):
+    """
+    Loads calibration from TOML, finds all video files, and performs one-to-one matching
+    """
+    # Load TOML file as ground truth
+    calib_file = data_folder / 'parameters.toml'
+    if not calib_file.exists():
+        print(f"CRITICAL ERROR: 'parameters.toml' not found in '{data_folder}'. This file is required.")
+        sys.exit(1)
+
+    with calib_file.open("rb") as f:
+        calib_data = tomllib.load(f)
+
+    toml_camera_names = sorted(calib_data.keys())  # Keep consistent order
+    print(f"Found {len(toml_camera_names)} cameras in TOML: {toml_camera_names}")
+
+    # Find all available video files
+    video_paths = sorted(data_folder.glob(video_format))
+    if not video_paths:
+        print(f"CRITICAL ERROR: No videos with format '{video_format}' found in '{data_folder}'.")
+        sys.exit(1)
+
+    video_filenames = [p.name for p in video_paths]
+    print(f"Found {len(video_filenames)} video files: {video_filenames}")
+
+    if len(toml_camera_names) != len(video_paths):
+        print(
+            "CRITICAL ERROR: The number of cameras in 'parameters.toml' does not match the number of video files found.")
+        sys.exit(1)
+
+    # Build cost matrix with Levenshtein distance
+    n = len(toml_camera_names)
+    cost_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            cost_matrix[i, j] = Levenshtein.distance(toml_camera_names[i], video_filenames[j])
+
+    # Solve the assignment problem to find the best matches
+    toml_indices, video_indices = linear_sum_assignment(cost_matrix)
+
+    # Build the final, correctly ordered lists based on the TOML order
+    ordered_video_paths = []
+    ordered_video_names = []
+    loaded_individual = []
+
+    for i, toml_name in enumerate(toml_camera_names):
+        # which video index was matched to this toml index?
+        matched_video_idx = video_indices[np.where(toml_indices == i)][0]
+
+        ordered_video_paths.append(str(video_paths[matched_video_idx]))
+        ordered_video_names.append(video_filenames[matched_video_idx])
+
+        cam = calib_data[toml_name]
+        cam_params = {
+            'fx': cam['camera_matrix'][0][0], 'fy': cam['camera_matrix'][1][1],
+            'cx': cam['camera_matrix'][0][2], 'cy': cam['camera_matrix'][1][2],
+            'dist': np.array(cam['dist_coeffs'], dtype=np.float32),
+            'rvec': np.array(cam['rvec'], dtype=np.float32),
+            'tvec': np.array(cam['tvec'], dtype=np.float32),
+        }
+        loaded_individual.append(cam_params)
+        # print(f"'{toml_name}' (TOML)  <-->  '{video_filenames[matched_video_idx]}' (Video File)")
+
+    return ordered_video_paths, ordered_video_names, loaded_individual
+
 def load_videos(data_folder: Path, video_format: str):
     video_paths = sorted(data_folder.glob(video_format))
 
@@ -74,9 +143,21 @@ def load_videos(data_folder: Path, video_format: str):
 
 
 def main():
-    video_paths, video_metadata, video_names = load_videos(DATA_FOLDER, VIDEO_FORMAT)
+    ordered_paths, ordered_names, ordered_calib = load_and_match_data(DATA_FOLDER, VIDEO_FORMAT)
+
+    cap = cv2.VideoCapture(ordered_paths[0])
+    video_metadata = {
+        'num_videos': len(ordered_paths),
+        'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        'num_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+        'fps': cap.get(cv2.CAP_PROP_FPS)
+    }
+    cap.release()
+
     app_state = AppState(video_metadata, SKELETON_CONFIG)
-    app_state.video_names = video_names
+    app_state.video_names = ordered_names
+    app_state.set_calibration(ordered_calib)
     app_state.load_data_from_files(DATA_FOLDER)
 
     # Queues
@@ -89,7 +170,7 @@ def main():
     scene_visualizer = SceneVisualizer(frame_size=(DISPLAY_WIDTH, DISPLAY_HEIGHT))
 
     # Workers
-    video_reader = VideoReaderWorker(app_state, video_paths, command_queue,
+    video_reader = VideoReaderWorker(app_state, ordered_paths, command_queue,
                                      [frames_for_tracking_queue, frames_for_rendering_queue])
     tracking_worker = TrackingWorker(app_state, frames_for_tracking_queue)
     rendering_worker = RenderingWorker(app_state, scene_visualizer, frames_for_rendering_queue, results_queue)

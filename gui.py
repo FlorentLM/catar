@@ -2,13 +2,15 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 from queue import Queue
 from multiprocessing import Queue as MPQueue
-
 from state import AppState
 from viz_3d import SceneVisualizer
+from pathlib import Path
+import cv2
+from core import reproject_points
 
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
-
+DATA_FOLDER = Path.cwd() / 'data'
 
 # Main UI
 
@@ -115,6 +117,7 @@ def _create_menu_bar(app_state, command_queue, ga_command_queue):
             dpg.add_menu_item(label="Load State (L)", callback=_load_state_callback, user_data={"app_state": app_state})
 
         with dpg.menu(label="Calibration"):
+
             dpg.add_menu_item(label="Run Genetic Algorithm", callback=_start_ga_callback,
                               user_data={"app_state": app_state, "ga_command_queue": ga_command_queue})
             dpg.add_menu_item(label="Add Frame to Calibration Set (C)", callback=_add_to_calib_frames_callback,
@@ -253,41 +256,88 @@ def resize_video_widgets(sender, app_data, user_data):
 
 
 def update_annotation_overlays(app_state: AppState):
-
     with app_state.lock:
         frame_idx = app_state.frame_idx
-
         num_videos = app_state.video_metadata['num_videos']
         video_w = app_state.video_metadata['width']
         video_h = app_state.video_metadata['height']
 
-        annotations = app_state.annotations[frame_idx]
-        human_annotated = app_state.human_annotated[frame_idx]
+        # For all points
+        all_annotations = app_state.annotations[frame_idx]
+        all_human_annotated = app_state.human_annotated[frame_idx]
         point_names = app_state.POINT_NAMES
         point_colors = app_state.point_colors
 
+        # Selected point only, for special visualizations
+        p_idx = app_state.selected_point_idx
+        best_individual = app_state.best_individual
+        f_mats = app_state.fundamental_matrices
+        selected_annots = app_state.annotations[frame_idx, :, p_idx]
+        point_3d = app_state.reconstructed_3d_points[frame_idx, p_idx]
+
+    # Main drawing loop
     for cam_idx in range(num_videos):
-        layer_tag, drawlist_tag = f"annotation_layer_{cam_idx}", f"drawlist_{cam_idx}"
+        layer_tag = f"annotation_layer_{cam_idx}"
+        drawlist_tag = f"drawlist_{cam_idx}"
         dpg.delete_item(layer_tag, children_only=True)
+
         widget_size = dpg.get_item_rect_size(drawlist_tag)
-
-        if widget_size[0] == 0:
-            continue
-
+        if widget_size[0] == 0: continue
         scale_x, scale_y = widget_size[0] / video_w, widget_size[1] / video_h
 
-        for p_idx in range(app_state.num_points):
-            point_2d = annotations[cam_idx, p_idx]
+        # Draw special overlays for the selected point
+        if best_individual and f_mats:
+            valid_annot_mask = ~np.isnan(selected_annots).any(axis=1)
+            num_views = np.sum(valid_annot_mask)
 
+            if num_views == 1:
+                # One view annotated -> draw epipolar lines
+                from_cam_idx = np.where(valid_annot_mask)[0][0]
+                if cam_idx != from_cam_idx:
+                    point_2d = selected_annots[from_cam_idx]
+                    F = f_mats.get((from_cam_idx, cam_idx))
+                    if F is not None:
+                        line = cv2.computeCorrespondEpilines(point_2d.reshape(1, 1, 2), 1, F).reshape(3)
+                        a, b, c = line
+
+                        p1_orig, p2_orig = (0, -c / b), (video_w, -(c + a * video_w) / b)
+                        if abs(b) < 1e-6:  # Handle vertical line
+                            p1_orig, p2_orig = (-c / a, 0), (-c / a, video_h)
+
+                        p1_scaled = (p1_orig[0] * scale_x, p1_orig[1] * scale_y)
+                        p2_scaled = (p2_orig[0] * scale_x, p2_orig[1] * scale_y)
+                        dpg.draw_line(p1_scaled, p2_scaled, color=(255, 255, 0), thickness=1, parent=layer_tag)
+
+            elif num_views >= 2 and not np.isnan(point_3d).any():
+                # 2+ views annotated -> Draw reprojection
+                reproj_2d = reproject_points(point_3d, best_individual[cam_idx])
+                if reproj_2d.size > 0:
+                    reproj_scaled = (reproj_2d[0] * scale_x, reproj_2d[1] * scale_y)
+                    color = point_colors[p_idx].tolist()
+
+                    # Draw red X
+                    dpg.draw_line((reproj_scaled[0] - 5, reproj_scaled[1] - 5),
+                                  (reproj_scaled[0] + 5, reproj_scaled[1] + 5), color=(0, 0, 255), parent=layer_tag)
+                    dpg.draw_line((reproj_scaled[0] - 5, reproj_scaled[1] + 5),
+                                  (reproj_scaled[0] + 5, reproj_scaled[1] - 5), color=(0, 0, 255), parent=layer_tag)
+
+                    # Draw error line if this view is annotated
+                    if valid_annot_mask[cam_idx]:
+                        annot_scaled = (selected_annots[cam_idx, 0] * scale_x, selected_annots[cam_idx, 1] * scale_y)
+                        dpg.draw_line(annot_scaled, reproj_scaled, color=color, thickness=1, parent=layer_tag)
+
+        # Draw all annotated points (circles and text)
+        for i in range(app_state.num_points):
+            point_2d = all_annotations[cam_idx, i]
             if not np.isnan(point_2d).any():
                 center_x, center_y = point_2d[0] * scale_x, point_2d[1] * scale_y
-                color = point_colors[p_idx].tolist()
+                color = point_colors[i].tolist()
 
-                if human_annotated[cam_idx, p_idx]:
+                if all_human_annotated[cam_idx, i]:
                     dpg.draw_circle(center=(center_x, center_y), radius=7, color=(255, 255, 255), parent=layer_tag)
 
                 dpg.draw_circle(center=(center_x, center_y), radius=5, color=color, fill=color, parent=layer_tag)
-                dpg.draw_text(pos=(center_x + 8, center_y - 8), text=point_names[p_idx], color=color, size=14,
+                dpg.draw_text(pos=(center_x + 8, center_y - 8), text=point_names[i], color=color, size=14,
                               parent=layer_tag)
 
 
@@ -376,6 +426,45 @@ def _on_histogram_click(sender, app_data, user_data):
                 app_state.frame_idx = clicked_frame
                 app_state.paused = True
 
+
+def _on_select_calib_file(sender, app_data, user_data):
+    """
+    This is the secondary callback that is executed after the user
+    selects a file from the file dialog or cancels.
+    """
+    app_state = user_data["app_state"]
+
+    # app_data contains the selection from the file dialog
+    # Check if the user selected a file (and didn't cancel)
+    if 'file_path_name' in app_data and app_data['file_path_name']:
+        file_path = Path(app_data['file_path_name'])
+
+        # Call the method in AppState to perform the actual loading
+        app_state.load_calibration_from_toml(file_path)
+
+    # Clean up by deleting the file dialog from the UI
+    dpg.delete_item("external_calib_file_dialog")
+
+
+def _load_external_calib_callback(sender, app_data, user_data):
+    """
+    This is the primary callback attached to the menu item.
+    It opens the file dialog window.
+    """
+    # Create and show the file dialog
+    with dpg.file_dialog(
+            directory_selector=False,
+            show=True,
+            callback=_on_select_calib_file,
+            tag="external_calib_file_dialog",
+            width=700,
+            height=400,
+            default_path=str(DATA_FOLDER),
+            user_data=user_data  # Pass the app_state along to the next callback
+    ):
+        # Filter for TOML files to guide the user
+        dpg.add_file_extension(".toml", color=(255, 255, 0, 255))
+        dpg.add_file_extension(".*")
 
 def _toggle_pause_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
@@ -514,12 +603,15 @@ def _image_click_callback(sender, app_data, user_data):
     scaled_pos = (local_pos[0] * video_w / container_size[0], local_pos[1] * video_h / container_size[1])
 
     with app_state.lock:
-        if app_data[0] == 0:  # Left click
+        frame_idx = app_state.frame_idx
+        p_idx = app_state.selected_point_idx
+
+        if app_data[0] == 0:  # Left click to annotate
             app_state.annotations[frame_idx, cam_idx, p_idx] = scaled_pos
             app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
-            app_state.needs_3d_reconstruction = True
+            app_state.needs_3d_reconstruction = True # Always trigger a check
 
-        elif app_data[0] == 1:  # Right click
+        elif app_data[0] == 1:  # Right click to remove
             app_state.annotations[frame_idx, cam_idx, p_idx] = np.nan
             app_state.human_annotated[frame_idx, cam_idx, p_idx] = False
             app_state.needs_3d_reconstruction = True

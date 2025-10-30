@@ -9,7 +9,6 @@ from typing import List
 from core import (
     track_points,
     update_3d_reconstruction,
-    draw_ui,
     create_camera_visual,
     run_genetic_step,
 )
@@ -208,22 +207,18 @@ class RenderingWorker(threading.Thread):
                 scene = self._prepare_3d_scene()
                 rendered_3d_frame = self.scene_visualizer.draw_scene(scene)
 
-                rendered_video_frames = [
-                    draw_ui(frame.copy(), cam_idx, self.app_state)
-                    for cam_idx, frame in enumerate(data["raw_frames"])
-                ]
+                rendered_video_frames = data["raw_frames"]
 
                 # Resize all frames to the display dimensions before sending to the GUI
                 final_video_frames = [cv2.resize(f, (DISPLAY_WIDTH, DISPLAY_HEIGHT)) for f in rendered_video_frames]
                 final_3d_frame = cv2.resize(rendered_3d_frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
 
-                # Clear any old frame that the GUI hasn't gotten to yet
                 while not self.results_out_queue.empty():
                     try:
                         self.results_out_queue.get_nowait()
                     except queue.Empty:
                         break
-                # Put the newest frame on the queue
+
                 self.results_out_queue.put({
                     'frame_idx': data['frame_idx'],
                     'video_frames_bgr': final_video_frames,
