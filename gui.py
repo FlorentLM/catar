@@ -5,7 +5,6 @@ from multiprocessing import Queue as MPQueue
 from state import AppState
 from viz_3d import SceneVisualizer
 from pathlib import Path
-import cv2
 from core import reproject_points
 
 DISPLAY_WIDTH = 640
@@ -61,6 +60,7 @@ def create_dpg_ui(
             _create_bottom_panel(app_state)
 
     _create_ga_popup(app_state, ga_command_queue)
+    _create_batch_track_popup(app_state)
 
     dpg.create_viewport(title="CATAR", width=initial_width, height=initial_height)
     dpg.set_viewport_resize_callback(resize_video_widgets, user_data={"app_state": app_state})
@@ -140,6 +140,9 @@ def _create_control_panel(app_state: AppState):
     )
     dpg.add_button(label="Track Keypoints", callback=_toggle_tracking_callback, user_data=user_data,
                    tag="keypoint_tracking_button")
+
+    dpg.add_button(label="Track Forward", callback=_start_batch_track_callback, user_data=user_data,
+                   tag="batch_track_button")
 
     dpg.add_separator()
 
@@ -262,19 +265,19 @@ def update_annotation_overlays(app_state: AppState):
         video_w = app_state.video_metadata['width']
         video_h = app_state.video_metadata['height']
 
-        # For all points
-        all_annotations = app_state.annotations[frame_idx]
-        all_human_annotated = app_state.human_annotated[frame_idx]
-        point_names = app_state.POINT_NAMES
-        point_colors = app_state.point_colors
-        camera_colors = app_state.camera_colors
+    # For all points
+    all_annotations = app_state.annotations[frame_idx]
+    all_human_annotated = app_state.human_annotated[frame_idx]
+    point_names = app_state.POINT_NAMES
+    point_colors = app_state.point_colors
+    camera_colors = app_state.camera_colors
 
-        # Selected point only, for special visualizations
-        p_idx = app_state.selected_point_idx
-        best_individual = app_state.best_individual
-        f_mats = app_state.fundamental_matrices
-        selected_annots = app_state.annotations[frame_idx, :, p_idx]
-        point_3d = app_state.reconstructed_3d_points[frame_idx, p_idx]
+    # Selected point only, for special visualizations
+    p_idx = app_state.selected_point_idx
+    best_individual = app_state.best_individual
+    f_mats = app_state.fundamental_matrices
+    selected_annots = app_state.annotations[frame_idx, :, p_idx]
+    point_3d = app_state.reconstructed_3d_points[frame_idx, p_idx]
 
     # Main drawing loop
     for cam_idx in range(num_videos):
@@ -290,9 +293,7 @@ def update_annotation_overlays(app_state: AppState):
         if best_individual and f_mats:
             valid_annot_mask = ~np.isnan(selected_annots).any(axis=1)
 
-            # --- Epipolar Lines ---
-            # An epipolar line is drawn on the current view (`cam_idx`) for every *other*
-            # view (`from_cam_idx`) that has an annotation.
+            # Epipolar Lines
             for from_cam_idx in range(num_videos):
                 if cam_idx == from_cam_idx:
                     continue
@@ -310,12 +311,12 @@ def update_annotation_overlays(app_state: AppState):
                         a, b, c = line
 
                         # Calculate two points on the line that are at the edges of the video frame
-                        # We solve ax + by + c = 0 for y: y = (-ax - c) / b
                         if abs(b) > 1e-6: # Avoid division by zero for horizontal lines
                             x0, x1 = 0, video_w
                             y0 = (-a * x0 - c) / b
                             y1 = (-a * x1 - c) / b
                             p1_orig, p2_orig = (x0, y0), (x1, y1)
+
                         else: # Handle vertical lines by solving for x: x = (-by - c) / a
                             y0, y1 = 0, video_h
                             x0 = (-b * y0 - c) / a
@@ -331,8 +332,12 @@ def update_annotation_overlays(app_state: AppState):
             # Reprojection and Error lines
             # if a 3D point has been reconstructed, show where it projects back to
             if not np.isnan(point_3d).any():
-                reproj_2d = reproject_points(point_3d, best_individual[cam_idx])
-                if reproj_2d.size > 0:
+
+                reprojected_points = reproject_points(point_3d, best_individual[cam_idx])
+
+                if reprojected_points.size > 0:
+                    reproj_2d = reprojected_points[0]
+
                     reproj_scaled = (reproj_2d[0] * scale_x, reproj_2d[1] * scale_y)
                     color = point_colors[p_idx].tolist()
 
@@ -397,6 +402,38 @@ def _create_ga_popup(app_state, ga_command_queue):
         dpg.add_text("Best Fitness: inf", tag="ga_fitness_text")
         dpg.add_text("Mean Fitness: inf", tag="ga_mean_fitness_text")
         dpg.add_button(label="Stop Calibration", callback=_stop_ga_callback, user_data=user_data, width=-1)
+
+
+def _create_batch_track_popup(app_state):
+    user_data = {"app_state": app_state}
+
+    with dpg.window(label="Tracking Progress", modal=True, show=False, tag="batch_track_popup", width=400, no_close=True):
+        dpg.add_text("Processing frames...", tag="batch_track_status_text")
+        dpg.add_progress_bar(tag="batch_track_progress", width=-1)
+        dpg.add_button(label="Stop", callback=_stop_batch_track_callback, user_data=user_data, width=-1)
+
+
+def _start_batch_track_callback(sender, app_data, user_data):
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        start_frame = app_state.frame_idx
+
+        app_state.stop_batch_track.clear()
+
+        # Tell the tracking worker to start its batch job
+        app_state.tracking_command_queue.put({
+            "action": "batch_track",
+            "start_frame": start_frame
+        })
+    dpg.set_value("batch_track_progress", 0.0)
+    dpg.show_item("batch_track_popup")
+
+
+def _stop_batch_track_callback(sender, app_data, user_data):
+    app_state = user_data["app_state"]
+    print("Stop command issued to batch tracker.")
+    app_state.stop_batch_track.set() # Set the event to signal the worker to stop
+    dpg.hide_item("batch_track_popup")
 
 
 def _register_event_handlers(app_state, command_queue, ga_command_queue, scene_visualizer):
@@ -473,7 +510,7 @@ def _on_select_calib_file(sender, app_data, user_data):
         file_path = Path(app_data['file_path_name'])
 
         # Call the method in AppState to perform the actual loading
-        app_state.load_calibration_from_toml(file_path)
+        app_state.load_calibration(file_path)
 
     # Clean up by deleting the file dialog from the UI
     dpg.delete_item("external_calib_file_dialog")

@@ -161,10 +161,13 @@ def main():
     app_state.load_data_from_files(DATA_FOLDER)
 
     # Queues
+    # TODO: all these should probably be owned by the AppState object
     command_queue = queue.Queue()
     frames_for_tracking_queue = queue.Queue(maxsize=2)
     frames_for_rendering_queue = queue.Queue(maxsize=2)
     results_queue = queue.Queue(maxsize=2)
+    tracking_progress_queue = queue.Queue()
+    app_state.tracking_command_queue = queue.Queue()
     ga_command_queue = multiprocessing.Queue()
     ga_progress_queue = multiprocessing.Queue()
     scene_visualizer = SceneVisualizer(frame_size=(DISPLAY_WIDTH, DISPLAY_HEIGHT))
@@ -172,7 +175,7 @@ def main():
     # Workers
     video_reader = VideoReaderWorker(app_state, ordered_paths, command_queue,
                                      [frames_for_tracking_queue, frames_for_rendering_queue])
-    tracking_worker = TrackingWorker(app_state, frames_for_tracking_queue)
+    tracking_worker = TrackingWorker(app_state, frames_for_tracking_queue, tracking_progress_queue, ordered_paths, app_state.tracking_command_queue)
     rendering_worker = RenderingWorker(app_state, scene_visualizer, frames_for_rendering_queue, results_queue)
     ga_worker = GAWorker(ga_command_queue, ga_progress_queue)
 
@@ -201,6 +204,19 @@ def main():
             rgba_3d = cv2.cvtColor(processed_data['3d_frame_bgr'], cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
             dpg.set_value("3d_texture", rgba_3d.ravel())
 
+        except queue.Empty:
+            pass
+
+        try:
+            # Check for progress updates from the tracking worker
+            progress_data = tracking_progress_queue.get_nowait()
+            if progress_data['status'] == 'running':
+                dpg.configure_item("batch_track_progress", default_value=progress_data['progress'])
+                dpg.set_value("batch_track_status_text",
+                              f"Tracking... Frame {progress_data['current_frame']}/{progress_data['total_frames']}")
+            elif progress_data['status'] == 'complete':
+                dpg.hide_item("batch_track_popup")
+                app_state.frame_idx = progress_data['final_frame']  # Jump to the last tracked frame
         except queue.Empty:
             pass
 

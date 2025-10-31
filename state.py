@@ -1,3 +1,4 @@
+import queue
 import threading
 import tomllib
 
@@ -40,6 +41,8 @@ class AppState:
         self.save_output_video: bool = False
         self.needs_3d_reconstruction: bool = True
         self.drag_state: Dict[str, Any] = {}  # holds info about an ongoing drag operation
+        self.tracking_command_queue = queue.Queue()
+        self.stop_batch_track = threading.Event()
 
         # Core data
         num_frames = self.video_metadata['num_frames']
@@ -72,7 +75,7 @@ class AppState:
                 "calibration_frames": list(self.calibration_frames),
                 "video_metadata": self.video_metadata.copy(),
                 "best_fitness": self.best_fitness,
-                "best_individual": self.best_individual, # This can be large... consider sending only on start?
+                "best_individual": self.best_individual, # consider sending only on start?
                 "generation": 0, # GA worker manages its own generation count
             }
 
@@ -93,11 +96,14 @@ class AppState:
                 file_path = data_folder / filename
                 if file_path.exists():
                     try:
-                        if file_type == 'numpy': data = np.load(file_path)
+                        if file_type == 'numpy':
+                            data = np.load(file_path)
                         elif file_type == 'pickle':
-                            with file_path.open('rb') as f: data = pickle.load(f)
+                            with file_path.open('rb') as f:
+                                data = pickle.load(f)
                         elif file_type == 'json':
-                            with file_path.open('r') as f: data = json.load(f)
+                            with file_path.open('r') as f:
+                                data = json.load(f)
 
                         loaded_data[filename.split('.')[0]] = data
                         print(f"  - Successfully loaded '{filename}'")
@@ -113,8 +119,9 @@ class AppState:
                 setattr(self, key, value)
         print("\nState loading complete.")
 
-    def load_calibration_from_toml(self, file_path: Path):
-        print(f"Loading external calibration from '{file_path}'")
+    def load_calibration(self, file_path: Path):
+
+        print(f"Loading camera calibration from '{file_path}'")
         if not file_path.exists():
             print("  - WARNING: File not found.")
             return
@@ -133,7 +140,6 @@ class AppState:
         loaded_individual = []
         for cam_name in sorted_camera_names:
             cam = calib_data[cam_name]
-            # Convert lists from TOML to numpy arrays
             cam_params = {
                 'fx': cam['camera_matrix'][0][0],
                 'fy': cam['camera_matrix'][1][1],
@@ -151,7 +157,7 @@ class AppState:
             self.best_fitness = 0  # 0 = indicator of a loaded calibration
             self.needs_3d_reconstruction = True
 
-        print("Successfully loaded and applied external calibration.")
+        print("Successfully loaded and applied camera calibration.")
 
     def save_data_to_files(self, data_folder: Path):
         """Saves all persistent data from the state object to files."""

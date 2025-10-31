@@ -121,18 +121,20 @@ class VideoReaderWorker(threading.Thread):
 
 
 class TrackingWorker(threading.Thread):
-    """
-    Consumes raw frames and performs optic flow tracking if enabled.
-    (does not render or display anything, only updates the annotations in the AppState)
-    """
     def __init__(
         self,
         app_state: AppState,
         frames_in_queue: queue.Queue,
+        progress_out_queue: queue.Queue, # For sending progress to UI
+        video_paths: List[str],          # Needs video paths for batch mode
+        command_queue: queue.Queue       # For receiving commands from UI
     ):
         super().__init__(daemon=True, name="TrackingWorker")
         self.app_state = app_state
         self.frames_in_queue = frames_in_queue
+        self.progress_out_queue = progress_out_queue
+        self.video_paths = video_paths
+        self.command_queue = command_queue
         self.shutdown_event = threading.Event()
         self.prev_frames = None
         self.prev_frame_idx = -1
@@ -141,7 +143,17 @@ class TrackingWorker(threading.Thread):
         print("Tracking worker started.")
         while not self.shutdown_event.is_set():
             try:
-                data = self.frames_in_queue.get(timeout=1.0)
+                # FIRST, check for special commands like batch tracking
+                command = self.command_queue.get_nowait()
+                if command.get("action") == "batch_track":
+                    self._run_batch_track(command["start_frame"])
+                    continue # Go back to waiting for commands
+            except queue.Empty:
+                pass # No special commands, proceed to real-time mode
+
+            # SECOND, run the old real-time logic (for Play/Next Frame)
+            try:
+                data = self.frames_in_queue.get(timeout=0.1) # Short timeout
                 if data.get("action") == "shutdown":
                     self.shutdown_event.set()
                     break
@@ -149,22 +161,77 @@ class TrackingWorker(threading.Thread):
                 with self.app_state.lock:
                     is_tracking_enabled = self.app_state.keypoint_tracking_enabled
 
-                # core logic: only track if enabled and frames are sequential
                 if is_tracking_enabled and data["was_sequential"] and self.prev_frames:
                     track_points(self.app_state, self.prev_frames, data["raw_frames"], data["frame_idx"])
 
-                # Update state for next iteration
                 self.prev_frames = data["raw_frames"]
                 self.prev_frame_idx = data["frame_idx"]
 
             except queue.Empty:
-                continue # No new frames, just wait
+                continue
             except Exception as e:
                 print(f"!!! CRITICAL ERROR IN TRACKING WORKER: {e}")
                 import traceback
                 traceback.print_exc()
-                self.shutdown_event.set()
+
         print("Tracking worker shut down.")
+
+    def _run_batch_track(self, start_frame: int):
+        print(f"Starting batch track from frame {start_frame}...")
+
+        caps = [cv2.VideoCapture(path) for path in self.video_paths]
+        if not all(cap.isOpened() for cap in caps):
+            print("Batch track error: Could not open videos.")
+            return
+
+        num_frames = self.app_state.video_metadata['num_frames']
+        total_frames_to_process = num_frames - start_frame -1
+
+        # Get the starting previous frame
+        prev_frames_batch = []
+        for cap in caps:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            ret, frame = cap.read()
+            if not ret: return
+            prev_frames_batch.append(frame)
+
+        for i, frame_idx in enumerate(range(start_frame + 1, num_frames)):
+
+            if self.app_state.stop_batch_track.is_set():
+                print(f"Batch track stopped by user at frame {frame_idx}.")
+                break
+
+            # Read current frames
+            current_frames_batch = []
+            for cap in caps:
+                ret, frame = cap.read()
+                if not ret: break
+                current_frames_batch.append(frame)
+
+            if not current_frames_batch:
+                break # End of video
+
+            # Core tracking logic
+            track_points(self.app_state, prev_frames_batch, current_frames_batch, frame_idx)
+
+            # Update for next iteration
+            prev_frames_batch = current_frames_batch
+
+            # Send progress update every few frames to avoid flooding the queue
+            if i % 5 == 0:
+                progress = i / total_frames_to_process
+                self.progress_out_queue.put({
+                    "status": "running",
+                    "progress": progress,
+                    "current_frame": frame_idx,
+                    "total_frames": num_frames
+                })
+
+        # Final progress update and cleanup
+        self.progress_out_queue.put({"status": "complete", "final_frame": num_frames - 1})
+        for cap in caps:
+            cap.release()
+        print("Batch track complete.")
 
 
 class RenderingWorker(threading.Thread):

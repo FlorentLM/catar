@@ -19,7 +19,7 @@ LK_PARAMS = dict(winSize=(9, 9),
                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01))
 NUM_DIST_COEFFS = 14
 
-
+LK_ERROR_THRESHOLD = 20.0
 
 def get_camera_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
     """Constructs the 3x3 camera intrinsic matrix."""
@@ -167,16 +167,18 @@ def track_points(app_state: 'AppState', prev_frames: List[np.ndarray], current_f
         p0_valid = p0[valid_indices].reshape(-1, 1, 2)
         p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, current_gray, p0_valid, None, **LK_PARAMS)
 
-        if p1 is not None and st.any():
-            good_new = p1[st == 1]
-            original_indices = np.where(valid_indices)[0][st.flatten() == 1]
+        if p1 is not None:  # Check if p1 exists before checking st
+            # Combine status check with an error threshold
+            successful_tracks = (st == 1) & (err.flatten() < LK_ERROR_THRESHOLD)
 
-            for i, original_idx in enumerate(original_indices):
-                # we don't overwrite a human annotation
-                if not human_annotated[frame_idx, cam_idx, original_idx]:
-                    new_annotations[frame_idx, cam_idx, original_idx] = good_new[i]
-                    # explicitly mark the new point as NOT human-annotated
-                    new_human_annotated[frame_idx, cam_idx, original_idx] = False
+            if successful_tracks.any():
+                good_new = p1[successful_tracks]
+                original_indices = np.where(valid_indices)[0][successful_tracks.flatten()]
+
+                for i, original_idx in enumerate(original_indices):
+                    if not human_annotated[frame_idx, cam_idx, original_idx]:
+                        new_annotations[frame_idx, cam_idx, original_idx] = good_new[i]
+                        new_human_annotated[frame_idx, cam_idx, original_idx] = False
 
     with app_state.lock:
         app_state.annotations[:] = new_annotations
