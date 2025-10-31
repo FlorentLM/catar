@@ -136,11 +136,10 @@ def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, i
 
 # Point Tracking (Optic flow)
 
-def track_points(app_state: 'AppState', prev_frames: List[np.ndarray], current_frames: List[np.ndarray]):
+def track_points(app_state: 'AppState', prev_frames: List[np.ndarray], current_frames: List[np.ndarray], frame_idx: int):
     """Tracks keypoints from previous to current frames using Lucas-Kanade algo."""
 
     with app_state.lock:
-        frame_idx = app_state.frame_idx
         focus_selected_point = app_state.focus_selected_point
         selected_point_idx = app_state.selected_point_idx
         annotations = app_state.annotations
@@ -148,6 +147,7 @@ def track_points(app_state: 'AppState', prev_frames: List[np.ndarray], current_f
 
     num_videos = len(current_frames)
     new_annotations = annotations.copy()
+    new_human_annotated = human_annotated.copy()    # mutable copy of the human_annotated array
 
     for cam_idx in range(num_videos):
         prev_gray = cv2.cvtColor(prev_frames[cam_idx], cv2.COLOR_BGR2GRAY)
@@ -172,11 +172,15 @@ def track_points(app_state: 'AppState', prev_frames: List[np.ndarray], current_f
             original_indices = np.where(valid_indices)[0][st.flatten() == 1]
 
             for i, original_idx in enumerate(original_indices):
+                # we don't overwrite a human annotation
                 if not human_annotated[frame_idx, cam_idx, original_idx]:
                     new_annotations[frame_idx, cam_idx, original_idx] = good_new[i]
+                    # explicitly mark the new point as NOT human-annotated
+                    new_human_annotated[frame_idx, cam_idx, original_idx] = False
 
     with app_state.lock:
         app_state.annotations[:] = new_annotations
+        app_state.human_annotated[:] = new_human_annotated
 
 # 3D reconstruction
 

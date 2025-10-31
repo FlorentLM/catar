@@ -151,7 +151,7 @@ class TrackingWorker(threading.Thread):
 
                 # core logic: only track if enabled and frames are sequential
                 if is_tracking_enabled and data["was_sequential"] and self.prev_frames:
-                    track_points(self.app_state, self.prev_frames, data["raw_frames"])
+                    track_points(self.app_state, self.prev_frames, data["raw_frames"], data["frame_idx"])
 
                 # Update state for next iteration
                 self.prev_frames = data["raw_frames"]

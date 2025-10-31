@@ -39,6 +39,7 @@ class AppState:
         self.keypoint_tracking_enabled: bool = False
         self.save_output_video: bool = False
         self.needs_3d_reconstruction: bool = True
+        self.drag_state: Dict[str, Any] = {}  # holds info about an ongoing drag operation
 
         # Core data
         num_frames = self.video_metadata['num_frames']

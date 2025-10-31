@@ -221,7 +221,7 @@ def _create_video_grid(app_state: AppState, scene_visualizer: SceneVisualizer, c
                                 dpg.add_draw_layer(tag=f"annotation_layer_{idx}")
 
                             with dpg.item_handler_registry(tag=f"image_handler_{idx}"):
-                                dpg.add_item_clicked_handler(callback=_image_click_callback,
+                                dpg.add_item_clicked_handler(callback=_image_mouse_down_callback,
                                                              user_data={"cam_idx": idx, "app_state": app_state})
                             dpg.bind_item_handler_registry(f"drawlist_{idx}", f"image_handler_{idx}")
 
@@ -355,9 +355,13 @@ def update_annotation_overlays(app_state: AppState):
                 color = point_colors[i].tolist()
 
                 if all_human_annotated[cam_idx, i]:
-                    dpg.draw_circle(center=(center_x, center_y), radius=7, color=(255, 255, 255), parent=layer_tag)
+                    dpg.draw_circle(center=(center_x, center_y), radius=9, color=(255, 255, 255), parent=layer_tag)
 
-                dpg.draw_circle(center=(center_x, center_y), radius=5, color=color, fill=color, parent=layer_tag)
+                # outer circle (not filled)
+                dpg.draw_circle(center=(center_x, center_y), radius=7, color=color, parent=layer_tag)
+                # tiny dot in the center
+                dpg.draw_circle(center=(center_x, center_y), radius=1, color=color, fill=color, parent=layer_tag)
+
                 dpg.draw_text(pos=(center_x + 8, center_y - 8), text=point_names[i], color=color, size=14,
                               parent=layer_tag)
 
@@ -399,8 +403,16 @@ def _register_event_handlers(app_state, command_queue, ga_command_queue, scene_v
     with dpg.handler_registry():
         dpg.add_key_press_handler(callback=_on_key_press, user_data={"app_state": app_state})
         dpg.add_mouse_wheel_handler(callback=scene_visualizer.dpg_on_mouse_wheel, user_data="3d_image")
+
+        # handlers to control the 3D camera
         dpg.add_mouse_drag_handler(callback=scene_visualizer.dpg_drag_move)
         dpg.add_mouse_release_handler(callback=scene_visualizer.dpg_drag_end)
+
+        # handlers for 2D annotation dragging
+        dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, callback=_image_drag_callback,
+                                   user_data={"app_state": app_state})
+        dpg.add_mouse_release_handler(button=dpg.mvMouseButton_Left, callback=_image_release_callback,
+                                      user_data={"app_state": app_state})
 
 
 # Callbacks
@@ -605,38 +617,105 @@ def _clear_future_annotations_callback(sender, app_data, user_data):
         print(f"Cleared future annotations for point {app_state.POINT_NAMES[p_idx]}.")
 
 
-def _image_click_callback(sender, app_data, user_data):
+def _image_mouse_down_callback(sender, app_data, user_data):
+    """Initiates a drag operation or creates a new point."""
+
     app_state = user_data["app_state"]
     cam_idx = user_data["cam_idx"]
     drawlist_tag = f"drawlist_{cam_idx}"
 
-    mouse_pos_abs = dpg.get_mouse_pos(local=False)
-
-    container_pos_abs = dpg.get_item_rect_min(drawlist_tag)
-    local_pos = (mouse_pos_abs[0] - container_pos_abs[0], mouse_pos_abs[1] - container_pos_abs[1])
-
-    with app_state.lock:
-        video_w, video_h = app_state.video_metadata['width'], app_state.video_metadata['height']
-        frame_idx, p_idx = app_state.frame_idx, app_state.selected_point_idx
-
-    container_size = dpg.get_item_rect_size(drawlist_tag)
-    if container_size[0] == 0: return
-    scaled_pos = (local_pos[0] * video_w / container_size[0], local_pos[1] * video_h / container_size[1])
-
     with app_state.lock:
         frame_idx = app_state.frame_idx
         p_idx = app_state.selected_point_idx
+        annotations = app_state.annotations[frame_idx, cam_idx, :, :]
+        video_w = app_state.video_metadata['width']
+        video_h = app_state.video_metadata['height']
 
-        if app_data[0] == 0:  # Left click to annotate
-            app_state.annotations[frame_idx, cam_idx, p_idx] = scaled_pos
-            app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
-            app_state.needs_3d_reconstruction = True # Always trigger a check
+    container_pos_abs = dpg.get_item_rect_min(drawlist_tag)
+    container_size = dpg.get_item_rect_size(drawlist_tag)
+    if container_size[0] == 0: return
 
-        elif app_data[0] == 1:  # Right click to remove
+    # Convert mouse position from screen space to image space
+    mouse_pos_abs = dpg.get_mouse_pos(local=False)
+    local_pos = (mouse_pos_abs[0] - container_pos_abs[0], mouse_pos_abs[1] - container_pos_abs[1])
+    scaled_pos = (local_pos[0] * video_w / container_size[0], local_pos[1] * video_h / container_size[1])
+
+    # Check if the click is near an existing point for the selected keypoint type
+    existing_point = annotations[p_idx]
+    drag_threshold = 15 # Pixel distance to start a drag
+    is_drag_start = False
+
+    if not np.isnan(existing_point).any():
+        # Convert existing point from image space to local widget space for distance check
+        existing_point_local = (
+            existing_point[0] * container_size[0] / video_w,
+            existing_point[1] * container_size[1] / video_h
+        )
+        dist = np.linalg.norm(np.array(local_pos) - np.array(existing_point_local))
+        if dist < drag_threshold:
+            is_drag_start = True
+
+    with app_state.lock:
+        if app_data[0] == 0:  # left mouse down
+            if is_drag_start:
+                # Start dragging the existing point
+                app_state.drag_state = {"cam_idx": cam_idx, "p_idx": p_idx, "active": True}
+            else:
+                # Create a new point immediately
+                app_state.annotations[frame_idx, cam_idx, p_idx] = scaled_pos
+                app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
+                app_state.needs_3d_reconstruction = True
+                # Start a drag so the user can fine-tune the new point's position
+                app_state.drag_state = {"cam_idx": cam_idx, "p_idx": p_idx, "active": True}
+
+        elif app_data[0] == 1:  # Right click to delete
             app_state.annotations[frame_idx, cam_idx, p_idx] = np.nan
             app_state.human_annotated[frame_idx, cam_idx, p_idx] = False
             app_state.needs_3d_reconstruction = True
 
+def _image_drag_callback(sender, app_data, user_data):
+    """Updates the position of the point being dragged."""
+
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        if not app_state.drag_state.get("active"):
+            return
+        cam_idx = app_state.drag_state["cam_idx"]
+        p_idx = app_state.drag_state["p_idx"]
+        frame_idx = app_state.frame_idx
+        video_w = app_state.video_metadata['width']
+        video_h = app_state.video_metadata['height']
+
+    drawlist_tag = f"drawlist_{cam_idx}"
+    container_pos_abs = dpg.get_item_rect_min(drawlist_tag)
+    container_size = dpg.get_item_rect_size(drawlist_tag)
+    if container_size[0] == 0: return
+
+    # Convert mouse position to scaled image coordinates
+    mouse_pos_abs = dpg.get_mouse_pos(local=False)
+    local_pos = (mouse_pos_abs[0] - container_pos_abs[0], mouse_pos_abs[1] - container_pos_abs[1])
+    scaled_pos = (local_pos[0] * video_w / container_size[0], local_pos[1] * video_h / container_size[1])
+
+    # Update annotation in real-time
+    with app_state.lock:
+        app_state.annotations[frame_idx, cam_idx, p_idx] = scaled_pos
+        app_state.needs_3d_reconstruction = True
+
+def _image_release_callback(sender, app_data, user_data):
+    """Finishes the drag operation and validates the point."""
+
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        if not app_state.drag_state.get("active"):
+            return
+        # The point is now considered human-annotated, even if it was originally a tracker point
+        frame_idx = app_state.frame_idx
+        cam_idx = app_state.drag_state["cam_idx"]
+        p_idx = app_state.drag_state["p_idx"]
+        app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
+        app_state.needs_3d_reconstruction = True
+        # Clear the drag state
+        app_state.drag_state = {}
 
 def _save_state_callback(sender, app_data, user_data):
     from main import DATA_FOLDER
