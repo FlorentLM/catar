@@ -288,7 +288,7 @@ def main():
 
     # Run main loop
     try:
-        main_loop(app_state, queues)
+        main_loop(app_state, queues, scene_viz)
     finally:
         # Shutdown
         print("Shutting down...")
