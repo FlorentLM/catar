@@ -12,18 +12,18 @@ from typing import List
 import config
 from core import track_points, update_3d_reconstruction, create_camera_visual, run_genetic_step
 from state import AppState
-from old.viz_3d import SceneVisualizer, SceneObject
+from viz_3d import SceneVisualizer, SceneObject
 
 
 class VideoReaderWorker(threading.Thread):
     """Reads video frames and distributes them to processing workers."""
 
     def __init__(
-            self,
-            app_state: AppState,
-            video_paths: List[str],
-            command_queue: queue.Queue,
-            output_queues: List[queue.Queue],
+        self,
+        app_state: AppState,
+        video_paths: List[str],
+        command_queue: queue.Queue,
+        output_queues: List[queue.Queue],
     ):
         super().__init__(daemon=True, name="VideoReaderWorker")
         self.app_state = app_state
@@ -137,6 +137,7 @@ class VideoReaderWorker(threading.Thread):
             q.put(frame_data)
 
     def _cleanup(self):
+        """Release all video captures."""
         for cap in self.video_captures:
             cap.release()
         print("Video reader worker shut down.")
@@ -146,12 +147,12 @@ class TrackingWorker(threading.Thread):
     """Point tracking using optic flow."""
 
     def __init__(
-            self,
-            app_state: AppState,
-            frames_in_queue: queue.Queue,
-            progress_out_queue: queue.Queue,
-            video_paths: List[str],
-            command_queue: queue.Queue
+        self,
+        app_state: AppState,
+        frames_in_queue: queue.Queue,
+        progress_out_queue: queue.Queue,
+        video_paths: List[str],
+        command_queue: queue.Queue
     ):
         super().__init__(daemon=True, name="TrackingWorker")
         self.app_state = app_state
@@ -274,6 +275,7 @@ class TrackingWorker(threading.Thread):
         return frames
 
     def _cleanup_captures(self, caps: List[cv2.VideoCapture]):
+        """Release video captures."""
         for cap in caps:
             cap.release()
 
@@ -282,11 +284,11 @@ class RenderingWorker(threading.Thread):
     """Handles rendering of 2D overlays and 3D visualisation."""
 
     def __init__(
-            self,
-            app_state: AppState,
-            scene_visualizer: SceneVisualizer,
-            frames_in_queue: queue.Queue,
-            results_out_queue: queue.Queue,
+        self,
+        app_state: AppState,
+        scene_visualizer: SceneVisualizer,
+        frames_in_queue: queue.Queue,
+        results_out_queue: queue.Queue,
     ):
         super().__init__(daemon=True, name="RenderingWorker")
         self.app_state = app_state
@@ -323,31 +325,31 @@ class RenderingWorker(threading.Thread):
         with self.app_state.lock:
             needs_reconstruction = self.app_state.needs_3d_reconstruction
             best_individual = self.app_state.best_individual
+            frame_idx = self.app_state.frame_idx
 
-        if needs_reconstruction and best_individual:
-            update_3d_reconstruction(self.app_state)
-            with self.app_state.lock:
-                self.app_state.needs_3d_reconstruction = False
+        if needs_reconstruction:
+            print(f"Rendering worker: Triggering 3D reconstruction for frame {frame_idx}")
+            if best_individual:
+                update_3d_reconstruction(self.app_state)
+                with self.app_state.lock:
+                    self.app_state.needs_3d_reconstruction = False
+            else:
+                print("Rendering worker: No calibration available, skipping reconstruction")
 
         # Prepare and render 3D scene
         scene = self._build_3d_scene()
-        rendered_3d = self.scene_visualizer.draw_scene(scene)
+        self.scene_visualizer.draw_scene(scene)
 
         # Resize all frames to display size
         video_frames = [
             cv2.resize(frame, (config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT))
             for frame in data["raw_frames"]
         ]
-        rendered_3d_resized = cv2.resize(
-            rendered_3d,
-            (config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT)
-        )
 
         # Send to GUI
         self._send_results({
             'frame_idx': data['frame_idx'],
             'video_frames_bgr': video_frames,
-            '3d_frame_bgr': rendered_3d_resized,
         })
 
     def _build_3d_scene(self) -> List[SceneObject]:
@@ -368,15 +370,24 @@ class RenderingWorker(threading.Thread):
             point_colors = self.app_state.point_colors
             skeleton = self.app_state.skeleton
 
+        # Debug: count valid points
+        valid_points = 0
+
         # Draw points
         for i, point in enumerate(points_3d):
             if not np.isnan(point).any():
+                valid_points += 1
+                color = tuple(point_colors[i])
                 scene.append(SceneObject(
                     type='point',
                     coords=point,
-                    color=point_colors[i],
+                    color=color,
                     label=point_names[i]
                 ))
+
+                # Debug: print 1st point
+                if valid_points == 1:
+                    print(f"Adding point '{point_names[i]}' at {point} with color {color}")
 
                 # Draw skeleton connections
                 for connected_name in skeleton.get(point_names[i], []):
@@ -391,6 +402,10 @@ class RenderingWorker(threading.Thread):
                             ))
                     except ValueError:
                         pass
+
+        # Debug: Print scene info sometimes
+        if self.app_state.frame_idx % 30 == 0:  # every 30 frames
+            print(f"3D Scene: {len(scene)} objects, {valid_points} valid keypoints")
 
         return scene
 

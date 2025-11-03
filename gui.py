@@ -6,7 +6,7 @@ import numpy as np
 
 import config
 from state import AppState, Queues
-from old.viz_3d import SceneVisualizer
+from viz_3d import SceneVisualizer
 from core import reproject_points
 
 
@@ -42,7 +42,7 @@ def create_ui(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
     # Setup
     _create_textures(app_state.video_metadata)
     _create_themes()
-    _register_handlers(app_state, queues, scene_viz)
+    _register_handlers(app_state, queues)
 
     # Main window layout
     with dpg.window(label="Main Window", tag="main_window"):
@@ -96,19 +96,6 @@ def _create_textures(video_meta: dict):
                 tag=f"video_texture_{i}",
                 format=dpg.mvFormat_Float_rgba
             )
-
-        # 3D view texture
-        black_3d = np.zeros(
-            (config.DISPLAY_HEIGHT, config.DISPLAY_WIDTH, 4),
-            dtype=np.float32
-        )
-        dpg.add_raw_texture(
-            width=config.DISPLAY_WIDTH,
-            height=config.DISPLAY_HEIGHT,
-            default_value=black_3d.ravel().tolist(),
-            tag="3d_texture",
-            format=dpg.mvFormat_Float_rgba
-        )
 
 
 def _create_themes():
@@ -353,19 +340,17 @@ def _create_video_cell(cam_idx: int, app_state: AppState):
 
 def _create_3d_view_cell(scene_viz: SceneVisualizer):
     """Create 3D visualisation cell."""
+    # TODO: Get rid of this cell probably
 
     with dpg.table_cell():
         dpg.add_text("3D Projection")
-        dpg.add_image(
-            "3d_texture",
-            tag="3d_image",
-            width=config.DISPLAY_WIDTH,
-            height=config.DISPLAY_HEIGHT
+        dpg.add_text("")
+        dpg.add_text("3D view opens in a separate window", color=(255, 255, 0))
+        dpg.add_text("")
+        dpg.add_button(
+            label="Refresh 3D View",
+            callback=lambda: scene_viz.reset_view()
         )
-
-        with dpg.item_handler_registry(tag="3d_image_handler"):
-            dpg.add_item_clicked_handler(callback=scene_viz.dpg_drag_start)
-        dpg.bind_item_handler_registry("3d_image", "3d_image_handler")
 
 
 def _create_ga_popup(app_state: AppState, queues: Queues):
@@ -421,21 +406,13 @@ def _create_batch_track_popup(app_state: AppState):
 # Event Handlers
 # ============================================================================
 
-def _register_handlers(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
+def _register_handlers(app_state: AppState, queues: Queues):
     """Register event handlers (global)."""
 
     user_data = {"app_state": app_state, "queues": queues}
 
     with dpg.handler_registry():
         dpg.add_key_press_handler(callback=_on_key_press, user_data=user_data)
-        dpg.add_mouse_wheel_handler(
-            callback=scene_viz.dpg_on_mouse_wheel,
-            user_data="3d_image"
-        )
-
-        # 3D control
-        dpg.add_mouse_drag_handler(callback=scene_viz.dpg_drag_move)
-        dpg.add_mouse_release_handler(callback=scene_viz.dpg_drag_end)
 
         # 2D annotations
         dpg.add_mouse_drag_handler(
@@ -644,11 +621,13 @@ def _image_mouse_down_callback(sender, app_data, user_data):
                     "p_idx": p_idx,
                     "active": True
                 }
+                print(f"Started dragging point {app_state.point_names[p_idx]} in camera {cam_idx}")
             else:
                 # Create new point
                 app_state.annotations[frame_idx, cam_idx, p_idx] = scaled_pos
                 app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
                 app_state.needs_3d_reconstruction = True
+                print(f"Created new annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}, pos {scaled_pos}")
                 # Allow dragging immediately
                 app_state.drag_state = {
                     "cam_idx": cam_idx,
@@ -660,6 +639,7 @@ def _image_mouse_down_callback(sender, app_data, user_data):
             app_state.annotations[frame_idx, cam_idx, p_idx] = np.nan
             app_state.human_annotated[frame_idx, cam_idx, p_idx] = False
             app_state.needs_3d_reconstruction = True
+            print(f"Deleted annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}")
 
 
 def _image_drag_callback(sender, app_data, user_data):
@@ -877,9 +857,6 @@ def resize_video_widgets(sender, app_data, user_data):
     for i in range(app_state.video_metadata['num_videos']):
         dpg.configure_item(f"drawlist_{i}", width=item_width, height=item_height)
         dpg.configure_item(f"video_image_{i}", pmax=(item_width, item_height))
-
-    # Resize 3D view
-    dpg.configure_item("3d_image", width=item_width, height=item_height)
 
 
 def update_ui(app_state: AppState):

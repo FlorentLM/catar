@@ -7,13 +7,12 @@ import numpy as np
 import itertools
 from typing import List, Dict, Any, Tuple
 
-from old.viz_3d import SceneObject
+from viz_3d import SceneObject
 import config
 
 from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:
-    pass
+    from state import AppState
 
 
 # ============================================================================
@@ -34,14 +33,23 @@ def get_camera_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
 def get_projection_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
     """3x4 projection matrix from parameters."""
     K = get_camera_matrix(cam_params)
-    R, _ = cv2.Rodrigues(cam_params['rvec'])
-    t = cam_params['tvec'].reshape(-1, 1)
-    return K @ np.hstack((R, t))
+
+    # rvec and tvec are camera-to-world but we need world-to-camera for projection
+    R_c2w, _ = cv2.Rodrigues(cam_params['rvec'])
+    t_c2w = cam_params['tvec'].flatten()
+
+    # Invert to get world-to-camera
+    R_w2c = R_c2w.T
+    t_w2c = -R_c2w.T @ t_c2w
+
+    return K @ np.hstack((R_w2c, t_w2c.reshape(-1, 1)))
 
 
 def reproject_points(points_3d: np.ndarray, cam_params: Dict[str, Any]) -> np.ndarray:
-    """Reproject 3D points to 2D."""
-
+    """
+    Reproject 3D points to 2D.
+    (Assumes rvec and tvec in cam_params are camera-to-world)
+    """
     if points_3d.size == 0:
         return np.array([])
 
@@ -50,10 +58,19 @@ def reproject_points(points_3d: np.ndarray, cam_params: Dict[str, Any]) -> np.nd
     elif points_3d.ndim == 2:
         points_3d = points_3d[:, np.newaxis, :]
 
+    # rvec and tvec are camera-to-world but cv2.projectPoints needs world-to-camera
+    R_c2w, _ = cv2.Rodrigues(cam_params['rvec'])
+    t_c2w = cam_params['tvec'].flatten()
+
+    # Invert to get world-to-camera
+    R_w2c = R_c2w.T
+    t_w2c = -R_c2w.T @ t_c2w
+    rvec_w2c, _ = cv2.Rodrigues(R_w2c)
+
     reprojected, _ = cv2.projectPoints(
         points_3d,
-        cam_params['rvec'],
-        cam_params['tvec'],
+        rvec_w2c,
+        t_w2c,
         get_camera_matrix(cam_params),
         cam_params['dist']
     )
@@ -105,6 +122,7 @@ def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, i
         R_i, t_i = Rs_c2w[i], ts_c2w[i]
         R_j, t_j = Rs_c2w[j], ts_c2w[j]
 
+        # Relative transformation camera i to camera j
         R_rel = R_j.T @ R_i
         t_rel = R_j.T @ (t_i - t_j)
 
@@ -134,10 +152,10 @@ def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, i
 # ============================================================================
 
 def track_points(
-        app_state: 'AppState',
-        prev_frames: List[np.ndarray],
-        current_frames: List[np.ndarray],
-        frame_idx: int
+    app_state: 'AppState',
+    prev_frames: List[np.ndarray],
+    current_frames: List[np.ndarray],
+    frame_idx: int
 ):
     """Track keypoints using Lucas-Kanade algo."""
 
@@ -198,8 +216,8 @@ def track_points(
 # TODO: Also replaced by mokap implementation
 
 def triangulate_points(
-        frame_annotations: np.ndarray,
-        proj_matrices: np.ndarray
+    frame_annotations: np.ndarray,
+    proj_matrices: np.ndarray
 ) -> np.ndarray:
     """Triangulate 3D points from 2D correspondences using all camera pairs."""
 
@@ -256,21 +274,30 @@ def create_camera_visual(cam_params: Dict[str, Any], label: str) -> List[SceneOb
 
     rvec, tvec = cam_params['rvec'], cam_params['tvec']
     R_w2c, _ = cv2.Rodrigues(rvec)
-    R_c2w = R_w2c.T
-    t_c2w = -R_w2c.T @ tvec.flatten()
 
-    # Frustum pyramid in camera coords
-    scale = 1.0
-    w, h, depth = 0.5 * scale, 0.4 * scale, 0.8 * scale
-    pyramid_cam = np.array([
-        [0, 0, 0],
-        [-w, -h, depth], [w, -h, depth],
-        [w, h, depth], [-w, h, depth]
+    # Camera center in world coordinates
+    t_c2w = -R_w2c.T @ tvec.flatten()
+    R_c2w = R_w2c.T
+
+
+    # cameras are about 100 units away so make frustums about 20 units in size
+    # TODO: This should be automatic
+
+    scale = 20.0
+    w, h, depth = 0.3 * scale, 0.2 * scale, 0.5 * scale
+
+    # Frustum pyramid in camera coordinates (camera looks down +Z axis)
+    pyramid_pts_cam = np.array([
+        [0, 0, 0],           # Camera center (pyramid apex)
+        [-w, -h, depth],     # Bottom left of image plane
+        [w, -h, depth],      # Bottom right
+        [w, h, depth],       # Top right
+        [-w, h, depth]       # Top left
     ])
 
     # Transform to world coords
-    pyramid_world = (R_c2w @ pyramid_cam.T).T + t_c2w
-    apex, bl, br, tr, tl = pyramid_world
+    pyramid_pts_world = (R_c2w @ pyramid_pts_cam.T).T + t_c2w
+    apex, bl, br, tr, tl = pyramid_pts_world
 
     color = (255, 255, 0)
     objects = [SceneObject(type='point', coords=apex, color=color, label=label)]
@@ -343,10 +370,10 @@ def create_individual(video_metadata: Dict) -> List[Dict]:
 
 
 def compute_fitness(
-        individual: List[Dict],
-        annotations: np.ndarray,
-        calibration_frames: List[int],
-        video_metadata: Dict
+    individual: List[Dict],
+    annotations: np.ndarray,
+    calibration_frames: List[int],
+    video_metadata: Dict
 ) -> float:
     """Compute reprojection error fitness for a calibration."""
 

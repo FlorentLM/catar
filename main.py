@@ -13,9 +13,10 @@ import dearpygui.dearpygui as dpg
 
 import config
 from state import AppState, Queues
-from gui import create_ui, update_ui
+from core import create_camera_visual, update_3d_reconstruction
+from gui import create_ui, update_ui, resize_video_widgets
 from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker
-from old.viz_3d import SceneVisualizer
+from viz_3d import SceneVisualizer, SceneObject
 
 
 def load_and_match_videos(data_folder: Path, video_format: str):
@@ -104,7 +105,63 @@ def get_video_metadata(video_path: str) -> dict:
     return metadata
 
 
-def main_loop(app_state: AppState, queues: Queues):
+def _build_scene_for_frame(app_state: AppState):
+    """Build 3D scene for current frame."""
+
+    scene = []
+
+    with app_state.lock:
+        # Add camera visualisations
+        if app_state.show_cameras_in_3d and app_state.best_individual:
+            for i, cam_params in enumerate(app_state.best_individual):
+                scene.extend(
+                    create_camera_visual(cam_params, app_state.video_names[i])
+                )
+
+        # Add reconstructed points and skeleton
+        points_3d = app_state.reconstructed_3d_points[app_state.frame_idx]
+        point_names = app_state.point_names
+        point_colors = app_state.point_colors
+        skeleton = app_state.skeleton
+
+    # Draw points
+    valid_points = 0
+    for i, point in enumerate(points_3d):
+        if not np.isnan(point).any():
+            valid_points += 1
+            color = tuple(point_colors[i])
+            scene.append(SceneObject(
+                type='point',
+                coords=point,
+                color=color,
+                label=point_names[i]
+            ))
+
+            # Debug first point
+            if valid_points == 1:
+                print(f"Adding point '{point_names[i]}' at {point} with color {color}")
+
+            # Draw skeleton
+            for connected_name in skeleton.get(point_names[i], []):
+                try:
+                    j = point_names.index(connected_name)
+                    if not np.isnan(points_3d[j]).any():
+                        scene.append(SceneObject(
+                            type='line',
+                            coords=np.array([point, points_3d[j]]),
+                            color=(128, 128, 128),
+                            label=None
+                        ))
+                except ValueError:
+                    pass
+
+    if valid_points > 0:
+        print(f"3D Scene: {len(scene)} objects, {valid_points} valid keypoints")
+
+    return scene
+
+
+def main_loop(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
     """Main GUI update loop."""
 
     initial_resize_counter = 5
@@ -113,9 +170,27 @@ def main_loop(app_state: AppState, queues: Queues):
 
         # initial resize
         if initial_resize_counter > 0:
-            from gui import resize_video_widgets
             resize_video_widgets(None, None, {"app_state": app_state})
             initial_resize_counter -= 1
+
+        # Check if 3D reconstruction is needed (like after a new annotation while paused)
+        with app_state.lock:
+            needs_reconstruction = app_state.needs_3d_reconstruction
+            best_individual = app_state.best_individual
+
+        if needs_reconstruction and best_individual:
+            update_3d_reconstruction(app_state)
+            with app_state.lock:
+                app_state.needs_3d_reconstruction = False
+
+            # Build and update 3D scene
+            scene = _build_scene_for_frame(app_state)
+            scene_viz.draw_scene(scene)
+
+        # 3D visualisation updates (must be done from main thread)
+        if not scene_viz.process_3d_updates():
+            # 3D window was closed, try refresh on next update
+            pass
 
         # Process rendered frames from rendering worker
         try:
@@ -125,11 +200,6 @@ def main_loop(app_state: AppState, queues: Queues):
             for i, frame_bgr in enumerate(processed['video_frames_bgr']):
                 rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
                 dpg.set_value(f"video_texture_{i}", rgba.ravel())
-
-            # Update 3D visualisation texture
-            rgba_3d = cv2.cvtColor(processed['3d_frame_bgr'], cv2.COLOR_BGR2RGBA)
-            rgba_3d = rgba_3d.astype(np.float32) / 255.0
-            dpg.set_value("3d_texture", rgba_3d.ravel())
 
         except Exception:
             pass
@@ -209,9 +279,11 @@ def main():
         GAWorker(queues.ga_command, queues.ga_progress)
     ]
 
+    # Start all workers
     for worker in workers:
         worker.start()
 
+    # Create UI
     create_ui(app_state, queues, scene_viz)
 
     # Run main loop
