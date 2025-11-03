@@ -166,8 +166,8 @@ def track_points(
         human_annotated = app_state.human_annotated
 
     num_videos = len(current_frames)
-    new_annotations = annotations.copy()
-    new_human_annotated = human_annotated.copy()
+    new_annotations = annotations
+    new_human_annotated = human_annotated
 
     for cam_idx in range(num_videos):
         prev_gray = cv2.cvtColor(prev_frames[cam_idx], cv2.COLOR_BGR2GRAY)
@@ -191,22 +191,19 @@ def track_points(
         )
 
         if p1 is not None:
-            # Filter by status and error threshold
             good_tracks = (status == 1) & (error.flatten() < config.LK_ERROR_THRESHOLD)
 
             if good_tracks.any():
                 tracked_points = p1[good_tracks]
                 original_indices = np.where(valid_mask)[0][good_tracks.flatten()]
 
-                for i, orig_idx in enumerate(original_indices):
-                    # Don't overwrite human annotations
-                    if not human_annotated[frame_idx, cam_idx, orig_idx]:
-                        new_annotations[frame_idx, cam_idx, orig_idx] = tracked_points[i]
-                        new_human_annotated[frame_idx, cam_idx, orig_idx] = False
-
-    with app_state.lock:
-        app_state.annotations[:] = new_annotations
-        app_state.human_annotated[:] = new_human_annotated
+                with app_state.lock:
+                    for i, orig_idx in enumerate(original_indices):
+                        # Don't overwrite human annotations
+                        if not human_annotated[frame_idx, cam_idx, orig_idx]:
+                            annotations[frame_idx, cam_idx, orig_idx] = tracked_points[i]
+                            # Human annotated status for this point remains False
+                            human_annotated[frame_idx, cam_idx, orig_idx] = False
 
 
 # ============================================================================
