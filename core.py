@@ -147,19 +147,84 @@ def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, i
 
 
 # ============================================================================
+# 3D reconstruction & confidence
+# ============================================================================
+
+def triangulate_points(frame_annotations: np.ndarray, proj_matrices: List[np.ndarray]) -> np.ndarray:
+    """Triangulate 3D points from 2D correspondences."""
+    # TODO: Also use mokap's implementation
+
+    num_cams, num_points, _ = frame_annotations.shape
+    if num_cams < 2:
+        return np.full((num_points, 3), np.nan, dtype=np.float32)
+
+    camera_pairs = list(itertools.combinations(range(num_cams), 2))
+    votes = np.full((len(camera_pairs), num_points, 3), np.nan, dtype=np.float32)
+
+    for i, (cam1, cam2) in enumerate(camera_pairs):
+        p1 = frame_annotations[cam1]
+        p2 = frame_annotations[cam2]
+        valid = ~np.isnan(p1).any(axis=1) & ~np.isnan(p2).any(axis=1)
+
+        if not np.any(valid):
+            continue
+
+        points_4d = cv2.triangulatePoints(
+            proj_matrices[cam1], proj_matrices[cam2], p1[valid].T, p2[valid].T
+        )
+        points_3d = (points_4d[:3] / (points_4d[3] + 1e-6)).T
+        votes[i, valid] = points_3d
+    return np.nanmean(votes, axis=0)
+
+
+def calculate_reproj_confidence(app_state: 'AppState', frame_idx: int, point_idx: int) -> np.ndarray:
+    """
+    Calculates reprojection error for a point in a frame using leave-one-out approach.
+    """
+
+    with app_state.lock:
+        annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
+        calibration = app_state.best_individual
+
+    num_cams = len(calibration)
+    errors = np.full(num_cams, np.nan, dtype=np.float32)
+
+    if calibration is None:
+        return errors
+
+    valid_cam_indices = np.where(~np.isnan(annotations_for_point).any(axis=1))[0]
+
+    if len(valid_cam_indices) < 3:  # Need at least 2 other views to triangulate
+        return errors
+
+    for cam_to_test in valid_cam_indices:
+        peer_indices = [i for i in valid_cam_indices if i != cam_to_test]
+
+        peer_annots = annotations_for_point[peer_indices].reshape(len(peer_indices), 1, 2)
+        peer_proj_mats = [get_projection_matrix(calibration[i]) for i in peer_indices]
+
+        point_3d = triangulate_points(peer_annots, peer_proj_mats).flatten()
+
+        if not np.isnan(point_3d).any():
+            reprojected = reproject_points(point_3d, calibration[cam_to_test])
+            if reprojected.size > 0:
+                original_annot = annotations_for_point[cam_to_test]
+                errors[cam_to_test] = np.linalg.norm(reprojected.flatten() - original_annot)
+
+    return errors
+
+
+# ============================================================================
 # Optic flow tracking
 # ============================================================================
 
 def track_points(
-    app_state: 'AppState',
-    prev_frames: List[np.ndarray],
-    current_frames: List[np.ndarray],
-    frame_idx: int
+        app_state: 'AppState',
+        prev_frames: List[np.ndarray],
+        current_frames: List[np.ndarray],
+        frame_idx: int
 ):
-    """
-    Track keypoints using 3D-Guided LK with Forward-Backward confidence check.
-    """
-
+    """Tracks points using 3D guidance and Forward-Backward check, with reprojection confidence."""
     with app_state.lock:
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
@@ -191,25 +256,22 @@ def track_points(
 
         point_indices_to_track = np.where(track_mask)[0]
 
-        # Generate geometric predictions (Candidate A) for all trackable points
+        # Calculate reprojection errors from the previous frame to gauge reliability
+        prev_frame_reproj_errors = {
+            p_idx: calculate_reproj_confidence(app_state, frame_idx - 1, p_idx)
+            for p_idx in point_indices_to_track
+        }
+
         geometric_predictions = np.full((app_state.num_points, 2), np.nan, dtype=np.float32)
         for p_idx in point_indices_to_track:
-            point_3d = prev_points_3d[p_idx]
-            if not np.isnan(point_3d).any():
-                reprojected = reproject_points(point_3d, calibration[cam_idx])
+            if not np.isnan(prev_points_3d[p_idx]).any():
+                reprojected = reproject_points(prev_points_3d[p_idx], calibration[cam_idx])
                 if reprojected.size > 0:
                     geometric_predictions[p_idx] = reprojected.flatten()
 
-        # The starting points for LK search are the geometric predictions if available,
-        # otherwise the previous frame's 2D point
-        start_points_for_lk = np.where(
-            ~np.isnan(geometric_predictions),
-            geometric_predictions,
-            p0_2d_prev
-        )[track_mask].reshape(-1, 1, 2)
-        
-        if start_points_for_lk.size == 0:
-            continue
+        start_points_for_lk = np.where(~np.isnan(geometric_predictions), geometric_predictions, p0_2d_prev)[
+            track_mask].reshape(-1, 1, 2)
+        if start_points_for_lk.size == 0: continue
 
         # Forward pass (prev -> curr)
         p1_forward, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
@@ -229,28 +291,25 @@ def track_points(
                 # Get the two candidates
                 geometric_prediction = geometric_predictions[p_idx] # Candidate A
                 lk_result = p1_forward[i].flatten()                # Candidate B
+                fb_error = np.linalg.norm(start_points_for_lk[i].flatten() - p0_backward[i].flatten())
 
-                # Calculate forward-backward error
-                original_start_point = start_points_for_lk[i].flatten()
-                backward_end_point = p0_backward[i].flatten()
-                fb_error = np.linalg.norm(original_start_point - backward_end_point)
+                is_lk_successful = status_fwd[i] == 1 and status_bwd[i] == 1 and fb_error < config.FORWARD_BACKWARD_THRESHOLD
 
-                # Evaluate confidence
-                is_lk_successful = (status_fwd[i] == 1 and status_bwd[i] == 1)
-                is_fb_consistent = (fb_error < config.FORWARD_BACKWARD_THRESHOLD)
-                
-                final_point = None
-                if is_lk_successful and is_fb_consistent:
-                    # High confidence: Trust the visual evidence
+                # Check confidence of the geometric prediction using leave-one-out error
+                reproj_error = prev_frame_reproj_errors[p_idx][cam_idx]
+                is_reprojection_reliable = not np.isnan(
+                    reproj_error) and reproj_error < config.REPROJ_CONFIDENCE_THRESHOLD
+
+                final_point = np.full(2, np.nan)
+                if is_lk_successful:
                     final_point = lk_result
-                elif config.TRUST_REPROJECTION_ON_FAILURE and not np.isnan(geometric_prediction).any():
-                    # Low confidence or failure: Fall back to the geometric prediction
+                elif is_reprojection_reliable and not np.isnan(geometric_prediction).any():
                     final_point = geometric_prediction
-                
-                # Update state if a valid point was chosen
-                if final_point is not None:
-                    annotations[frame_idx, cam_idx, p_idx] = final_point
+
+                annotations[frame_idx, cam_idx, p_idx] = final_point
+                if not np.isnan(final_point).any():
                     human_annotated[frame_idx, cam_idx, p_idx] = False
+
 
 # ============================================================================
 # 3D Reconstruction
