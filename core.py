@@ -5,7 +5,7 @@ import random
 import cv2
 import numpy as np
 import itertools
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 from viz_3d import SceneObject
 import config
@@ -240,6 +240,66 @@ def triangulate_points(
         votes[i, valid] = points_3d
 
     return np.nanmean(votes, axis=0)
+
+
+def refine_annotation(
+    app_state: 'AppState',
+    target_cam_idx: int,
+    point_idx: int,
+    frame_idx: int
+) -> Optional[np.ndarray]:
+    """
+    Refines a 2D annotation by triangulating from other views and reprojecting.
+    This snaps a new user click to a more accurate position based on other existing annotations.
+
+    Returns:
+        A (2,) array with the refined 2D coordinates, or None if refinement is not possible.
+    """
+
+    with app_state.lock:
+        annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
+        best_individual = app_state.best_individual
+
+    if best_individual is None:
+        return None
+
+    # Which cameras have a valid annotation for this point (excluding target camera ofc)?
+    num_cams = annotations_for_point.shape[0]
+    valid_cam_indices = []
+    valid_annotations_2d = []
+
+    for i in range(num_cams):
+        if i == target_cam_idx:
+            continue
+        if not np.isnan(annotations_for_point[i]).any():
+            valid_cam_indices.append(i)
+            valid_annotations_2d.append(annotations_for_point[i])
+
+    # We need at least two other views to triangulate
+    if len(valid_cam_indices) < 2:
+        return None
+
+    valid_annotations_2d = np.array(valid_annotations_2d)
+    proj_matrices = np.array([get_projection_matrix(best_individual[i]) for i in valid_cam_indices])
+
+    # triangulate_points expects (num_cams, num_points, 2)
+    point_to_triangulate = valid_annotations_2d.reshape(len(valid_cam_indices), 1, 2)
+    # and returns (num_points, 3), so we get (1, 3)
+    point_3d_single = triangulate_points(point_to_triangulate, proj_matrices)
+
+    if np.isnan(point_3d_single).any():
+        return None
+
+    point_3d = point_3d_single.flatten()  # (3,)
+
+    # Reproject the point back into the target camera's view
+    target_cam_params = best_individual[target_cam_idx]
+    reprojected_point_2d = reproject_points(point_3d, target_cam_params)
+
+    if reprojected_point_2d.size == 0:
+        return None
+
+    return reprojected_point_2d.flatten()  # (2,)
 
 
 def update_3d_reconstruction(app_state: 'AppState'):

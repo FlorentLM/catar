@@ -7,7 +7,7 @@ import numpy as np
 import config
 from state import AppState, Queues
 from viz_3d import SceneVisualizer
-from core import reproject_points
+from core import reproject_points, refine_annotation
 
 
 # ============================================================================
@@ -623,11 +623,28 @@ def _image_mouse_down_callback(sender, app_data, user_data):
                 }
                 print(f"Started dragging point {app_state.point_names[p_idx]} in camera {cam_idx}")
             else:
+                # Reprojection-assisted annotation
+
+                # Attempt to refine the click using other views before creating the point
+                refined_pos = refine_annotation(
+                    app_state,
+                    cam_idx,
+                    p_idx,
+                    frame_idx
+                )
+
+                # Use the refined position if available, otherwise use the user's click
+                final_pos = refined_pos if refined_pos is not None else scaled_pos
+
+                if refined_pos is not None:
+                    print(f"Snapped new annotation for '{app_state.point_names[p_idx]}' using reprojection.")
+
                 # Create new point
-                app_state.annotations[frame_idx, cam_idx, p_idx] = scaled_pos
+                app_state.annotations[frame_idx, cam_idx, p_idx] = final_pos
+
                 app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
                 app_state.needs_3d_reconstruction = True
-                print(f"Created new annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}, pos {scaled_pos}")
+                print(f"Created new annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}, pos {final_pos}")
                 # Allow dragging immediately
                 app_state.drag_state = {
                     "cam_idx": cam_idx,

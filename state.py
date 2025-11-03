@@ -46,7 +46,8 @@ class AppState:
     """Thread-safe container for application state."""
 
     def __init__(self, video_metadata: Dict[str, Any], skeleton_config: Dict[str, Any]):
-        self.lock = threading.Lock()
+
+        self.lock = threading.RLock()
 
         # Video metadata (read-only after init)
         self.video_metadata = video_metadata
