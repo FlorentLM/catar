@@ -214,6 +214,91 @@ def calculate_reproj_confidence(app_state: 'AppState', frame_idx: int, point_idx
     return errors
 
 
+def refine_annotation(
+    app_state: 'AppState',
+    target_cam_idx: int,
+    point_idx: int,
+    frame_idx: int
+) -> Optional[np.ndarray]:
+    """
+    Refines a 2D annotation by triangulating from other views and reprojecting.
+
+    This is used to "snap" a new user click to a more accurate position based
+    on the consensus of other existing annotations for the same point.
+
+    Returns:
+        A (2,) numpy array with the refined 2D coordinates, or None if
+        refinement is not possible (e.g., fewer than 2 other views).
+    """
+    with app_state.lock:
+        # Get all annotations for the specific point in the specific frame
+        annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
+        best_individual = app_state.best_individual
+
+    if best_individual is None:
+        return None
+
+    # Identify which cameras have a valid annotation for this point, excluding the target camera
+    num_cams = annotations_for_point.shape[0]
+    valid_cam_indices = []
+    valid_annotations_2d = []
+
+    for i in range(num_cams):
+        if i == target_cam_idx:
+            continue
+        if not np.isnan(annotations_for_point[i]).any():
+            valid_cam_indices.append(i)
+            valid_annotations_2d.append(annotations_for_point[i])
+
+    # We need at least two other views to triangulate reliably
+    if len(valid_cam_indices) < 2:
+        return None
+
+    valid_annotations_2d = np.array(valid_annotations_2d)
+
+    # Get projection matrices for the valid cameras only
+    proj_matrices = np.array([get_projection_matrix(best_individual[i]) for i in valid_cam_indices])
+
+    # The triangulate_points function expects input shape (num_cams, num_points, 2).
+    # Here, we have one point, so we reshape.
+    point_to_triangulate = valid_annotations_2d.reshape(len(valid_cam_indices), 1, 2)
+
+    # The function returns shape (num_points, 3), so we'll get (1, 3)
+    point_3d_single = triangulate_points(point_to_triangulate, proj_matrices)
+
+    if np.isnan(point_3d_single).any():
+        return None
+
+    point_3d = point_3d_single.flatten()  # Shape becomes (3,)
+
+    # Reproject the 3D point back onto the target camera's view
+    target_cam_params = best_individual[target_cam_idx]
+    reprojected_point_2d = reproject_points(point_3d, target_cam_params)
+
+    if reprojected_point_2d.size == 0:
+        return None
+
+    return reprojected_point_2d.flatten()  # Shape becomes (2,)
+
+
+def update_3d_reconstruction(app_state: 'AppState'):
+    """Reconstruct 3D points for the current frame."""
+
+    with app_state.lock:
+        frame_idx = app_state.frame_idx
+        annotations = app_state.annotations[frame_idx]
+        best_individual = app_state.best_individual
+
+        if best_individual is None:
+            return
+
+    proj_matrices = np.array([get_projection_matrix(cam) for cam in best_individual])
+    points_3d = triangulate_points(annotations, proj_matrices)
+
+    with app_state.lock:
+        app_state.reconstructed_3d_points[frame_idx] = points_3d
+
+
 # ============================================================================
 # Optic flow tracking
 # ============================================================================
@@ -309,129 +394,6 @@ def track_points(
                 annotations[frame_idx, cam_idx, p_idx] = final_point
                 if not np.isnan(final_point).any():
                     human_annotated[frame_idx, cam_idx, p_idx] = False
-
-
-# ============================================================================
-# 3D Reconstruction
-# ============================================================================
-
-# TODO: Also replaced by mokap implementation
-
-def triangulate_points(
-    frame_annotations: np.ndarray,
-    proj_matrices: np.ndarray
-) -> np.ndarray:
-    """Triangulate 3D points from 2D correspondences using all camera pairs."""
-
-    num_cams, num_points, _ = frame_annotations.shape
-    camera_pairs = list(itertools.combinations(range(num_cams), 2))
-
-    votes = np.full((len(camera_pairs), num_points, 3), np.nan, dtype=np.float32)
-
-    for i, (cam1, cam2) in enumerate(camera_pairs):
-        p1 = frame_annotations[cam1]
-        p2 = frame_annotations[cam2]
-
-        # Only triangulate where both views have valid points
-        valid = ~np.isnan(p1).any(axis=1) & ~np.isnan(p2).any(axis=1)
-        if not np.any(valid):
-            continue
-
-        points_4d = cv2.triangulatePoints(
-            proj_matrices[cam1],
-            proj_matrices[cam2],
-            p1[valid].T,
-            p2[valid].T
-        )
-        points_3d = (points_4d[:3] / (points_4d[3] + 1e-6)).T
-        votes[i, valid] = points_3d
-
-    return np.nanmean(votes, axis=0)
-
-
-def refine_annotation(
-    app_state: 'AppState',
-    target_cam_idx: int,
-    point_idx: int,
-    frame_idx: int
-) -> Optional[np.ndarray]:
-    """
-    Refines a 2D annotation by triangulating from other views and reprojecting.
-
-    This is used to "snap" a new user click to a more accurate position based
-    on the consensus of other existing annotations for the same point.
-
-    Returns:
-        A (2,) numpy array with the refined 2D coordinates, or None if
-        refinement is not possible (e.g., fewer than 2 other views).
-    """
-    with app_state.lock:
-        # Get all annotations for the specific point in the specific frame
-        annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
-        best_individual = app_state.best_individual
-
-    if best_individual is None:
-        return None
-
-    # Identify which cameras have a valid annotation for this point, excluding the target camera
-    num_cams = annotations_for_point.shape[0]
-    valid_cam_indices = []
-    valid_annotations_2d = []
-
-    for i in range(num_cams):
-        if i == target_cam_idx:
-            continue
-        if not np.isnan(annotations_for_point[i]).any():
-            valid_cam_indices.append(i)
-            valid_annotations_2d.append(annotations_for_point[i])
-
-    # We need at least two other views to triangulate reliably
-    if len(valid_cam_indices) < 2:
-        return None
-
-    valid_annotations_2d = np.array(valid_annotations_2d)
-
-    # Get projection matrices for the valid cameras only
-    proj_matrices = np.array([get_projection_matrix(best_individual[i]) for i in valid_cam_indices])
-
-    # The triangulate_points function expects input shape (num_cams, num_points, 2).
-    # Here, we have one point, so we reshape.
-    point_to_triangulate = valid_annotations_2d.reshape(len(valid_cam_indices), 1, 2)
-
-    # The function returns shape (num_points, 3), so we'll get (1, 3)
-    point_3d_single = triangulate_points(point_to_triangulate, proj_matrices)
-
-    if np.isnan(point_3d_single).any():
-        return None
-
-    point_3d = point_3d_single.flatten()  # Shape becomes (3,)
-
-    # Reproject the 3D point back onto the target camera's view
-    target_cam_params = best_individual[target_cam_idx]
-    reprojected_point_2d = reproject_points(point_3d, target_cam_params)
-
-    if reprojected_point_2d.size == 0:
-        return None
-
-    return reprojected_point_2d.flatten()  # Shape becomes (2,)
-
-
-def update_3d_reconstruction(app_state: 'AppState'):
-    """Reconstruct 3D points for the current frame."""
-
-    with app_state.lock:
-        frame_idx = app_state.frame_idx
-        annotations = app_state.annotations[frame_idx]
-        best_individual = app_state.best_individual
-
-        if best_individual is None:
-            return
-
-    proj_matrices = np.array([get_projection_matrix(cam) for cam in best_individual])
-    points_3d = triangulate_points(annotations, proj_matrices)
-
-    with app_state.lock:
-        app_state.reconstructed_3d_points[frame_idx] = points_3d
 
 
 # ============================================================================
