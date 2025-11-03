@@ -99,6 +99,9 @@ class AppState:
             dtype=np.float32
         )
 
+        # Frame cache for UI zoom
+        self.current_video_frames: Optional[List[np.ndarray]] = None
+
         # Calibration state
         self.calibration_frames: List[int] = []
         self.best_individual: Optional[List[Dict[str, Any]]] = None

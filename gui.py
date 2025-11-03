@@ -1,6 +1,7 @@
 """
 GUI implementation using DearPyGUI.
 """
+import cv2
 import dearpygui.dearpygui as dpg
 import numpy as np
 
@@ -64,6 +65,7 @@ def create_ui(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
     # Popups
     _create_ga_popup(app_state, queues)
     _create_batch_track_popup(app_state)
+    _create_loupe_popup()
 
     # Viewport
     dpg.create_viewport(title="CATAR", width=window_width, height=window_height)
@@ -96,6 +98,18 @@ def _create_textures(video_meta: dict):
                 tag=f"video_texture_{i}",
                 format=dpg.mvFormat_Float_rgba
             )
+
+        # Add loupe texture
+        loupe_size = 128
+
+        black_loupe = np.zeros((loupe_size, loupe_size, 4), dtype=np.float32)
+        dpg.add_raw_texture(
+            width=loupe_size,
+            height=loupe_size,
+            default_value=black_loupe.ravel().tolist(),
+            tag="loupe_texture",
+            format=dpg.mvFormat_Float_rgba
+        )
 
 
 def _create_themes():
@@ -402,6 +416,22 @@ def _create_batch_track_popup(app_state: AppState):
         )
 
 
+def _create_loupe_popup():
+    """Creates the floating, borderless window for the zoom loupe."""
+
+    loupe_size = 128
+    with dpg.window(
+        tag="loupe_window",
+        show=False,
+        no_title_bar=True,
+        no_resize=True,
+        no_move=True,
+        width=loupe_size,
+        height=loupe_size
+    ):
+        dpg.add_image("loupe_texture")
+
+
 # ============================================================================
 # Event Handlers
 # ============================================================================
@@ -621,6 +651,7 @@ def _image_mouse_down_callback(sender, app_data, user_data):
                     "p_idx": p_idx,
                     "active": True
                 }
+                dpg.show_item("loupe_window")
                 print(f"Started dragging point {app_state.point_names[p_idx]} in camera {cam_idx}")
             else:
                 # Reprojection-assisted annotation
@@ -674,6 +705,12 @@ def _image_drag_callback(sender, app_data, user_data):
         video_w = app_state.video_metadata['width']
         video_h = app_state.video_metadata['height']
 
+        # Get the cached frames for the loupe
+        current_frames = app_state.current_video_frames
+        if current_frames is None:
+            return
+        video_frame = current_frames[cam_idx]
+
     drawlist_tag = f"drawlist_{cam_idx}"
     container_pos = dpg.get_item_rect_min(drawlist_tag)
     container_size = dpg.get_item_rect_size(drawlist_tag)
@@ -694,6 +731,31 @@ def _image_drag_callback(sender, app_data, user_data):
         app_state.annotations[frame_idx, cam_idx, p_idx] = scaled_pos
         app_state.needs_3d_reconstruction = True
 
+    loupe_size = 128
+    zoom_factor = 4
+
+    # Calculate the region to extract from the source video frame
+    src_half_w = (loupe_size / zoom_factor) / 2
+    src_x = int(scaled_pos[0] - src_half_w)
+    src_y = int(scaled_pos[1] - src_half_w)
+
+    # Extract the patch
+    h, w, _ = video_frame.shape
+    x1, y1 = max(0, src_x), max(0, src_y)
+    x2, y2 = min(w, src_x + loupe_size // zoom_factor), min(h, src_y + loupe_size // zoom_factor)
+
+    patch = video_frame[y1:y2, x1:x2]
+
+    if patch.size > 0:
+        # zoom the patch using nearest-neighbor to see the pixels
+        zoomed_patch = cv2.resize(patch, (loupe_size, loupe_size), interpolation=cv2.INTER_NEAREST)
+        zoomed_patch_rgba = cv2.cvtColor(zoomed_patch, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
+        # Update the texture
+        dpg.set_value("loupe_texture", zoomed_patch_rgba.ravel())
+
+    # Position the loupe window near the cursor
+    dpg.configure_item("loupe_window", pos=(mouse_pos[0] + 15, mouse_pos[1] + 15))
+
 
 def _image_release_callback(sender, app_data, user_data):
     """Finish drag operation."""
@@ -711,6 +773,8 @@ def _image_release_callback(sender, app_data, user_data):
         app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
         app_state.needs_3d_reconstruction = True
         app_state.drag_state = {}
+
+    dpg.hide_item("loupe_window")  # Hide the loupe
 
 
 # ============================================================================

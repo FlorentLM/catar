@@ -326,6 +326,7 @@ class RenderingWorker(threading.Thread):
             needs_reconstruction = self.app_state.needs_3d_reconstruction
             best_individual = self.app_state.best_individual
             frame_idx = self.app_state.frame_idx
+            self.app_state.current_video_frames = data["raw_frames"]
 
         if needs_reconstruction:
             print(f"Rendering worker: Triggering 3D reconstruction for frame {frame_idx}")
