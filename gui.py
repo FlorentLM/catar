@@ -135,6 +135,10 @@ def _create_themes():
             dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, (230, 165, 255, 75))
             dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, (230, 165, 255, 75))
 
+    # Sets the loupe window's internal padding to 0 on X and Y
+    with dpg.theme(tag="loupe_theme"):
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0, category=dpg.mvThemeCat_Core)
 
 def _create_menu_bar(app_state: AppState, queues: Queues):
     """Create top menu bar."""
@@ -417,23 +421,23 @@ def _create_batch_track_popup(app_state: AppState):
 
 
 def _create_loupe_popup():
-    """Creates the floating borderless window for the loupe."""
+    """Creates the floating, borderless window for the loupe."""
     loupe_size = 128
 
     with dpg.window(
-        tag="loupe_window",
-        show=False,
-        no_title_bar=True,
-        no_resize=True,
-        no_move=True,
-        no_scrollbar=True,
-        width=loupe_size,
-        height=loupe_size, # Add a little space for a title
-    ):
-        with dpg.drawlist(
+            tag="loupe_window",
+            show=False,
+            no_title_bar=True,
+            no_resize=True,
+            no_move=True,
             width=loupe_size,
             height=loupe_size,
-            tag="loupe_drawlist"
+            no_scrollbar=True,
+    ):
+        with dpg.drawlist(
+                width=loupe_size,
+                height=loupe_size,
+                tag="loupe_drawlist"
         ):
             # Layer for the zoomed video image
             dpg.draw_image(
@@ -444,6 +448,8 @@ def _create_loupe_popup():
             )
             # Layer for drawing annotations and lines on top
             dpg.add_draw_layer(tag="loupe_overlay_layer")
+
+    dpg.bind_item_theme("loupe_window", "loupe_theme")
 
 
 # ============================================================================
@@ -701,6 +707,43 @@ def _image_mouse_down_callback(sender, app_data, user_data):
             print(f"Deleted annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}")
 
 
+def line_box_intersection(a: float, b: float, c: float, box_x: float, box_y: float, box_w: float, box_h: float) -> list:
+    """
+    Calculates the two intersection points of a line (ax + by + c = 0) with a rectangle.
+    """
+    intersections = []
+
+    # Top edge (y = box_y)
+    if abs(a) > 1e-9:
+        x = (-c - b * box_y) / a
+        if box_x <= x <= box_x + box_w:
+            intersections.append((x, box_y))
+
+    # Bottom edge (y = box_y + box_h)
+    if abs(a) > 1e-9:
+        x = (-c - b * (box_y + box_h)) / a
+        if box_x <= x <= box_x + box_w:
+            intersections.append((x, box_y + box_h))
+
+    # Left edge (x = box_x)
+    if abs(b) > 1e-9:
+        y = (-c - a * box_x) / b
+        if box_y <= y <= box_y + box_h:
+            intersections.append((box_x, y))
+
+    # Right edge (x = box_x + box_w)
+    if abs(b) > 1e-9:
+        y = (-c - a * (box_x + box_w)) / b
+        if box_y <= y <= box_y + box_h:
+            if box_y <= y <= box_y + box_h:
+                intersections.append((box_x + box_w, y))
+
+    # Remove duplicate points (can happen at corners)
+    unique_points = sorted(list(set(intersections)))
+
+    return unique_points
+
+
 def _image_drag_callback(sender, app_data, user_data):
     """Update annotation position while dragging and render the zoom loupe."""
 
@@ -796,13 +839,17 @@ def _image_drag_callback(sender, app_data, user_data):
             line = F @ p_hom
             a, b, c = line
 
-            # Find intersection with the source patch boundaries and draw
-            # TODO: full line-box intersection is more robust
-            if abs(b) > 1e-6:
-                y0_loupe = (-a * src_x - c) / b
-                y1_loupe = (-a * (src_x + src_patch_width) - c) / b
-                p1_loupe = to_loupe_coords((src_x, y0_loupe))
-                p2_loupe = to_loupe_coords((src_x + src_patch_width, y1_loupe))
+            intersection_points = line_box_intersection(
+                a, b, c, src_x, src_y, src_patch_width, src_patch_width
+            )
+
+            if len(intersection_points) == 2:
+                p1_video_coords = intersection_points[0]
+                p2_video_coords = intersection_points[1]
+
+                # Transform points to the loupe's coordinate system and draw
+                p1_loupe = to_loupe_coords(p1_video_coords)
+                p2_loupe = to_loupe_coords(p2_video_coords)
                 color = camera_colors[from_cam % len(camera_colors)]
                 dpg.draw_line(p1_loupe, p2_loupe, color=color, thickness=1, parent=layer_tag)
 
