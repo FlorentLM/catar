@@ -27,7 +27,12 @@ LK_PARAMS = dict(
     maxLevel=2,
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01)
 )
-LK_ERROR_THRESHOLD = 20.0
+
+# If LK tracking fails (or is unreliable), trust the 3D reprojection.
+TRUST_REPROJECTION_ON_FAILURE = True
+# Threshold for the forward-backward check. If the endpoint of a backward track
+# is further than this many pixels from the start point, the track is unreliable.
+FORWARD_BACKWARD_THRESHOLD = 5.0  # in pixels
 
 # Camera calibration
 NUM_DIST_COEFFS = 14

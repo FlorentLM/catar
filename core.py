@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from state import AppState
 
-
 # ============================================================================
 # Camera geometry
 # ============================================================================
@@ -157,13 +156,20 @@ def track_points(
     current_frames: List[np.ndarray],
     frame_idx: int
 ):
-    """Track keypoints using Lucas-Kanade algo."""
+    """
+    Track keypoints using 3D-Guided LK with Forward-Backward confidence check.
+    """
 
     with app_state.lock:
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
         annotations = app_state.annotations
         human_annotated = app_state.human_annotated
+        prev_points_3d = app_state.reconstructed_3d_points[frame_idx - 1]
+        calibration = app_state.best_individual
+
+    if calibration is None:
+        return
 
     num_videos = len(current_frames)
 
@@ -171,38 +177,80 @@ def track_points(
         prev_gray = cv2.cvtColor(prev_frames[cam_idx], cv2.COLOR_BGR2GRAY)
         curr_gray = cv2.cvtColor(current_frames[cam_idx], cv2.COLOR_BGR2GRAY)
 
-        p0 = annotations[frame_idx - 1, cam_idx, :, :]
-        valid_mask = ~np.isnan(p0).any(axis=1)
-
-        # In focus mode: only track selected point
+        # Base the decision to track on the previous 2D annotation's existence
+        p0_2d_prev = annotations[frame_idx - 1, cam_idx, :, :]
+        
+        track_mask = ~np.isnan(p0_2d_prev).any(axis=1)
         if focus_mode:
-            is_valid = valid_mask[selected_idx]
-            valid_mask[:] = False
-            valid_mask[selected_idx] = is_valid
+            is_valid = track_mask[selected_idx]
+            track_mask[:] = False
+            track_mask[selected_idx] = is_valid
 
-        if not np.any(valid_mask):
+        if not np.any(track_mask):
             continue
 
-        p0_valid = p0[valid_mask].reshape(-1, 1, 2)
-        p1, status, error = cv2.calcOpticalFlowPyrLK(
-            prev_gray, curr_gray, p0_valid, None, **config.LK_PARAMS
+        point_indices_to_track = np.where(track_mask)[0]
+
+        # Generate geometric predictions (Candidate A) for all trackable points
+        geometric_predictions = np.full((app_state.num_points, 2), np.nan, dtype=np.float32)
+        for p_idx in point_indices_to_track:
+            point_3d = prev_points_3d[p_idx]
+            if not np.isnan(point_3d).any():
+                reprojected = reproject_points(point_3d, calibration[cam_idx])
+                if reprojected.size > 0:
+                    geometric_predictions[p_idx] = reprojected.flatten()
+
+        # The starting points for LK search are the geometric predictions if available,
+        # otherwise the previous frame's 2D point
+        start_points_for_lk = np.where(
+            ~np.isnan(geometric_predictions),
+            geometric_predictions,
+            p0_2d_prev
+        )[track_mask].reshape(-1, 1, 2)
+        
+        if start_points_for_lk.size == 0:
+            continue
+
+        # Forward pass (prev -> curr)
+        p1_forward, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
+            prev_gray, curr_gray, start_points_for_lk, None, **config.LK_PARAMS
         )
 
-        if p1 is not None:
-            good_tracks = (status.flatten() == 1) & (error.flatten() < config.LK_ERROR_THRESHOLD)
+        # Backward pass (curr -> prev)
+        p0_backward, status_bwd, _ = cv2.calcOpticalFlowPyrLK(
+            curr_gray, prev_gray, p1_forward, None, **config.LK_PARAMS
+        )
 
-            # Check if there are any valid tracks after filtering
-            if np.any(good_tracks):
-                tracked_points = p1[good_tracks]
-                original_indices = np.where(valid_mask)[0][good_tracks]
+        with app_state.lock:
+            for i, p_idx in enumerate(point_indices_to_track):
+                if human_annotated[frame_idx, cam_idx, p_idx]:
+                    continue
 
-                with app_state.lock:
-                    for i, orig_idx in enumerate(original_indices):
-                        if not human_annotated[frame_idx, cam_idx, orig_idx]:
-                            # Keep human annotations intact
-                            annotations[frame_idx, cam_idx, orig_idx] = tracked_points[i]
-                            human_annotated[frame_idx, cam_idx, orig_idx] = False
+                # Get the two candidates
+                geometric_prediction = geometric_predictions[p_idx] # Candidate A
+                lk_result = p1_forward[i].flatten()                # Candidate B
 
+                # Calculate forward-backward error
+                original_start_point = start_points_for_lk[i].flatten()
+                backward_end_point = p0_backward[i].flatten()
+                fb_error = np.linalg.norm(original_start_point - backward_end_point)
+
+                # Evaluate confidence
+                is_lk_successful = (status_fwd[i] == 1 and status_bwd[i] == 1)
+                is_fb_consistent = (fb_error < config.FORWARD_BACKWARD_THRESHOLD)
+                
+                final_point = None
+                if is_lk_successful and is_fb_consistent:
+                    # High confidence: Trust the visual evidence
+                    final_point = lk_result
+                elif config.TRUST_REPROJECTION_ON_FAILURE and not np.isnan(geometric_prediction).any():
+                    # Low confidence or failure: Fall back to the geometric prediction
+                    final_point = geometric_prediction
+                
+                # Update state if a valid point was chosen
+                if final_point is not None:
+                    annotations[frame_idx, cam_idx, p_idx] = final_point
+                    human_annotated[frame_idx, cam_idx, p_idx] = False
 
 # ============================================================================
 # 3D Reconstruction
@@ -250,20 +298,23 @@ def refine_annotation(
 ) -> Optional[np.ndarray]:
     """
     Refines a 2D annotation by triangulating from other views and reprojecting.
-    This snaps a new user click to a more accurate position based on other existing annotations.
+
+    This is used to "snap" a new user click to a more accurate position based
+    on the consensus of other existing annotations for the same point.
 
     Returns:
-        A (2,) array with the refined 2D coordinates, or None if refinement is not possible.
+        A (2,) numpy array with the refined 2D coordinates, or None if
+        refinement is not possible (e.g., fewer than 2 other views).
     """
-
     with app_state.lock:
+        # Get all annotations for the specific point in the specific frame
         annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
         best_individual = app_state.best_individual
 
     if best_individual is None:
         return None
 
-    # Which cameras have a valid annotation for this point (excluding target camera ofc)?
+    # Identify which cameras have a valid annotation for this point, excluding the target camera
     num_cams = annotations_for_point.shape[0]
     valid_cam_indices = []
     valid_annotations_2d = []
@@ -275,31 +326,35 @@ def refine_annotation(
             valid_cam_indices.append(i)
             valid_annotations_2d.append(annotations_for_point[i])
 
-    # We need at least two other views to triangulate
+    # We need at least two other views to triangulate reliably
     if len(valid_cam_indices) < 2:
         return None
 
     valid_annotations_2d = np.array(valid_annotations_2d)
+
+    # Get projection matrices for the valid cameras only
     proj_matrices = np.array([get_projection_matrix(best_individual[i]) for i in valid_cam_indices])
 
-    # triangulate_points expects (num_cams, num_points, 2)
+    # The triangulate_points function expects input shape (num_cams, num_points, 2).
+    # Here, we have one point, so we reshape.
     point_to_triangulate = valid_annotations_2d.reshape(len(valid_cam_indices), 1, 2)
-    # and returns (num_points, 3), so we get (1, 3)
+
+    # The function returns shape (num_points, 3), so we'll get (1, 3)
     point_3d_single = triangulate_points(point_to_triangulate, proj_matrices)
 
     if np.isnan(point_3d_single).any():
         return None
 
-    point_3d = point_3d_single.flatten()  # (3,)
+    point_3d = point_3d_single.flatten()  # Shape becomes (3,)
 
-    # Reproject the point back into the target camera's view
+    # Reproject the 3D point back onto the target camera's view
     target_cam_params = best_individual[target_cam_idx]
     reprojected_point_2d = reproject_points(point_3d, target_cam_params)
 
     if reprojected_point_2d.size == 0:
         return None
 
-    return reprojected_point_2d.flatten()  # (2,)
+    return reprojected_point_2d.flatten()  # Shape becomes (2,)
 
 
 def update_3d_reconstruction(app_state: 'AppState'):
