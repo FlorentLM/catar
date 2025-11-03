@@ -417,19 +417,33 @@ def _create_batch_track_popup(app_state: AppState):
 
 
 def _create_loupe_popup():
-    """Creates the floating, borderless window for the zoom loupe."""
-
+    """Creates the floating borderless window for the loupe."""
     loupe_size = 128
+
     with dpg.window(
         tag="loupe_window",
         show=False,
         no_title_bar=True,
         no_resize=True,
         no_move=True,
+        no_scrollbar=True,
         width=loupe_size,
-        height=loupe_size
+        height=loupe_size, # Add a little space for a title
     ):
-        dpg.add_image("loupe_texture")
+        with dpg.drawlist(
+            width=loupe_size,
+            height=loupe_size,
+            tag="loupe_drawlist"
+        ):
+            # Layer for the zoomed video image
+            dpg.draw_image(
+                "loupe_texture",
+                pmin=(0, 0),
+                pmax=(loupe_size, loupe_size),
+                tag="loupe_image"
+            )
+            # Layer for drawing annotations and lines on top
+            dpg.add_draw_layer(tag="loupe_overlay_layer")
 
 
 # ============================================================================
@@ -645,28 +659,20 @@ def _image_mouse_down_callback(sender, app_data, user_data):
     with app_state.lock:
         if app_data[0] == 0:  # left click
             if is_drag_start:
-                # Start dragging existing point
+                # Flag the start of a drag on an existing point
                 app_state.drag_state = {
                     "cam_idx": cam_idx,
                     "p_idx": p_idx,
                     "active": True
                 }
-                dpg.show_item("loupe_window")
-                print(f"Started dragging point {app_state.point_names[p_idx]} in camera {cam_idx}")
             else:
                 # Reprojection-assisted annotation
 
                 # Attempt to refine the click using other views before creating the point
-                refined_pos = refine_annotation(
-                    app_state,
-                    cam_idx,
-                    p_idx,
-                    frame_idx
-                )
+                refined_pos = refine_annotation(app_state, cam_idx, p_idx, frame_idx)
 
                 # Use the refined position if available, otherwise use the user's click
                 final_pos = refined_pos if refined_pos is not None else scaled_pos
-
                 if refined_pos is not None:
                     print(f"Snapped new annotation for '{app_state.point_names[p_idx]}' using reprojection.")
 
@@ -676,12 +682,17 @@ def _image_mouse_down_callback(sender, app_data, user_data):
                 app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
                 app_state.needs_3d_reconstruction = True
                 print(f"Created new annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}, pos {final_pos}")
+
                 # Allow dragging immediately
                 app_state.drag_state = {
                     "cam_idx": cam_idx,
                     "p_idx": p_idx,
                     "active": True
                 }
+
+            # Show the loupe if any drag operation was started
+            if app_state.drag_state.get("active"):
+                dpg.show_item("loupe_window")
 
         elif app_data[0] == 1:  # right click = delete
             app_state.annotations[frame_idx, cam_idx, p_idx] = np.nan
@@ -691,7 +702,7 @@ def _image_mouse_down_callback(sender, app_data, user_data):
 
 
 def _image_drag_callback(sender, app_data, user_data):
-    """Update annotation position while dragging."""
+    """Update annotation position while dragging and render the zoom loupe."""
 
     app_state = user_data["app_state"]
 
@@ -702,15 +713,24 @@ def _image_drag_callback(sender, app_data, user_data):
         cam_idx = app_state.drag_state["cam_idx"]
         p_idx = app_state.drag_state["p_idx"]
         frame_idx = app_state.frame_idx
+
+        # Get all data needed for rendering overlays
         video_w = app_state.video_metadata['width']
         video_h = app_state.video_metadata['height']
-
-        # Get the cached frames for the loupe
         current_frames = app_state.current_video_frames
-        if current_frames is None:
-            return
-        video_frame = current_frames[cam_idx]
+        all_annotations = app_state.annotations[frame_idx]
+        best_individual = app_state.best_individual
+        f_mats = app_state.fundamental_matrices
+        point_3d_selected = app_state.reconstructed_3d_points[frame_idx, p_idx]
+        point_colors = app_state.point_colors
+        # point_names = app_state.point_names
+        camera_colors = app_state.camera_colors
 
+    if current_frames is None:
+        return
+    video_frame = current_frames[cam_idx]
+
+    # Calculate mouse pos
     drawlist_tag = f"drawlist_{cam_idx}"
     container_pos = dpg.get_item_rect_min(drawlist_tag)
     container_size = dpg.get_item_rect_size(drawlist_tag)
@@ -718,10 +738,7 @@ def _image_drag_callback(sender, app_data, user_data):
         return
 
     mouse_pos = dpg.get_mouse_pos(local=False)
-    local_pos = (
-        mouse_pos[0] - container_pos[0],
-        mouse_pos[1] - container_pos[1]
-    )
+    local_pos = (mouse_pos[0] - container_pos[0], mouse_pos[1] - container_pos[1])
     scaled_pos = (
         local_pos[0] * video_w / container_size[0],
         local_pos[1] * video_h / container_size[1]
@@ -731,30 +748,83 @@ def _image_drag_callback(sender, app_data, user_data):
         app_state.annotations[frame_idx, cam_idx, p_idx] = scaled_pos
         app_state.needs_3d_reconstruction = True
 
+    # Update loupe background texture
     loupe_size = 128
-    zoom_factor = 4
+    zoom_factor = 4.0
+    src_patch_width = loupe_size / zoom_factor
 
-    # Calculate the region to extract from the source video frame
-    src_half_w = (loupe_size / zoom_factor) / 2
-    src_x = int(scaled_pos[0] - src_half_w)
-    src_y = int(scaled_pos[1] - src_half_w)
+    src_x = scaled_pos[0] - src_patch_width / 2
+    src_y = scaled_pos[1] - src_patch_width / 2
 
-    # Extract the patch
-    h, w, _ = video_frame.shape
-    x1, y1 = max(0, src_x), max(0, src_y)
-    x2, y2 = min(w, src_x + loupe_size // zoom_factor), min(h, src_y + loupe_size // zoom_factor)
-
+    # Extract and resize the patch from the raw video
+    x1, y1 = max(0, int(src_x)), max(0, int(src_y))
+    x2, y2 = min(video_w, int(src_x + src_patch_width)), min(video_h, int(src_y + src_patch_width))
     patch = video_frame[y1:y2, x1:x2]
-
     if patch.size > 0:
-        # zoom the patch using nearest-neighbor to see the pixels
         zoomed_patch = cv2.resize(patch, (loupe_size, loupe_size), interpolation=cv2.INTER_NEAREST)
         zoomed_patch_rgba = cv2.cvtColor(zoomed_patch, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
-        # Update the texture
         dpg.set_value("loupe_texture", zoomed_patch_rgba.ravel())
 
-    # Position the loupe window near the cursor
-    dpg.configure_item("loupe_window", pos=(mouse_pos[0] + 15, mouse_pos[1] + 15))
+    # Add the overlays to the loupe
+    dpg.delete_item("loupe_overlay_layer", children_only=True)
+    layer_tag = "loupe_overlay_layer"
+
+    # Helper to transform from full video coords to loupe coords
+    def to_loupe_coords(p):
+        return ((p[0] - src_x) * zoom_factor, (p[1] - src_y) * zoom_factor)
+
+    # Draw all annotated points
+    for i in range(app_state.num_points):
+        point_2d = all_annotations[cam_idx, i]
+        if not np.isnan(point_2d).any():
+            center_loupe = to_loupe_coords(point_2d)
+            # Only draw if visible within the loupe
+            if 0 < center_loupe[0] < loupe_size and 0 < center_loupe[1] < loupe_size:
+                color = point_colors[i].tolist()
+                dpg.draw_circle(center_loupe, radius=7, color=color, parent=layer_tag)
+                dpg.draw_circle(center_loupe, radius=1, color=color, fill=color, parent=layer_tag)
+
+    # Draw epipolar lines for the selected point
+    if best_individual and f_mats:
+        for from_cam in range(len(current_frames)):
+            point_2d = all_annotations[from_cam, p_idx]
+            F = f_mats.get((from_cam, cam_idx))
+            if cam_idx == from_cam or np.isnan(point_2d).any() or F is None:
+                continue
+
+            p_hom = np.array([point_2d[0], point_2d[1], 1.0])
+            line = F @ p_hom
+            a, b, c = line
+
+            # Find intersection with the source patch boundaries and draw
+            # TODO: full line-box intersection is more robust
+            if abs(b) > 1e-6:
+                y0_loupe = (-a * src_x - c) / b
+                y1_loupe = (-a * (src_x + src_patch_width) - c) / b
+                p1_loupe = to_loupe_coords((src_x, y0_loupe))
+                p2_loupe = to_loupe_coords((src_x + src_patch_width, y1_loupe))
+                color = camera_colors[from_cam % len(camera_colors)]
+                dpg.draw_line(p1_loupe, p2_loupe, color=color, thickness=1, parent=layer_tag)
+
+    # Draw reprojection for the selected point
+    if best_individual and not np.isnan(point_3d_selected).any():
+        reprojected = reproject_points(point_3d_selected, best_individual[cam_idx])
+        if reprojected.size > 0:
+            reproj_loupe = to_loupe_coords(reprojected[0])
+            if 0 < reproj_loupe[0] < loupe_size and 0 < reproj_loupe[1] < loupe_size:
+                dpg.draw_line((reproj_loupe[0] - 5, reproj_loupe[1] - 5), (reproj_loupe[0] + 5, reproj_loupe[1] + 5),
+                              color=(255, 0, 0), parent=layer_tag)
+                dpg.draw_line((reproj_loupe[0] - 5, reproj_loupe[1] + 5), (reproj_loupe[0] + 5, reproj_loupe[1] - 5),
+                              color=(255, 0, 0), parent=layer_tag)
+
+    # Draw a small crosshair
+    center = loupe_size / 2
+    dpg.draw_line((center - 5, center), (center + 5, center), color=(255, 255, 255), thickness=1, parent=layer_tag)
+    dpg.draw_line((center, center - 5), (center, center + 5), color=(255, 255, 255), thickness=1, parent=layer_tag)
+    dpg.draw_rectangle((0, 0), (loupe_size, loupe_size), color=(255, 255, 255), thickness=1, parent=layer_tag)
+
+    # Position loupe near the cursor
+    dpg.configure_item("loupe_window", pos=(mouse_pos[0] + 20, mouse_pos[1] + 20))
 
 
 def _image_release_callback(sender, app_data, user_data):
