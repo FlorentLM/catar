@@ -1,146 +1,218 @@
+"""
+All application state and communication queues are managed here.
+"""
 import queue
 import threading
+import multiprocessing
 import tomllib
-
 import numpy as np
 import pickle
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
 
 from core import calculate_fundamental_matrices
 
 
+@dataclass
+class Queues:
+    """Centralised queue management for threads communication."""
+
+    # Main thread queues
+    command: queue.Queue = field(default_factory=queue.Queue)
+    results: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=2))
+
+    # Worker input queues
+    frames_for_tracking: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=2))
+    frames_for_rendering: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=2))
+
+    # Worker command and progress queues
+    tracking_command: queue.Queue = field(default_factory=queue.Queue)
+    tracking_progress: queue.Queue = field(default_factory=queue.Queue)
+    ga_command: multiprocessing.Queue = field(default_factory=multiprocessing.Queue)
+    ga_progress: multiprocessing.Queue = field(default_factory=multiprocessing.Queue)
+
+    def shutdown_all(self):
+        """Send shutdown commands to all workers."""
+
+        self.command.put({"action": "shutdown"})
+        self.frames_for_tracking.put({"action": "shutdown"})
+        self.frames_for_rendering.put({"action": "shutdown"})
+        self.ga_command.put({"action": "shutdown"})
+
+
 class AppState:
-    """thread-safe container for the application's shared state"""
+    """Thread-safe container for application state."""
 
     def __init__(self, video_metadata: Dict[str, Any], skeleton_config: Dict[str, Any]):
         self.lock = threading.Lock()
 
-        # Metadata (read-only after init)
+        # Video metadata (read-only after init)
         self.video_metadata = video_metadata
-        self.POINT_NAMES = skeleton_config['point_names']
-        self.SKELETON = skeleton_config['skeleton']
-        self.point_colors = skeleton_config['point_colors']
-        self.camera_colors = [
-                       (255, 255, 0), (0, 255, 255), (255, 0, 255), (255, 128, 0),
-                       (128, 0, 255), (0, 255, 128), (255, 255, 255), (0, 255, 0),
-                       (128, 128, 0), (0, 128, 128), (128, 0, 128), (128, 128, 128)
-                                                                      ]
-        # TODO: Use mokap colours
-        self.num_points = len(self.POINT_NAMES)
         self.video_names: List[str] = []
 
-        # UI & Control state
+        # Skeleton configuration (read-only after init)
+        self.point_names = skeleton_config['point_names']
+        self.skeleton = skeleton_config['skeleton']
+        self.point_colors = skeleton_config['point_colors']
+        self.camera_colors = [
+            (255, 255, 0), (0, 255, 255), (255, 0, 255), (255, 128, 0),
+            (128, 0, 255), (0, 255, 128), (255, 255, 255), (0, 255, 0),
+            (128, 128, 0), (0, 128, 128), (128, 0, 128), (128, 128, 128)
+        ]
+        self.num_points = len(self.point_names)
+
+        # Playback state
         self.frame_idx: int = 0
         self.paused: bool = True
+
+        # UI state
         self.selected_point_idx: int = 0
         self.focus_selected_point: bool = False
         self.show_cameras_in_3d: bool = True
+        self.drag_state: Dict[str, Any] = {}
+
+        # Feature flags
         self.keypoint_tracking_enabled: bool = False
-        self.save_output_video: bool = False
         self.needs_3d_reconstruction: bool = True
-        self.drag_state: Dict[str, Any] = {}  # holds info about an ongoing drag operation
-        self.tracking_command_queue = queue.Queue()
+
+        # Batch tracking control
         self.stop_batch_track = threading.Event()
 
-        # Core data
-        num_frames = self.video_metadata['num_frames']
-        num_videos = self.video_metadata['num_videos']
-        self.annotations: np.ndarray = np.full((num_frames, num_videos, self.num_points, 2), np.nan, dtype=np.float32)
-        self.human_annotated: np.ndarray = np.zeros((num_frames, num_videos, self.num_points), dtype=bool)
-        self.reconstructed_3d_points: np.ndarray = np.full((num_frames, self.num_points, 3), np.nan, dtype=np.float32)
+        # Annotation data
+        num_frames = video_metadata['num_frames']
+        num_videos = video_metadata['num_videos']
+        self.annotations = np.full(
+            (num_frames, num_videos, self.num_points, 2),
+            np.nan,
+            dtype=np.float32
+        )
+        self.human_annotated = np.zeros(
+            (num_frames, num_videos, self.num_points),
+            dtype=bool
+        )
+        self.reconstructed_3d_points = np.full(
+            (num_frames, self.num_points, 3),
+            np.nan,
+            dtype=np.float32
+        )
 
-        # Calibration & GA state
-        self.fundamental_matrices: Optional[Dict[Tuple[int, int], np.ndarray]] = None
-        self.epipolar_click_data: Optional[Dict] = None # {'cam_idx': int, 'point_2d': tuple}
+        # Calibration state
         self.calibration_frames: List[int] = []
         self.best_individual: Optional[List[Dict[str, Any]]] = None
         self.best_fitness: float = float('inf')
+        self.fundamental_matrices: Optional[Dict[Tuple[int, int], np.ndarray]] = None
         self.is_ga_running: bool = False
 
-    def set_calibration(self, loaded_individual: List[Dict[str, Any]]):
-        with self.lock:
-            self.best_individual = loaded_individual
-            self.fundamental_matrices = calculate_fundamental_matrices(loaded_individual)
-            self.best_fitness = 0  # 0 for loaded calibration
-            self.needs_3d_reconstruction = True
-        print("Successfully applied pre-matched camera calibration.")
+    def set_calibration(self, individual: List[Dict[str, Any]]):
+        """Apply camera calibration and update dependent state."""
 
-    def get_ga_state_snapshot(self) -> Dict[str, Any]:
-        """Returns a copy of all data needed by the GA worker."""
+        with self.lock:
+            self.best_individual = individual
+            self.fundamental_matrices = calculate_fundamental_matrices(individual)
+            self.best_fitness = 0.0  # Loaded calibrations have fitness 0
+            self.needs_3d_reconstruction = True
+        print("Successfully applied camera calibration.")
+
+    def get_ga_snapshot(self) -> Dict[str, Any]:
+        """Create snapshot of state needed by the GA worker."""
+
         with self.lock:
             return {
                 "annotations": self.annotations.copy(),
                 "calibration_frames": list(self.calibration_frames),
                 "video_metadata": self.video_metadata.copy(),
                 "best_fitness": self.best_fitness,
-                "best_individual": self.best_individual, # consider sending only on start?
-                "generation": 0, # GA worker manages its own generation count
+                "best_individual": self.best_individual,
+                "generation": 0,
             }
 
-    def load_data_from_files(self, data_folder: Path):
-        """Loads all persistent data from files into the state object."""
+    def save_to_disk(self, folder: Path):
+        """Save all persistent state to disk."""
 
-        print(f"Attempting to load saved state from: '{data_folder}'")
-        # TODO: Simplify this, no need for a thousand files of different file formats
+        print(f"Saving state to: '{folder}'")
+        with self.lock:
+            try:
+                np.save(folder / 'annotations.npy', self.annotations)
+                np.save(folder / 'human_annotated.npy', self.human_annotated)
+                np.save(folder / 'reconstructed_3d_points.npy', self.reconstructed_3d_points)
+
+                with open(folder / 'calibration_frames.json', 'w') as f:
+                    json.dump(self.calibration_frames, f)
+
+                if self.best_individual is not None:
+                    with open(folder / 'best_individual.pkl', 'wb') as f:
+                        pickle.dump(self.best_individual, f)
+
+                print("State saved successfully.")
+            except Exception as e:
+                print(f"Error saving state: {e}")
+
+    def load_from_disk(self, folder: Path):
+        """Load persistent state from disk."""
+
+        print(f"Loading state from: '{folder}'")
+
         files_to_load = {
-            'numpy': ['annotations.npy', 'human_annotated.npy', 'reconstructed_3d_points.npy'],
-            'pickle': ['best_individual.pkl'],
-            'json': ['calibration_frames.json']
+            'annotations.npy': ('numpy', 'annotations'),
+            'human_annotated.npy': ('numpy', 'human_annotated'),
+            'reconstructed_3d_points.npy': ('numpy', 'reconstructed_3d_points'),
+            'best_individual.pkl': ('pickle', 'best_individual'),
+            'calibration_frames.json': ('json', 'calibration_frames'),
         }
 
         loaded_data = {}
-        for file_type, filenames in files_to_load.items():
-            for filename in filenames:
-                file_path = data_folder / filename
-                if file_path.exists():
-                    try:
-                        if file_type == 'numpy':
-                            data = np.load(file_path)
-                        elif file_type == 'pickle':
-                            with file_path.open('rb') as f:
-                                data = pickle.load(f)
-                        elif file_type == 'json':
-                            with file_path.open('r') as f:
-                                data = json.load(f)
+        for filename, (file_type, attr_name) in files_to_load.items():
+            file_path = folder / filename
+            if not file_path.exists():
+                continue
 
-                        loaded_data[filename.split('.')[0]] = data
-                        print(f"  - Successfully loaded '{filename}'")
-                    except Exception as e:
-                        print(f"  - WARNING: Could not load '{filename}'. Error: {e}")
+            try:
+                if file_type == 'numpy':
+                    loaded_data[attr_name] = np.load(file_path)
+                elif file_type == 'pickle':
+                    with file_path.open('rb') as f:
+                        loaded_data[attr_name] = pickle.load(f)
+                elif file_type == 'json':
+                    with file_path.open('r') as f:
+                        loaded_data[attr_name] = json.load(f)
+                print(f"  - Loaded '{filename}'")
+            except Exception as e:
+                print(f"  - WARNING: Could not load '{filename}': {e}")
 
         if not loaded_data:
-            print("No saved state files found. Starting with a fresh state.")
+            print("No saved state found. Starting fresh.")
             return
 
         with self.lock:
-            for key, value in loaded_data.items():
-                setattr(self, key, value)
-        print("\nState loading complete.")
+            for attr_name, value in loaded_data.items():
+                setattr(self, attr_name, value)
 
-    def load_calibration(self, file_path: Path):
+        print("State loading complete.")
 
-        print(f"Loading camera calibration from '{file_path}'")
+    def load_calibration_from_toml(self, file_path: Path):
+        """Load camera calibration from TOML file."""
+
+        print(f"Loading calibration from '{file_path}'")
         if not file_path.exists():
-            print("  - WARNING: File not found.")
+            print("  - ERROR: File not found.")
             return
 
-        with file_path.open("rb") as f:
-            try:
+        try:
+            with file_path.open("rb") as f:
                 calib_data = tomllib.load(f)
-            except tomllib.TOMLDecodeError as e:
-                print(f"  - ERROR: Could not parse TOML file. {e}")
-                return
+        except Exception as e:
+            print(f"  - ERROR: Could not parse TOML file: {e}")
+            return
 
-        # The order of video files is sorted alphabetically in main.py
-        # We must ensure the calibration data matches this order.
+        # Assume sorted order matches video order
         sorted_camera_names = sorted(calib_data.keys())
 
-        loaded_individual = []
+        individual = []
         for cam_name in sorted_camera_names:
             cam = calib_data[cam_name]
-            cam_params = {
+            individual.append({
                 'fx': cam['camera_matrix'][0][0],
                 'fy': cam['camera_matrix'][1][1],
                 'cx': cam['camera_matrix'][0][2],
@@ -148,34 +220,6 @@ class AppState:
                 'dist': np.array(cam['dist_coeffs'], dtype=np.float32),
                 'rvec': np.array(cam['rvec'], dtype=np.float32),
                 'tvec': np.array(cam['tvec'], dtype=np.float32),
-            }
-            loaded_individual.append(cam_params)
+            })
 
-        with self.lock:
-            self.best_individual = loaded_individual
-            self.fundamental_matrices = calculate_fundamental_matrices(loaded_individual)
-            self.best_fitness = 0  # 0 = indicator of a loaded calibration
-            self.needs_3d_reconstruction = True
-
-        print("Successfully loaded and applied camera calibration.")
-
-    def save_data_to_files(self, data_folder: Path):
-        """Saves all persistent data from the state object to files."""
-
-        print(f"\nAttempting to save state to: '{data_folder}'")
-        with self.lock:
-            try:
-                np.save(data_folder / 'annotations.npy', self.annotations)
-                np.save(data_folder / 'human_annotated.npy', self.human_annotated)
-                np.save(data_folder / 'reconstructed_3d_points.npy', self.reconstructed_3d_points)
-
-                with open(data_folder / 'calibration_frames.json', 'w') as f:
-                    json.dump(self.calibration_frames, f)
-
-                if self.best_individual is not None:
-                    with open(data_folder / 'best_individual.pkl', 'wb') as f:
-                        pickle.dump(self.best_individual, f)
-
-                print("State saved successfully.")
-            except Exception as e:
-                print(f"Error saving state: {e}")
+        self.set_calibration(individual)
