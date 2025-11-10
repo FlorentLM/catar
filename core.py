@@ -1,244 +1,52 @@
 """
-Core algos for tracking, triangulation and calibration.
+Core algos for tracking and calibration (and some stuff for visualisation)
 """
 import random
 import cv2
 import numpy as np
-import itertools
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional
 
+from utils import annotations_to_polars, get_projection_matrix, reproject_points, undistort_points, triangulate_points, \
+    calculate_reproj_confidence
 from viz_3d import SceneObject
 import config
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from state import AppState
+    from mokap.reconstruction.reconstruction import Reconstructor
+    from mokap.reconstruction.tracking import MultiObjectTracker
+
 
 # ============================================================================
 # Camera geometry
 # ============================================================================
 
-# TODO: These will be replaced by the mokap implementations
-
-def get_camera_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
-    """3x3 intrinsic matrix from parameters."""
-    return np.array([
-        [cam_params['fx'], 0.0, cam_params['cx']],
-        [0.0, cam_params['fy'], cam_params['cy']],
-        [0.0, 0.0, 1.0]
-    ], dtype=np.float32)
-
-
-def get_projection_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
-    """3x4 projection matrix from parameters."""
-    K = get_camera_matrix(cam_params)
-
-    # rvec and tvec are camera-to-world but we need world-to-camera for projection
-    R_c2w, _ = cv2.Rodrigues(cam_params['rvec'])
-    t_c2w = cam_params['tvec'].flatten()
-
-    # Invert to get world-to-camera
-    R_w2c = R_c2w.T
-    t_w2c = -R_c2w.T @ t_c2w
-
-    return K @ np.hstack((R_w2c, t_w2c.reshape(-1, 1)))
-
-
-def reproject_points(points_3d: np.ndarray, cam_params: Dict[str, Any]) -> np.ndarray:
-    """
-    Reproject 3D points to 2D.
-    (Assumes rvec and tvec in cam_params are camera-to-world)
-    """
-    if points_3d.size == 0:
-        return np.array([])
-
-    if points_3d.ndim == 1:
-        points_3d = points_3d.reshape(1, 1, 3)
-    elif points_3d.ndim == 2:
-        points_3d = points_3d[:, np.newaxis, :]
-
-    # rvec and tvec are camera-to-world but cv2.projectPoints needs world-to-camera
-    R_c2w, _ = cv2.Rodrigues(cam_params['rvec'])
-    t_c2w = cam_params['tvec'].flatten()
-
-    # Invert to get world-to-camera
-    R_w2c = R_c2w.T
-    t_w2c = -R_c2w.T @ t_c2w
-    rvec_w2c, _ = cv2.Rodrigues(R_w2c)
-
-    reprojected, _ = cv2.projectPoints(
-        points_3d,
-        rvec_w2c,
-        t_w2c,
-        get_camera_matrix(cam_params),
-        cam_params['dist']
-    )
-    return reprojected.squeeze(axis=1) if reprojected is not None else np.array([])
-
-
-def undistort_points(points_2d: np.ndarray, cam_params: Dict[str, Any]) -> np.ndarray:
-    """Undistort 2D points."""
-
-    valid_mask = ~np.isnan(points_2d).any(axis=-1)
-    if not np.any(valid_mask):
-        return np.full_like(points_2d, np.nan)
-
-    valid_points = points_2d[valid_mask]
-    undistorted = cv2.undistortImagePoints(
-        valid_points.reshape(-1, 1, 2),
-        get_camera_matrix(cam_params),
-        cam_params['dist']
-    )
-
-    result = np.full_like(points_2d, np.nan)
-    result[valid_mask] = undistorted.reshape(-1, 2)
-    return result
-
-
-def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, int], np.ndarray]:
-    """
-    Calculate F mat for each camera pair
-    (rvec and tvec are camera-to-world)
-    """
-    num_cams = len(calibration)
-    f_mats = {}
-
-    Ks = [get_camera_matrix(cam) for cam in calibration]
-    Rs_c2w = []
-    ts_c2w = []
-
-    for cam in calibration:
-        R, _ = cv2.Rodrigues(cam['rvec'])
-        Rs_c2w.append(R)
-        ts_c2w.append(cam['tvec'].flatten())
-
-    for i, j in itertools.product(range(num_cams), repeat=2):
-
-        if i == j:
-            continue
-
-        K_i, K_j = Ks[i], Ks[j]
-        R_i, t_i = Rs_c2w[i], ts_c2w[i]
-        R_j, t_j = Rs_c2w[j], ts_c2w[j]
-
-        # Relative transformation camera i to camera j
-        R_rel = R_j.T @ R_i
-        t_rel = R_j.T @ (t_i - t_j)
-
-        # Essential mat E = [t]_x @ R
-        t_skew = np.array([
-            [0, -t_rel[2], t_rel[1]],
-            [t_rel[2], 0, -t_rel[0]],
-            [-t_rel[1], t_rel[0], 0]
-        ])
-        E = t_skew @ R_rel
-
-        # Fundamental mat F = K_j^-T @ E @ K_i^-1
-        F = np.linalg.inv(K_j).T @ E @ np.linalg.inv(K_i)
-
-        # rank-2 constraint
-        U, S, Vt = np.linalg.svd(F)
-        S[2] = 0.0
-        F_corrected = U @ np.diag(S) @ Vt
-
-        f_mats[(i, j)] = F_corrected
-
-    return f_mats
-
-
-# ============================================================================
-# 3D reconstruction & confidence
-# ============================================================================
-
-def triangulate_points(frame_annotations: np.ndarray, proj_matrices: List[np.ndarray]) -> np.ndarray:
-    """Triangulate 3D points from 2D correspondences."""
-    # TODO: Also use mokap's implementation
-
-    num_cams, num_points, _ = frame_annotations.shape
-    if num_cams < 2:
-        return np.full((num_points, 3), np.nan, dtype=np.float32)
-
-    camera_pairs = list(itertools.combinations(range(num_cams), 2))
-    votes = np.full((len(camera_pairs), num_points, 3), np.nan, dtype=np.float32)
-
-    for i, (cam1, cam2) in enumerate(camera_pairs):
-        p1 = frame_annotations[cam1]
-        p2 = frame_annotations[cam2]
-        valid = ~np.isnan(p1).any(axis=1) & ~np.isnan(p2).any(axis=1)
-
-        if not np.any(valid):
-            continue
-
-        points_4d = cv2.triangulatePoints(
-            proj_matrices[cam1], proj_matrices[cam2], p1[valid].T, p2[valid].T
-        )
-        points_3d = (points_4d[:3] / (points_4d[3] + 1e-6)).T
-        votes[i, valid] = points_3d
-    return np.nanmean(votes, axis=0)
-
-
-def calculate_reproj_confidence(app_state: 'AppState', frame_idx: int, point_idx: int) -> np.ndarray:
-    """
-    Calculates reprojection error for a point in a frame using leave-one-out approach.
-    """
-
-    with app_state.lock:
-        annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
-        calibration = app_state.best_individual
-
-    num_cams = len(calibration)
-    errors = np.full(num_cams, np.nan, dtype=np.float32)
-
-    if calibration is None:
-        return errors
-
-    valid_cam_indices = np.where(~np.isnan(annotations_for_point).any(axis=1))[0]
-
-    if len(valid_cam_indices) < 3:  # Need at least 2 other views to triangulate
-        return errors
-
-    for cam_to_test in valid_cam_indices:
-        peer_indices = [i for i in valid_cam_indices if i != cam_to_test]
-
-        peer_annots = annotations_for_point[peer_indices].reshape(len(peer_indices), 1, 2)
-        peer_proj_mats = [get_projection_matrix(calibration[i]) for i in peer_indices]
-
-        point_3d = triangulate_points(peer_annots, peer_proj_mats).flatten()
-
-        if not np.isnan(point_3d).any():
-            reprojected = reproject_points(point_3d, calibration[cam_to_test])
-            if reprojected.size > 0:
-                original_annot = annotations_for_point[cam_to_test]
-                errors[cam_to_test] = np.linalg.norm(reprojected.flatten() - original_annot)
-
-    return errors
-
-
-def refine_annotation(
+def snap_annotation(
     app_state: 'AppState',
     target_cam_idx: int,
     point_idx: int,
     frame_idx: int
 ) -> Optional[np.ndarray]:
     """
-    Refines a 2D annotation by triangulating from other views and reprojecting.
+    Refines a 2D annotation by triangulating from other views and reprojecting
 
-    This is used to "snap" a new user click to a more accurate position based
+    This "snaps" a new user click to a (maybe) more accurate position based
     on the consensus of other existing annotations for the same point.
 
     Returns:
         A (2,) numpy array with the refined 2D coordinates, or None if
-        refinement is not possible (e.g., fewer than 2 other views).
+        refinement is not possible (fewer than 2 other views)
     """
+
     with app_state.lock:
-        # Get all annotations for the specific point in the specific frame
+        # all annotations for the specific point in the specific frame
         annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
         best_individual = app_state.best_individual
 
     if best_individual is None:
         return None
 
-    # Identify which cameras have a valid annotation for this point, excluding the target camera
+    # Which cameras have a valid annotation for this point (excluding target camera)
     num_cams = annotations_for_point.shape[0]
     valid_cam_indices = []
     valid_annotations_2d = []
@@ -250,26 +58,25 @@ def refine_annotation(
             valid_cam_indices.append(i)
             valid_annotations_2d.append(annotations_for_point[i])
 
-    # We need at least two other views to triangulate reliably
+    # We need at least 2 other views to triangulate
     if len(valid_cam_indices) < 2:
         return None
 
     valid_annotations_2d = np.array(valid_annotations_2d)
 
-    # Get projection matrices for the valid cameras only
     proj_matrices = np.array([get_projection_matrix(best_individual[i]) for i in valid_cam_indices])
 
-    # The triangulate_points function expects input shape (num_cams, num_points, 2).
-    # Here, we have one point, so we reshape.
+    # triangulate_points expects shape (num_cams, num_points, 2)
+    # Only one point here so reshape
     point_to_triangulate = valid_annotations_2d.reshape(len(valid_cam_indices), 1, 2)
 
-    # The function returns shape (num_points, 3), so we'll get (1, 3)
+    # The function returns shape (num_points, 3), so we get (1, 3)
     point_3d_single = triangulate_points(point_to_triangulate, proj_matrices)
 
     if np.isnan(point_3d_single).any():
         return None
 
-    point_3d = point_3d_single.flatten()  # Shape becomes (3,)
+    point_3d = point_3d_single.flatten()
 
     # Reproject the 3D point back onto the target camera's view
     target_cam_params = best_individual[target_cam_idx]
@@ -278,25 +85,128 @@ def refine_annotation(
     if reprojected_point_2d.size == 0:
         return None
 
-    return reprojected_point_2d.flatten()  # Shape becomes (2,)
+    return reprojected_point_2d.flatten()
 
 
-def update_3d_reconstruction(app_state: 'AppState'):
-    """Reconstruct 3D points for the current frame."""
+def update_annotations_from_3d(
+    app_state: 'AppState',
+    frame_idx: int,
+    final_3d_skeleton_kps: Dict[str, np.ndarray]
+):
+    """
+    Reprojects a final 3D skeleton back to all 2D views to create a corrected
+    set of annotations for the next frame's tracking.
+    """
+    # TODO: This array building not the most efficient, shuld use the functions in mokap
+
+    if not final_3d_skeleton_kps:
+        return
+
+    print(f"[Frame {frame_idx}] Feedback Loop: Correcting 2D annotations based on the final 3D pose.")
 
     with app_state.lock:
-        frame_idx = app_state.frame_idx
-        annotations = app_state.annotations[frame_idx]
-        best_individual = app_state.best_individual
-
-        if best_individual is None:
+        if app_state.best_individual is None:
             return
 
-    proj_matrices = np.array([get_projection_matrix(cam) for cam in best_individual])
-    points_3d = triangulate_points(annotations, proj_matrices)
+        calibration = app_state.best_individual
+        point_names = app_state.point_names
+        num_cams = len(calibration)
+
+        points_to_reproject_3d = []
+        point_indices_in_app_state = []
+        for p_name, pos_3d in final_3d_skeleton_kps.items():
+            if p_name in point_names:
+                points_to_reproject_3d.append(pos_3d)
+                point_indices_in_app_state.append(point_names.index(p_name))
+
+        if not points_to_reproject_3d:
+            return
+
+        points_to_reproject_3d = np.array(points_to_reproject_3d)
+
+        for cam_idx in range(num_cams):
+            # Reproject all points for this camera
+            reprojected_points_2d = reproject_points(points_to_reproject_3d, calibration[cam_idx])
+
+            if reprojected_points_2d.size == 0:
+                continue
+
+            # Update the annotations array
+            for i, p_idx in enumerate(point_indices_in_app_state):
+                # only update if the point was not manually annotated
+                if not app_state.human_annotated[frame_idx, cam_idx, p_idx]:
+                    app_state.annotations[frame_idx, cam_idx, p_idx] = reprojected_points_2d[i]
+                    app_state.human_annotated[frame_idx, cam_idx, p_idx] = False
+
+
+def process_frame(
+        frame_idx: int,
+        app_state: 'AppState',
+        reconstructor: 'Reconstructor',
+        tracker: 'MultiObjectTracker',
+        prev_frames: List[np.ndarray],
+        current_frames: List[np.ndarray]
+):
+    """
+    Runs one full cycle: LK prediction -> mokap correction -> feedback loop.
+    """
+
+    # Prediction
 
     with app_state.lock:
-        app_state.reconstructed_3d_points[frame_idx] = points_3d
+        # annotations_for_frame = app_state.annotations[frame_idx - 1].copy()
+        camera_names = app_state.video_names
+        point_names = app_state.point_names
+
+    # Run LK tracking on the previous frame's data to predict the current frame
+    annotations_after_lk = track_points(
+        app_state, prev_frames, current_frames, frame_idx
+    )
+
+    num_lk_points = np.sum(~np.isnan(annotations_after_lk)) // 2
+    print(f"\n--- [Frame {frame_idx}] ---")
+    print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
+
+    # Mokap reconstruction and assembly
+
+    df_frame = annotations_to_polars(annotations_after_lk, frame_idx, camera_names, point_names)
+    points_soup = reconstructor.reconstruct_frame(
+        df_frame=df_frame,
+        keypoint_names=point_names
+    )
+    print(f"MOKAP RECON:   Input {len(df_frame)} 2D points -> Produced a soup of {len(points_soup)} 3D candidates.")
+
+    active_tracklets = tracker.update(points_soup, frame_idx)
+
+    final_3d_skeleton_kps = None
+    if active_tracklets:
+        best_tracklet = max(active_tracklets, key=lambda t: len(t.skeleton.keypoints))
+        final_3d_skeleton_kps = best_tracklet.skeleton.keypoints
+        num_kps = len(final_3d_skeleton_kps)
+        score = best_tracklet.skeleton.score
+        print(f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints (Score: {score:.2f}).")
+    else:
+        print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
+
+    # Either feedback loop, or fallback to just LK prediction
+
+    if final_3d_skeleton_kps:
+        # Success path: Mokap worked
+        update_annotations_from_3d(app_state, frame_idx, final_3d_skeleton_kps)
+
+        # with app_state.lock:
+        #     annotations_after_correction = app_state.annotations[frame_idx]
+        # diff = np.linalg.norm(annotations_after_lk - annotations_after_correction, axis=-1)
+        # num_updated_points = np.sum(diff > 1e-6)
+        # print(f"[Frame {frame_idx}] Mokap corrected {num_updated_points} points. Average shift: {np.mean(diff)} px."
+
+    else:
+        # Fallback path: Mokap failed, so the raw LK results are returned keep the track alive
+        with app_state.lock:
+            # only update points that were actually part of the track
+            track_mask = ~np.isnan(annotations_after_lk)
+            app_state.annotations[frame_idx][track_mask] = annotations_after_lk[track_mask]
+            app_state.human_annotated[frame_idx] = False  # and mark these as machine-generated
 
 
 # ============================================================================
@@ -308,18 +218,22 @@ def track_points(
         prev_frames: List[np.ndarray],
         current_frames: List[np.ndarray],
         frame_idx: int
-):
-    """Tracks points using 3D guidance and Forward-Backward check, with reprojection confidence."""
+) -> np.ndarray:
+    """Tracks points and returns the new 2D annotations."""
+
     with app_state.lock:
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
-        annotations = app_state.annotations
-        human_annotated = app_state.human_annotated
+
+        # TODO: These copies are probably a but costly but they are good for thread safety. Should profile it.
+        annotations_prev = app_state.annotations[frame_idx - 1].copy()
         prev_points_3d = app_state.reconstructed_3d_points[frame_idx - 1]
         calibration = app_state.best_individual
 
+    annotations_current = np.full_like(annotations_prev, np.nan)
+
     if calibration is None:
-        return
+        return annotations_current  # empty array if no calibration
 
     num_videos = len(current_frames)
 
@@ -327,9 +241,8 @@ def track_points(
         prev_gray = cv2.cvtColor(prev_frames[cam_idx], cv2.COLOR_BGR2GRAY)
         curr_gray = cv2.cvtColor(current_frames[cam_idx], cv2.COLOR_BGR2GRAY)
 
-        # Base the decision to track on the previous 2D annotation's existence
-        p0_2d_prev = annotations[frame_idx - 1, cam_idx, :, :]
-        
+        p0_2d_prev = annotations_prev[cam_idx]
+
         track_mask = ~np.isnan(p0_2d_prev).any(axis=1)
         if focus_mode:
             is_valid = track_mask[selected_idx]
@@ -341,93 +254,87 @@ def track_points(
 
         point_indices_to_track = np.where(track_mask)[0]
 
-        # Calculate reprojection errors from the previous frame to gauge reliability
         prev_frame_reproj_errors = {
             p_idx: calculate_reproj_confidence(app_state, frame_idx - 1, p_idx)
             for p_idx in point_indices_to_track
         }
 
         geometric_predictions = np.full((app_state.num_points, 2), np.nan, dtype=np.float32)
+
         for p_idx in point_indices_to_track:
             if not np.isnan(prev_points_3d[p_idx]).any():
                 reprojected = reproject_points(prev_points_3d[p_idx], calibration[cam_idx])
                 if reprojected.size > 0:
                     geometric_predictions[p_idx] = reprojected.flatten()
 
-        start_points_for_lk = np.where(~np.isnan(geometric_predictions), geometric_predictions, p0_2d_prev)[
-            track_mask].reshape(-1, 1, 2)
-        if start_points_for_lk.size == 0: continue
+        start_points_for_lk = p0_2d_prev[track_mask].reshape(-1, 1, 2)
+        if start_points_for_lk.size == 0:
+            continue
 
-        # Forward pass (prev -> curr)
+        # Look at the errors forward and backwards
         p1_forward, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
             prev_gray, curr_gray, start_points_for_lk, None, **config.LK_PARAMS
         )
 
-        # Backward pass (curr -> prev)
         p0_backward, status_bwd, _ = cv2.calcOpticalFlowPyrLK(
             curr_gray, prev_gray, p1_forward, None, **config.LK_PARAMS
         )
 
-        with app_state.lock:
-            for i, p_idx in enumerate(point_indices_to_track):
-                if human_annotated[frame_idx, cam_idx, p_idx]:
-                    continue
+        for i, p_idx in enumerate(point_indices_to_track):
+            geometric_prediction = geometric_predictions[p_idx]
+            lk_result = p1_forward[i].flatten()
 
-                # Get the two candidates
-                geometric_prediction = geometric_predictions[p_idx] # Candidate A
-                lk_result = p1_forward[i].flatten()                # Candidate B
-                fb_error = np.linalg.norm(start_points_for_lk[i].flatten() - p0_backward[i].flatten())
+            fb_error = np.linalg.norm(start_points_for_lk[i].flatten() - p0_backward[i].flatten())
+            is_lk_successful = status_fwd[i] == 1 and status_bwd[
+                i] == 1 and fb_error < config.FORWARD_BACKWARD_THRESHOLD
 
-                is_lk_successful = status_fwd[i] == 1 and status_bwd[i] == 1 and fb_error < config.FORWARD_BACKWARD_THRESHOLD
+            reproj_error = prev_frame_reproj_errors[p_idx][cam_idx]
+            is_reprojection_reliable = not np.isnan(reproj_error) and reproj_error < config.REPROJ_CONFIDENCE_THRESHOLD
 
-                # Check confidence of the geometric prediction using leave-one-out error
-                reproj_error = prev_frame_reproj_errors[p_idx][cam_idx]
-                is_reprojection_reliable = not np.isnan(
-                    reproj_error) and reproj_error < config.REPROJ_CONFIDENCE_THRESHOLD
+            final_point = np.full(2, np.nan)
+            if is_lk_successful:
+                final_point = lk_result
+            elif is_reprojection_reliable and not np.isnan(geometric_prediction).any():
+                final_point = geometric_prediction
 
-                final_point = np.full(2, np.nan)
-                if is_lk_successful:
-                    final_point = lk_result
-                elif is_reprojection_reliable and not np.isnan(geometric_prediction).any():
-                    final_point = geometric_prediction
+            annotations_current[cam_idx, p_idx] = final_point
 
-                annotations[frame_idx, cam_idx, p_idx] = final_point
-                if not np.isnan(final_point).any():
-                    human_annotated[frame_idx, cam_idx, p_idx] = False
+    return annotations_current
 
 
 # ============================================================================
 # Visualisation
 # ============================================================================
 
-def create_camera_visual(cam_params: Dict[str, Any], label: str) -> List[SceneObject]:
+def create_camera_visual(
+    cam_params: Dict[str, Any],
+    label: str,
+    scene_center: np.ndarray
+) -> List[SceneObject]:
     """Generate 3D visualisation objects for a camera frustum."""
 
     rvec, tvec = cam_params['rvec'], cam_params['tvec']
-    R_w2c, _ = cv2.Rodrigues(rvec)
 
-    # Camera center in world coordinates
-    t_c2w = -R_w2c.T @ tvec.flatten()
-    R_c2w = R_w2c.T
+    R_c2w, _ = cv2.Rodrigues(rvec)
+    camera_center_world = tvec.flatten()
 
+    distance_to_center = np.linalg.norm(camera_center_world - scene_center)
+    scale = distance_to_center * 0.2  # Frustum size = 20% of distance to center
 
-    # cameras are about 100 units away so make frustums about 20 units in size
-    # TODO: This should be automatic
-
-    scale = 20.0
     w, h, depth = 0.3 * scale, 0.2 * scale, 0.5 * scale
 
-    # Frustum pyramid in camera coordinates (camera looks down +Z axis)
+    # Frustum pyramid in local camera coordinates
+    # (OpenCV camera convention is +X right, +Y down, +Z forward)
     pyramid_pts_cam = np.array([
         [0, 0, 0],           # Camera center (pyramid apex)
-        [-w, -h, depth],     # Bottom left of image plane
+        [-w, -h, depth],     # Bottom left of image plane (in camera space)
         [w, -h, depth],      # Bottom right
         [w, h, depth],       # Top right
         [-w, h, depth]       # Top left
     ])
 
-    # Transform to world coords
-    pyramid_pts_world = (R_c2w @ pyramid_pts_cam.T).T + t_c2w
+    # Transform local camera pyramid points into world coordinates
+    pyramid_pts_world = (R_c2w @ pyramid_pts_cam.T).T + camera_center_world
     apex, bl, br, tr, tl = pyramid_pts_world
 
     color = (255, 255, 0)

@@ -1,167 +1,28 @@
 """
 Main entry point for CATAR.
 """
+import queue
 import sys
 import cv2
 import multiprocessing
 import numpy as np
-import tomllib
-from pathlib import Path
-from scipy.optimize import linear_sum_assignment
-import Levenshtein
 import dearpygui.dearpygui as dpg
 
 import config
 from state import AppState, Queues
-from core import create_camera_visual, update_3d_reconstruction
 from gui import create_ui, update_ui, resize_video_widgets
+from utils import load_and_match_videos, get_video_metadata
 from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker
-from viz_3d import SceneVisualizer, SceneObject
+from viz_3d import Open3DVisualizer, SceneObject
+
+from mokap.reconstruction.config import PipelineConfig
+from mokap.reconstruction.anatomy import StatsBootstrapper
+from mokap.reconstruction.reconstruction import Reconstructor
+from mokap.reconstruction.tracking import SkeletonAssembler, MultiObjectTracker
+from mokap.utils import fileio
 
 
-def load_and_match_videos(data_folder: Path, video_format: str):
-    """
-    Load videos and calibration with smart matching
-    Returns: video_paths, video_names, calibration
-    """
-    # TODO: the smart matching should be moved to mokap too
-
-    # Load calibration TOML
-    calib_file = data_folder / 'parameters.toml'
-    if not calib_file.exists():
-        print(f"ERROR: 'parameters.toml' not found in '{data_folder}'")
-        sys.exit(1)
-
-    with calib_file.open("rb") as f:
-        calib_data = tomllib.load(f)
-
-    toml_names = sorted(calib_data.keys())
-    print(f"Found {len(toml_names)} cameras in TOML")
-
-    # Find video files
-    video_paths = sorted(data_folder.glob(video_format))
-    if not video_paths:
-        print(f"ERROR: No videos matching '{video_format}' found in '{data_folder}'")
-        sys.exit(1)
-
-    video_filenames = [p.name for p in video_paths]
-    print(f"Found {len(video_filenames)} video files")
-
-    if len(toml_names) != len(video_paths):
-        print("ERROR: Number of cameras in TOML doesn't match number of videos")
-        sys.exit(1)
-
-    # Match with Levenshtein distance
-    n = len(toml_names)
-    cost_matrix = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            cost_matrix[i, j] = Levenshtein.distance(toml_names[i], video_filenames[j])
-
-    toml_indices, video_indices = linear_sum_assignment(cost_matrix)
-
-    # Build ordered lists
-    ordered_paths = []
-    ordered_names = []
-    calibration = []
-
-    for i, toml_name in enumerate(toml_names):
-        matched_video_idx = video_indices[np.where(toml_indices == i)][0]
-
-        ordered_paths.append(str(video_paths[matched_video_idx]))
-        ordered_names.append(video_filenames[matched_video_idx])
-
-        # Convert TOML calibration to dict
-        cam = calib_data[toml_name]
-        calibration.append({
-            'fx': cam['camera_matrix'][0][0],
-            'fy': cam['camera_matrix'][1][1],
-            'cx': cam['camera_matrix'][0][2],
-            'cy': cam['camera_matrix'][1][2],
-            'dist': np.array(cam['dist_coeffs'], dtype=np.float32),
-            'rvec': np.array(cam['rvec'], dtype=np.float32),
-            'tvec': np.array(cam['tvec'], dtype=np.float32),
-        })
-
-    return ordered_paths, ordered_names, calibration
-
-
-def get_video_metadata(video_path: str) -> dict:
-    """Extract metadata from a video."""
-    # TODO: This is also already implemented in mokap
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"ERROR: Could not open video: {video_path}")
-        sys.exit(1)
-
-    metadata = {
-        'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-        'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-        'num_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
-        'fps': cap.get(cv2.CAP_PROP_FPS)
-    }
-    cap.release()
-    return metadata
-
-
-def _build_scene_for_frame(app_state: AppState):
-    """Build 3D scene for current frame."""
-
-    scene = []
-
-    with app_state.lock:
-        # Add camera visualisations
-        if app_state.show_cameras_in_3d and app_state.best_individual:
-            for i, cam_params in enumerate(app_state.best_individual):
-                scene.extend(
-                    create_camera_visual(cam_params, app_state.video_names[i])
-                )
-
-        # Add reconstructed points and skeleton
-        points_3d = app_state.reconstructed_3d_points[app_state.frame_idx]
-        point_names = app_state.point_names
-        point_colors = app_state.point_colors
-        skeleton = app_state.skeleton
-
-    # Draw points
-    valid_points = 0
-    for i, point in enumerate(points_3d):
-        if not np.isnan(point).any():
-            valid_points += 1
-            color = tuple(point_colors[i])
-            scene.append(SceneObject(
-                type='point',
-                coords=point,
-                color=color,
-                label=point_names[i]
-            ))
-
-            # Debug first point
-            if valid_points == 1:
-                print(f"Adding point '{point_names[i]}' at {point} with color {color}")
-
-            # Draw skeleton
-            for connected_name in skeleton.get(point_names[i], []):
-                try:
-                    j = point_names.index(connected_name)
-                    if not np.isnan(points_3d[j]).any():
-                        scene.append(SceneObject(
-                            type='line',
-                            coords=np.array([point, points_3d[j]]),
-                            color=(128, 128, 128),
-                            label=None
-                        ))
-                except ValueError:
-                    pass
-
-    if valid_points > 0:
-        print(f"3D Scene: {len(scene)} objects, {valid_points} valid keypoints")
-
-    return scene
-
-
-def main_loop(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
+def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer):
     """Main GUI update loop."""
 
     initial_resize_counter = 5
@@ -173,35 +34,16 @@ def main_loop(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
             resize_video_widgets(None, None, {"app_state": app_state})
             initial_resize_counter -= 1
 
-        # Check if 3D reconstruction is needed (like after a new annotation while paused)
-        with app_state.lock:
-            needs_reconstruction = app_state.needs_3d_reconstruction
-            best_individual = app_state.best_individual
-
-        if needs_reconstruction and best_individual:
-            update_3d_reconstruction(app_state)
-            with app_state.lock:
-                app_state.needs_3d_reconstruction = False
-
-            # Build and update 3D scene
-            scene = _build_scene_for_frame(app_state)
-            scene_viz.draw_scene(scene)
-
-        # 3D visualisation updates (must be done from main thread)
-        if not scene_viz.process_3d_updates():
-            # 3D window was closed, try refresh on next update
-            pass
+        # 3D visualisation updates (this has to be done from main thread)
+        open3d_viz.process_updates()
 
         # Process rendered frames from rendering worker
         try:
             processed = queues.results.get_nowait()
-
-            # Update video textures
             for i, frame_bgr in enumerate(processed['video_frames_bgr']):
                 rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
                 dpg.set_value(f"video_texture_{i}", rgba.ravel())
-
-        except Exception:
+        except queue.Empty:
             pass
 
         # Process batch tracking progress
@@ -216,7 +58,7 @@ def main_loop(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
             elif progress['status'] == 'complete':
                 dpg.hide_item("batch_track_popup")
                 app_state.frame_idx = progress['final_frame']
-        except Exception:
+        except queue.Empty:
             pass
 
         # Update UI with current state
@@ -227,7 +69,6 @@ def main_loop(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
 
 def main():
 
-    # Ensure data folder exists
     if not config.DATA_FOLDER.exists():
         config.DATA_FOLDER.mkdir(parents=True)
         print(f"Created '{config.DATA_FOLDER}' directory. Please add videos and calibration.")
@@ -243,6 +84,81 @@ def main():
     metadata = get_video_metadata(video_paths[0])
     metadata['num_videos'] = len(video_paths)
 
+    # Initialise mokap config
+    print("Initializing mokap pipeline configuration...")
+    mokap_config = PipelineConfig()
+
+    # Load skeleton definition
+    bones_list = [(k, v_i) for k, v in config.SKELETON_CONFIG['skeleton'].items() for v_i in v]
+
+    # Load (or bootstrap) anatomical stats
+    print("Loading/Bootstrapping anatomical stats...")
+    stats_output_file = config.DATA_FOLDER / 'bone_stats.json'
+    bootstrapper = StatsBootstrapper(
+        output_path=stats_output_file,
+        bones_list=bones_list,
+        symmetry_map=config.SKELETON_CONFIG['symmetry_map'],
+        bootstrap_data=None,  # we are not bootstrapping from data yet...
+        config=mokap_config.anatomy
+    )
+
+    try:
+        bone_stats = bootstrapper.get_initial_stats()
+        print(f"Successfully loaded bone stats. Reference bone: {bone_stats['reference_bone']}")
+    except ValueError as e:
+        print(f"\n[ERROR] Could not get bone statistics: {e}")
+        print("Please provide a 'bone_stats.json' or a prior file (bone_lengths.csv) in tthe 'data' folder.")
+
+        # make a dummy bone_lengths.csv if it doesn't exist
+        prior_file = config.DATA_FOLDER / 'bone_lengths.csv'
+        if not prior_file.exists():
+            with open(prior_file, 'w') as f:
+                f.write("bone,length\n")
+                f.write("thorax-neck,1.0\n")  # dummy bone
+            print(f"Created a dummy bone stats file at '{prior_file}'. Please edit it with your measurements.")
+        sys.exit(1)
+
+    # Define the 3D volume of interest (same units as the calibration, like mm)
+    volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}
+    scene_centre = np.vstack([b for b in volume_bounds.values()]).mean(axis=1)
+    print(f"Using 3D volume bounds: {volume_bounds}")
+
+    # Mokap expects the camera parameters in a certain way
+    mokap_calibration = {}
+    for cam_name, catar_cal in zip(video_names, calibration):
+        K = np.array([
+            [catar_cal['fx'], 0.0, catar_cal['cx']],
+            [0.0, catar_cal['fy'], catar_cal['cy']],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+        mokap_calibration[cam_name] = {
+            'camera_matrix': K,
+            'dist_coeffs': np.array(catar_cal['dist'], dtype=np.float32),
+            'rvec': np.array(catar_cal['rvec'], dtype=np.float32),
+            'tvec': np.array(catar_cal['tvec'], dtype=np.float32)
+        }
+
+    # Instantiate the Reconstructor
+    print("Initializing 3D Reconstructor...")
+    reconstructor = Reconstructor(
+        camera_parameters=mokap_calibration,
+        volume_bounds=volume_bounds,
+        config=mokap_config.reconstruction
+    )
+
+    # Instantiate the Skeleton Assembler and Multi-Object Tracker
+    print("Initializing Skeleton Assembler and Tracker...")
+    assembler = SkeletonAssembler(
+        bones_list=bones_list,
+        bone_stats=bone_stats,
+        assembler_config=mokap_config.assembler,
+        tracker_config=mokap_config.tracker
+    )
+    tracker = MultiObjectTracker(
+        assembler=assembler,
+        config=mokap_config.tracker
+    )
+
     # Initialise application state
     app_state = AppState(metadata, config.SKELETON_CONFIG)
     app_state.video_names = video_names
@@ -253,7 +169,7 @@ def main():
     queues = Queues()
 
     # Initialise 3D scene visualiser
-    scene_viz = SceneVisualizer(frame_size=(config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT))
+    open3d_viz = Open3DVisualizer()
 
     # Create worker threads/processes
     workers = [
@@ -265,6 +181,8 @@ def main():
         ),
         TrackingWorker(
             app_state,
+            reconstructor,
+            tracker,
             queues.frames_for_tracking,
             queues.tracking_progress,
             video_paths,
@@ -272,7 +190,10 @@ def main():
         ),
         RenderingWorker(
             app_state,
-            scene_viz,
+            open3d_viz,
+            scene_centre,
+            reconstructor,
+            tracker,
             queues.frames_for_rendering,
             queues.results
         ),
@@ -283,12 +204,13 @@ def main():
     for worker in workers:
         worker.start()
 
-    # Create UI
-    create_ui(app_state, queues, scene_viz)
+    # Create all UI
+    create_ui(app_state, queues, open3d_viz)
 
-    # Run main loop
+    # all done, run main loop:
     try:
-        main_loop(app_state, queues, scene_viz)
+        main_loop(app_state, queues, open3d_viz)
+
     finally:
         # Shutdown
         print("Shutting down...")

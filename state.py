@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
-from core import calculate_fundamental_matrices
+from utils import calculate_fundamental_matrices
 
 
 @dataclass

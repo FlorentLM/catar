@@ -10,9 +10,12 @@ import numpy as np
 from typing import List
 
 import config
-from core import track_points, update_3d_reconstruction, create_camera_visual, run_genetic_step
+from core import create_camera_visual, run_genetic_step, process_frame
 from state import AppState
-from viz_3d import SceneVisualizer, SceneObject
+from viz_3d import Open3DVisualizer, SceneObject
+
+from mokap.reconstruction.reconstruction import Reconstructor
+from mokap.reconstruction.tracking import MultiObjectTracker
 
 
 class VideoReaderWorker(threading.Thread):
@@ -149,6 +152,8 @@ class TrackingWorker(threading.Thread):
     def __init__(
         self,
         app_state: AppState,
+        reconstructor: Reconstructor,
+        tracker: MultiObjectTracker,
         frames_in_queue: queue.Queue,
         progress_out_queue: queue.Queue,
         video_paths: List[str],
@@ -156,6 +161,8 @@ class TrackingWorker(threading.Thread):
     ):
         super().__init__(daemon=True, name="TrackingWorker")
         self.app_state = app_state
+        self.reconstructor = reconstructor
+        self.tracker = tracker
         self.frames_in_queue = frames_in_queue
         self.progress_out_queue = progress_out_queue
         self.video_paths = video_paths
@@ -196,27 +203,30 @@ class TrackingWorker(threading.Thread):
 
     def _process_frame(self, data: dict):
         """Process a single frame for tracking."""
+        frame_idx = data["frame_idx"]
 
         with self.app_state.lock:
             is_tracking_enabled = self.app_state.keypoint_tracking_enabled
 
+        # runs entire LK -> Mokap -> Feedback loop
         if is_tracking_enabled and data["was_sequential"] and self.prev_frames:
-            track_points(
+            print(f"[Frame {frame_idx}] TrackingWorker: Running full processing pipeline.")
+            process_frame(
+                frame_idx,
                 self.app_state,
+                self.reconstructor,
+                self.tracker,
                 self.prev_frames,
-                data["raw_frames"],
-                data["frame_idx"]
+                data["raw_frames"]
             )
 
         self.prev_frames = data["raw_frames"]
         self.prev_frame_idx = data["frame_idx"]
 
     def _run_batch_tracking(self, start_frame: int):
-        """Track points forward from start_frame to end of video."""
-
+        """Track points forward using the full feedback loop on every frame."""
         print(f"Starting batch track from frame {start_frame}...")
 
-        # Open video captures
         caps = [cv2.VideoCapture(path) for path in self.video_paths]
         if not all(cap.isOpened() for cap in caps):
             print("Batch track error: Could not open videos.")
@@ -242,24 +252,27 @@ class TrackingWorker(threading.Thread):
             if not all(f is not None for f in current_frames):
                 break
 
-            # Perform tracking
-            track_points(self.app_state, prev_frames, current_frames, frame_idx)
+
+            # This single call does LK prediction and mokap correction
+            process_frame(
+                frame_idx,
+                self.app_state,
+                self.reconstructor,
+                self.tracker,
+                prev_frames,
+                current_frames
+            )
+
             prev_frames = current_frames
 
             # Report progress
             if i % 5 == 0:
                 self.progress_out_queue.put({
-                    "status": "running",
-                    "progress": i / total_to_process,
-                    "current_frame": frame_idx,
-                    "total_frames": num_frames
+                    "status": "running", "progress": i / total_to_process,
+                    "current_frame": frame_idx, "total_frames": num_frames
                 })
 
-        # Complete
-        self.progress_out_queue.put({
-            "status": "complete",
-            "final_frame": num_frames - 1
-        })
+        self.progress_out_queue.put({"status": "complete", "final_frame": num_frames - 1})
         self._cleanup_captures(caps)
         print("Batch track complete.")
 
@@ -286,13 +299,19 @@ class RenderingWorker(threading.Thread):
     def __init__(
         self,
         app_state: AppState,
-        scene_visualizer: SceneVisualizer,
+        open3d_viz: Open3DVisualizer,
+        scene_centre: np.ndarray,
+        reconstructor: Reconstructor,
+        tracker: MultiObjectTracker,
         frames_in_queue: queue.Queue,
         results_out_queue: queue.Queue,
     ):
         super().__init__(daemon=True, name="RenderingWorker")
         self.app_state = app_state
-        self.scene_visualizer = scene_visualizer
+        self.open3d_viz = open3d_viz
+        self.scene_centre = scene_centre
+        self.reconstructor = reconstructor
+        self.tracker = tracker
         self.frames_in_queue = frames_in_queue
         self.results_out_queue = results_out_queue
         self.shutdown_event = threading.Event()
@@ -319,27 +338,16 @@ class RenderingWorker(threading.Thread):
         print("Rendering worker shut down.")
 
     def _render_frame(self, data: dict):
-        """Render a complete frame with 3D scene."""
+        """Renders the current state for visualisation without modifying it."""
 
-        # Update 3D reconstruction if needed
         with self.app_state.lock:
-            needs_reconstruction = self.app_state.needs_3d_reconstruction
-            best_individual = self.app_state.best_individual
-            frame_idx = self.app_state.frame_idx
+            # frame_idx = self.app_state.frame_idx
+
+            # Cache the raw video frames for the loupe tool
             self.app_state.current_video_frames = data["raw_frames"]
 
-        if needs_reconstruction:
-            print(f"Rendering worker: Triggering 3D reconstruction for frame {frame_idx}")
-            if best_individual:
-                update_3d_reconstruction(self.app_state)
-                with self.app_state.lock:
-                    self.app_state.needs_3d_reconstruction = False
-            else:
-                print("Rendering worker: No calibration available, skipping reconstruction")
-
-        # Prepare and render 3D scene
         scene = self._build_3d_scene()
-        self.scene_visualizer.draw_scene(scene)
+        self.open3d_viz.queue_update(scene)
 
         # Resize all frames to display size
         video_frames = [
@@ -347,7 +355,7 @@ class RenderingWorker(threading.Thread):
             for frame in data["raw_frames"]
         ]
 
-        # Send to GUI
+        # Send to GUI for display
         self._send_results({
             'frame_idx': data['frame_idx'],
             'video_frames_bgr': video_frames,
@@ -355,6 +363,7 @@ class RenderingWorker(threading.Thread):
 
     def _build_3d_scene(self) -> List[SceneObject]:
         """Build list of 3D objects to render."""
+
         scene = []
 
         with self.app_state.lock:
@@ -362,7 +371,7 @@ class RenderingWorker(threading.Thread):
             if self.app_state.show_cameras_in_3d and self.app_state.best_individual:
                 for i, cam_params in enumerate(self.app_state.best_individual):
                     scene.extend(
-                        create_camera_visual(cam_params, self.app_state.video_names[i])
+                        create_camera_visual(cam_params, self.app_state.video_names[i], self.scene_centre)
                     )
 
             # Add reconstructed points and skeleton
@@ -386,9 +395,9 @@ class RenderingWorker(threading.Thread):
                     label=point_names[i]
                 ))
 
-                # Debug: print 1st point
-                if valid_points == 1:
-                    print(f"Adding point '{point_names[i]}' at {point} with color {color}")
+                # # Debug: print 1st point
+                # if valid_points == 1:
+                #     print(f"Adding point '{point_names[i]}' at {point} with color {color}")
 
                 # Draw skeleton connections
                 for connected_name in skeleton.get(point_names[i], []):
@@ -404,9 +413,9 @@ class RenderingWorker(threading.Thread):
                     except ValueError:
                         pass
 
-        # Debug: Print scene info sometimes
-        if self.app_state.frame_idx % 30 == 0:  # every 30 frames
-            print(f"3D Scene: {len(scene)} objects, {valid_points} valid keypoints")
+        # # Debug: Print scene info sometimes
+        # if self.app_state.frame_idx % 30 == 0:  # every 30 frames
+        #     print(f"3D Scene: {len(scene)} objects, {valid_points} valid keypoints")
 
         return scene
 

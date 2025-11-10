@@ -7,15 +7,16 @@ import numpy as np
 
 import config
 from state import AppState, Queues
-from viz_3d import SceneVisualizer
-from core import reproject_points, refine_annotation
+from viz_3d import Open3DVisualizer
+from core import snap_annotation
+from utils import reproject_points, line_box_intersection
 
 
 # ============================================================================
 # Main UI
 # ============================================================================
 
-def create_ui(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
+def create_ui(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer):
     """Create the main DearPyGUI window."""
 
     dpg.create_context()
@@ -55,9 +56,9 @@ def create_ui(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
         ):
             with dpg.group(horizontal=True):
                 with dpg.child_window(width=config.CONTROL_PANEL_WIDTH, tag="control_panel_window"):
-                    _create_control_panel(app_state, queues)
+                    _create_control_panel(app_state, queues, open3d_viz)
                 with dpg.child_window(width=-1, tag="video_grid_window"):
-                    _create_video_grid(app_state, scene_viz, queues)
+                    _create_video_grid(app_state)
 
         with dpg.child_window(tag="bottom_panel_window", height=config.BOTTOM_PANEL_HEIGHT_FULL):
             _create_bottom_panel(app_state)
@@ -82,7 +83,6 @@ def create_ui(app_state: AppState, queues: Queues, scene_viz: SceneVisualizer):
 
 def _create_textures(video_meta: dict):
     """Create GPU textures for video frames and 3D view."""
-    # TODO: Replace the 3D view by a proper 3D plot... maybe need to ditch DPG?
 
     with dpg.texture_registry():
         # Video textures
@@ -171,7 +171,7 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
             )
 
 
-def _create_control_panel(app_state: AppState, queues: Queues):
+def _create_control_panel(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer):
     """Create left control panel."""
 
     user_data = {"app_state": app_state, "queues": queues}
@@ -180,6 +180,13 @@ def _create_control_panel(app_state: AppState, queues: Queues):
     dpg.add_text("Focus Mode: Disabled", tag="focus_text")
     dpg.add_text("Calibration Frames: 0", tag="num_calib_frames_text")
     dpg.add_text("Best Fitness: inf", tag="fitness_text")
+    dpg.add_separator()
+
+    dpg.add_text("--- 3D View ---")
+    dpg.add_button(
+        label="Refresh 3D View",
+        callback=lambda: open3d_viz.reset_view()
+    )
     dpg.add_separator()
 
     dpg.add_text("--- Controls ---")
@@ -307,11 +314,11 @@ def _create_bottom_panel(app_state: AppState):
     dpg.bind_item_handler_registry("annotation_plot", "histogram_handler")
 
 
-def _create_video_grid(app_state: AppState, scene_viz: SceneVisualizer, queues: Queues):
-    """Create grid of videos and 3D view."""
+def _create_video_grid(app_state: AppState):
+    """Create grid of videos."""
 
     num_videos = app_state.video_metadata['num_videos']
-    num_items = num_videos + 1
+    num_items = num_videos
 
     with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingStretchProp):
         for _ in range(config.GRID_COLS):
@@ -326,8 +333,6 @@ def _create_video_grid(app_state: AppState, scene_viz: SceneVisualizer, queues: 
 
                     if idx < num_videos:
                         _create_video_cell(idx, app_state)
-                    elif idx == num_videos:
-                        _create_3d_view_cell(scene_viz)
 
 
 def _create_video_cell(cam_idx: int, app_state: AppState):
@@ -354,21 +359,6 @@ def _create_video_cell(cam_idx: int, app_state: AppState):
                 user_data={"cam_idx": cam_idx, "app_state": app_state}
             )
         dpg.bind_item_handler_registry(f"drawlist_{cam_idx}", f"image_handler_{cam_idx}")
-
-
-def _create_3d_view_cell(scene_viz: SceneVisualizer):
-    """Create 3D visualisation cell."""
-    # TODO: Get rid of this cell probably
-
-    with dpg.table_cell():
-        dpg.add_text("3D Projection")
-        dpg.add_text("")
-        dpg.add_text("3D view opens in a separate window", color=(255, 255, 0))
-        dpg.add_text("")
-        dpg.add_button(
-            label="Refresh 3D View",
-            callback=lambda: scene_viz.reset_view()
-        )
 
 
 def _create_ga_popup(app_state: AppState, queues: Queues):
@@ -672,24 +662,21 @@ def _image_mouse_down_callback(sender, app_data, user_data):
                     "active": True
                 }
             else:
-                # Reprojection-assisted annotation
+                # Reprojection-assisted annotation (snapping)
 
-                # Attempt to refine the click using other views before creating the point
-                refined_pos = refine_annotation(app_state, cam_idx, p_idx, frame_idx)
-
-                # Use the refined position if available, otherwise use the user's click
-                final_pos = refined_pos if refined_pos is not None else scaled_pos
-                if refined_pos is not None:
-                    print(f"Snapped new annotation for '{app_state.point_names[p_idx]}' using reprojection.")
+                snapped_pos = snap_annotation(app_state, cam_idx, p_idx, frame_idx)
+                final_pos = snapped_pos if snapped_pos is not None else scaled_pos
+                # if snapped_pos is not None:
+                #     print(f"Snapped new annotation for '{app_state.point_names[p_idx]}' using reprojection.")
 
                 # Create new point
                 app_state.annotations[frame_idx, cam_idx, p_idx] = final_pos
 
                 app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
                 app_state.needs_3d_reconstruction = True
-                print(f"Created new annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}, pos {final_pos}")
+                # print(f"Created new annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}, pos {final_pos}")
 
-                # Allow dragging immediately
+                # allow dragging immediately
                 app_state.drag_state = {
                     "cam_idx": cam_idx,
                     "p_idx": p_idx,
@@ -704,44 +691,7 @@ def _image_mouse_down_callback(sender, app_data, user_data):
             app_state.annotations[frame_idx, cam_idx, p_idx] = np.nan
             app_state.human_annotated[frame_idx, cam_idx, p_idx] = False
             app_state.needs_3d_reconstruction = True
-            print(f"Deleted annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}")
-
-
-def line_box_intersection(a: float, b: float, c: float, box_x: float, box_y: float, box_w: float, box_h: float) -> list:
-    """
-    Calculates the two intersection points of a line (ax + by + c = 0) with a rectangle.
-    """
-    intersections = []
-
-    # Top edge (y = box_y)
-    if abs(a) > 1e-9:
-        x = (-c - b * box_y) / a
-        if box_x <= x <= box_x + box_w:
-            intersections.append((x, box_y))
-
-    # Bottom edge (y = box_y + box_h)
-    if abs(a) > 1e-9:
-        x = (-c - b * (box_y + box_h)) / a
-        if box_x <= x <= box_x + box_w:
-            intersections.append((x, box_y + box_h))
-
-    # Left edge (x = box_x)
-    if abs(b) > 1e-9:
-        y = (-c - a * box_x) / b
-        if box_y <= y <= box_y + box_h:
-            intersections.append((box_x, y))
-
-    # Right edge (x = box_x + box_w)
-    if abs(b) > 1e-9:
-        y = (-c - a * (box_x + box_w)) / b
-        if box_y <= y <= box_y + box_h:
-            if box_y <= y <= box_y + box_h:
-                intersections.append((box_x + box_w, y))
-
-    # Remove duplicate points (can happen at corners)
-    unique_points = sorted(list(set(intersections)))
-
-    return unique_points
+            # print(f"Deleted annotation: {app_state.point_names[p_idx]} at frame {frame_idx}, camera {cam_idx}")
 
 
 def _image_drag_callback(sender, app_data, user_data):
