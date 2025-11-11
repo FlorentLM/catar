@@ -71,7 +71,12 @@ class VideoReaderWorker(threading.Thread):
             with self.app_state.lock:
                 current_frame_idx = self.app_state.frame_idx
                 is_paused = self.app_state.paused
+                is_seeking = self.app_state.is_seeking
                 num_frames = self.app_state.video_metadata['num_frames']
+
+            if is_seeking:
+                time.sleep(0.01)  # Prevent busy-waiting
+                continue
 
             # Read frames only if index changed
             if current_frame_idx != prev_frame_idx:

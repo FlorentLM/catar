@@ -67,6 +67,7 @@ class AppState:
         # Playback state
         self.frame_idx: int = 0
         self.paused: bool = True
+        self.is_seeking: bool = False
 
         # UI state
         self.selected_point_idx: int = 0

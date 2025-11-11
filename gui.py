@@ -462,7 +462,7 @@ def _register_handlers(app_state: AppState, queues: Queues):
         )
         dpg.add_mouse_release_handler(
             button=dpg.mvMouseButton_Left,
-            callback=_image_release_callback,
+            callback=_leftclick_release_callback,
             user_data=user_data
         )
 
@@ -505,6 +505,7 @@ def _set_frame_callback(sender, app_data, user_data):
         return
 
     with app_state.lock:
+        app_state.is_seeking = True
         app_state.paused = True
         num_frames = app_state.video_metadata['num_frames']
         if 0 <= new_frame_idx < num_frames:
@@ -850,24 +851,27 @@ def _image_drag_callback(sender, app_data, user_data):
     dpg.configure_item("loupe_window", pos=final_loupe_pos)
 
 
-def _image_release_callback(sender, app_data, user_data):
-    """Finish drag operation."""
+def _leftclick_release_callback(sender, app_data, user_data):
+    """Finish annotation drag operation and timeline seeking."""
 
     app_state = user_data["app_state"]
 
     with app_state.lock:
-        if not app_state.drag_state.get("active"):
-            return
+        # Check if an annotation drag was active and finalize it
+        if app_state.drag_state.get("active"):
+            frame_idx = app_state.frame_idx
+            cam_idx = app_state.drag_state["cam_idx"]
+            p_idx = app_state.drag_state["p_idx"]
 
-        frame_idx = app_state.frame_idx
-        cam_idx = app_state.drag_state["cam_idx"]
-        p_idx = app_state.drag_state["p_idx"]
+            app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
+            app_state.needs_3d_reconstruction = True
+            app_state.drag_state = {}
 
-        app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
-        app_state.needs_3d_reconstruction = True
-        app_state.drag_state = {}
+            dpg.hide_item("loupe_window")  # Hide the loupe
 
-    dpg.hide_item("loupe_window")  # Hide the loupe
+        # Check if a seeking operation was active and finalize it
+        if app_state.is_seeking:
+            app_state.is_seeking = False
 
 
 # ============================================================================
