@@ -25,7 +25,7 @@ def annotations_to_polars(annotations_slice, frame_idx, camera_names, point_name
                     "keypoint": point_names[p],
                     "x": annotations_slice[c, p, 0],
                     "y": annotations_slice[c, p, 1],
-                    "score": 1.0,  # manual/good annotations have high confidence
+                    "score": annotations_slice[c, p, 2],
                 })
     if not rows:
         return pl.DataFrame(schema={'frame': pl.Int64, 'camera': pl.Utf8, 'keypoint': pl.Utf8, 'x': pl.Float64, 'y': pl.Float64, 'score': pl.Float64})

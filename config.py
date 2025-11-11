@@ -28,6 +28,10 @@ LK_PARAMS = dict(
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01)
 )
 
+# If an LK-tracked point deviates from the multi-view geometric consensus by more
+# than this many pixels, it is considered to be drifting and is invalidated.
+LK_CONFIDENCE_MAX_ERROR = 7.5  # in pixels
+
 # If a reprojection error (leave-one-out) is higher than this,
 # it is considered unreliable and will not be used as a fallback.
 REPROJ_CONFIDENCE_THRESHOLD = 5.0  # in pixels

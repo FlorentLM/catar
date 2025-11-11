@@ -13,7 +13,7 @@ from state import AppState, Queues
 from gui import create_ui, update_ui, resize_video_widgets
 from utils import load_and_match_videos, get_video_metadata
 from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker
-from viz_3d import Open3DVisualizer, SceneObject
+from viz_3d import Open3DVisualizer
 
 from mokap.reconstruction.config import PipelineConfig
 from mokap.reconstruction.anatomy import StatsBootstrapper

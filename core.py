@@ -4,6 +4,7 @@ Core algos for tracking and calibration (and some stuff for visualisation)
 import random
 import cv2
 import numpy as np
+from itertools import combinations
 from typing import List, Dict, Any, Optional
 
 from utils import annotations_to_polars, get_projection_matrix, reproject_points, undistort_points, triangulate_points, \
@@ -148,28 +149,22 @@ def process_frame(
         current_frames: List[np.ndarray]
 ):
     """
-    Runs one full cycle: LK prediction -> mokap correction -> feedback loop.
+    Runs one full cycle: LK prediction -> mokap correction -> feedback
     """
-
-    # Prediction
-
     with app_state.lock:
-        # annotations_for_frame = app_state.annotations[frame_idx - 1].copy()
         camera_names = app_state.video_names
         point_names = app_state.point_names
 
-    # Run LK tracking on the previous frame's data to predict the current frame
-    annotations_after_lk = track_points(
+    # Get geometric prediction and confidence score from LK tracking
+    annotations_from_lk = track_points(
         app_state, prev_frames, current_frames, frame_idx
     )
-
-    num_lk_points = np.sum(~np.isnan(annotations_after_lk)) // 2
+    num_lk_points = np.sum(~np.isnan(annotations_from_lk[..., 0]))
     print(f"\n--- [Frame {frame_idx}] ---")
     print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
 
-    # Mokap reconstruction and assembly
-
-    df_frame = annotations_to_polars(annotations_after_lk, frame_idx, camera_names, point_names)
+    # Run Mokap reconstruction using the LK results and their confidence score
+    df_frame = annotations_to_polars(annotations_from_lk, frame_idx, camera_names, point_names)
     points_soup = reconstructor.reconstruct_frame(
         df_frame=df_frame,
         keypoint_names=point_names
@@ -188,25 +183,55 @@ def process_frame(
     else:
         print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
 
-    # Either feedback loop, or fallback to just LK prediction
+    # feedback loop
+    with app_state.lock:
+        if app_state.annotations.shape[3] != 3:
+            old_annotations = app_state.annotations
+            app_state.annotations = np.full(
+                (old_annotations.shape[0], old_annotations.shape[1], old_annotations.shape[2], 3), np.nan,
+                dtype=np.float32)
 
-    if final_3d_skeleton_kps:
-        # Success path: Mokap worked
-        update_annotations_from_3d(app_state, frame_idx, final_3d_skeleton_kps)
+            app_state.annotations[..., :2] = old_annotations
+            app_state.annotations[..., 2] = 1.0  # default confidence for old data
 
-        # with app_state.lock:
-        #     annotations_after_correction = app_state.annotations[frame_idx]
-        # diff = np.linalg.norm(annotations_after_lk - annotations_after_correction, axis=-1)
-        # num_updated_points = np.sum(diff > 1e-6)
-        # print(f"[Frame {frame_idx}] Mokap corrected {num_updated_points} points. Average shift: {np.mean(diff)} px."
+        if final_3d_skeleton_kps:
+            calibration = app_state.best_individual
+            num_cams = len(calibration)
+            points_to_reproject_3d, p_indices = [], []
 
-    else:
-        # Fallback path: Mokap failed, so the raw LK results are returned keep the track alive
-        with app_state.lock:
-            # only update points that were actually part of the track
-            track_mask = ~np.isnan(annotations_after_lk)
-            app_state.annotations[frame_idx][track_mask] = annotations_after_lk[track_mask]
-            app_state.human_annotated[frame_idx] = False  # and mark these as machine-generated
+            for p_name, pos_3d in final_3d_skeleton_kps.items():
+                if p_name in point_names:
+                    points_to_reproject_3d.append(pos_3d)
+                    p_indices.append(point_names.index(p_name))
+
+            points_to_reproject_3d = np.array(points_to_reproject_3d)
+            annotations_from_model = np.full_like(app_state.annotations[frame_idx], np.nan)
+
+            if points_to_reproject_3d.size > 0:
+                for cam_idx in range(num_cams):
+                    reprojected_2d = reproject_points(points_to_reproject_3d, calibration[cam_idx])
+                    if reprojected_2d.size > 0:
+                        for i, p_idx in enumerate(p_indices):
+                            # Rescued points get a fixed (medium high) confidence score
+                            annotations_from_model[cam_idx, p_idx] = [*reprojected_2d[i], 0.75]
+
+            final_annotations = np.where(
+                ~np.isnan(annotations_from_lk[..., 0, np.newaxis]),
+                annotations_from_lk,
+                annotations_from_model
+            )
+
+            app_state.annotations[frame_idx] = final_annotations
+            app_state.human_annotated[frame_idx] = False
+
+        else:
+            # Fallback path: Mokap failed. Keep only the successful LK tracks.
+            # Create a mask for where to copy
+            mask = ~np.isnan(annotations_from_lk[..., 0])
+            app_state.annotations[frame_idx][mask] = annotations_from_lk[mask]
+            # Set confidence to NaN where LK failed
+            app_state.annotations[frame_idx][~mask, 2] = np.nan
+            app_state.human_annotated[frame_idx] = False
 
 
 # ============================================================================
@@ -219,31 +244,32 @@ def track_points(
         current_frames: List[np.ndarray],
         frame_idx: int
 ) -> np.ndarray:
-    """Tracks points and returns the new 2D annotations."""
-
+    """
+    Tracks points and returns new 2D annotations.
+    (onfidence score based on (sort of) RANSAC-like multi-view consistency)
+    """
     with app_state.lock:
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
-
-        # TODO: These copies are probably a but costly but they are good for thread safety. Should profile it.
-        annotations_prev = app_state.annotations[frame_idx - 1].copy()
-        prev_points_3d = app_state.reconstructed_3d_points[frame_idx - 1]
+        annotations_prev = app_state.annotations[frame_idx - 1][..., :2].copy()
         calibration = app_state.best_individual
 
-    annotations_current = np.full_like(annotations_prev, np.nan)
+    output_annotations = np.full((annotations_prev.shape[0], annotations_prev.shape[1], 3), np.nan, dtype=np.float32)
 
     if calibration is None:
-        return annotations_current  # empty array if no calibration
+        return output_annotations
 
     num_videos = len(current_frames)
+    proj_matrices = [get_projection_matrix(cam) for cam in calibration]
+    raw_lk_coords = np.full_like(annotations_prev, np.nan)
 
+    # Run LK Optic flow
     for cam_idx in range(num_videos):
         prev_gray = cv2.cvtColor(prev_frames[cam_idx], cv2.COLOR_BGR2GRAY)
         curr_gray = cv2.cvtColor(current_frames[cam_idx], cv2.COLOR_BGR2GRAY)
-
         p0_2d_prev = annotations_prev[cam_idx]
-
         track_mask = ~np.isnan(p0_2d_prev).any(axis=1)
+
         if focus_mode:
             is_valid = track_mask[selected_idx]
             track_mask[:] = False
@@ -251,55 +277,93 @@ def track_points(
 
         if not np.any(track_mask):
             continue
-
+        start_points_for_lk = p0_2d_prev[track_mask].reshape(-1, 1, 2)
         point_indices_to_track = np.where(track_mask)[0]
 
-        prev_frame_reproj_errors = {
-            p_idx: calculate_reproj_confidence(app_state, frame_idx - 1, p_idx)
-            for p_idx in point_indices_to_track
-        }
-
-        geometric_predictions = np.full((app_state.num_points, 2), np.nan, dtype=np.float32)
-
-        for p_idx in point_indices_to_track:
-            if not np.isnan(prev_points_3d[p_idx]).any():
-                reprojected = reproject_points(prev_points_3d[p_idx], calibration[cam_idx])
-                if reprojected.size > 0:
-                    geometric_predictions[p_idx] = reprojected.flatten()
-
-        start_points_for_lk = p0_2d_prev[track_mask].reshape(-1, 1, 2)
         if start_points_for_lk.size == 0:
             continue
 
-        # Look at the errors forward and backwards
-        p1_forward, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
-            prev_gray, curr_gray, start_points_for_lk, None, **config.LK_PARAMS
-        )
+        # Froward and backward test
+        p1_forward, status_fwd, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, start_points_for_lk, None,
+                                                             **config.LK_PARAMS)
 
-        p0_backward, status_bwd, _ = cv2.calcOpticalFlowPyrLK(
-            curr_gray, prev_gray, p1_forward, None, **config.LK_PARAMS
-        )
+        p0_backward, status_bwd, _ = cv2.calcOpticalFlowPyrLK(curr_gray, prev_gray, p1_forward, None,
+                                                              **config.LK_PARAMS)
 
         for i, p_idx in enumerate(point_indices_to_track):
-            geometric_prediction = geometric_predictions[p_idx]
-            lk_result = p1_forward[i].flatten()
+            fb_error = np.linalg.norm(start_points_for_lk[i] - p0_backward[i])
 
-            fb_error = np.linalg.norm(start_points_for_lk[i].flatten() - p0_backward[i].flatten())
             is_lk_successful = status_fwd[i] == 1 and status_bwd[
                 i] == 1 and fb_error < config.FORWARD_BACKWARD_THRESHOLD
 
-            reproj_error = prev_frame_reproj_errors[p_idx][cam_idx]
-            is_reprojection_reliable = not np.isnan(reproj_error) and reproj_error < config.REPROJ_CONFIDENCE_THRESHOLD
-
-            final_point = np.full(2, np.nan)
             if is_lk_successful:
-                final_point = lk_result
-            elif is_reprojection_reliable and not np.isnan(geometric_prediction).any():
-                final_point = geometric_prediction
+                raw_lk_coords[cam_idx, p_idx] = p1_forward[i].flatten()
 
-            annotations_current[cam_idx, p_idx] = final_point
+    # Confidence scoring
+    for p_idx in range(app_state.num_points):
 
-    return annotations_current
+        for cam_idx_to_check in range(num_videos):
+            point_to_check = raw_lk_coords[cam_idx_to_check, p_idx]
+
+            if np.isnan(point_to_check).any():
+                continue
+
+            peer_cam_indices = []
+            peer_annotations_2d = []
+
+            for i in range(num_videos):
+                if i == cam_idx_to_check:
+                    continue
+
+                peer_point = raw_lk_coords[i, p_idx]
+
+                if not np.isnan(peer_point).any():
+                    peer_cam_indices.append(i)
+                    peer_annotations_2d.append(peer_point)
+
+            confidence = 1.0
+            if len(peer_cam_indices) >= 2:
+
+                # Test every possible pair of peers to find the best possible consensus
+                # TODO: This works pretty well but is slow
+
+                min_drift_error = float('inf')
+
+                for peer_pair_indices in combinations(range(len(peer_cam_indices)), 2):
+                    idx1, idx2 = peer_pair_indices
+
+                    cam1_global_idx, cam2_global_idx = peer_cam_indices[idx1], peer_cam_indices[idx2]
+                    annots_pair = np.array([peer_annotations_2d[idx1], peer_annotations_2d[idx2]])
+                    proj_mats_pair = [proj_matrices[cam1_global_idx], proj_matrices[cam2_global_idx]]
+
+                    # Triangulate a hypothesis from this pair
+                    point_3d_hypothesis = triangulate_points(
+                        annots_pair.reshape(2, 1, 2),
+                        proj_mats_pair
+                    ).flatten()
+
+                    if np.isnan(point_3d_hypothesis).any():
+                        continue
+
+                    # Reproject hypothesis back to the camera we are checking
+                    reprojected = reproject_points(point_3d_hypothesis, calibration[cam_idx_to_check])
+                    if reprojected.size == 0:
+                        continue
+
+                    # Calculate error for this specific hypothesis
+                    error = np.linalg.norm(point_to_check - reprojected.flatten())
+
+                    # Keep track of the minimum error found so far
+                    if error < min_drift_error:
+                        min_drift_error = error
+
+                # at least one valid consensus is found: use it to calculate confidence
+                if min_drift_error != float('inf'):
+                    confidence = max(0.0, 1.0 - (min_drift_error / config.LK_CONFIDENCE_MAX_ERROR))
+
+            output_annotations[cam_idx_to_check, p_idx] = [*point_to_check, confidence]
+
+    return output_annotations
 
 
 # ============================================================================
