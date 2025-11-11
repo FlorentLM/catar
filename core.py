@@ -165,10 +165,7 @@ def process_frame(
 
     # Run Mokap reconstruction using the LK results and their confidence score
     df_frame = annotations_to_polars(annotations_from_lk, frame_idx, camera_names, point_names)
-    points_soup = reconstructor.reconstruct_frame(
-        df_frame=df_frame,
-        keypoint_names=point_names
-    )
+    points_soup = reconstructor.reconstruct_frame(df_frame=df_frame, keypoint_names=point_names)
     print(f"MOKAP RECON:   Input {len(df_frame)} 2D points -> Produced a soup of {len(points_soup)} 3D candidates.")
 
     active_tracklets = tracker.update(points_soup, frame_idx)
@@ -194,6 +191,8 @@ def process_frame(
             app_state.annotations[..., :2] = old_annotations
             app_state.annotations[..., 2] = 1.0  # default confidence for old data
 
+        # Create base annotation set from the model, rescuing failed multi-view tracks
+        annotations_from_model = np.full_like(app_state.annotations[frame_idx], np.nan)
         if final_3d_skeleton_kps:
             calibration = app_state.best_individual
             num_cams = len(calibration)
@@ -205,8 +204,6 @@ def process_frame(
                     p_indices.append(point_names.index(p_name))
 
             points_to_reproject_3d = np.array(points_to_reproject_3d)
-            annotations_from_model = np.full_like(app_state.annotations[frame_idx], np.nan)
-
             if points_to_reproject_3d.size > 0:
                 for cam_idx in range(num_cams):
                     reprojected_2d = reproject_points(points_to_reproject_3d, calibration[cam_idx])
@@ -215,23 +212,30 @@ def process_frame(
                             # Rescued points get a fixed (medium high) confidence score
                             annotations_from_model[cam_idx, p_idx] = [*reprojected_2d[i], 0.75]
 
-            final_annotations = np.where(
-                ~np.isnan(annotations_from_lk[..., 0, np.newaxis]),
-                annotations_from_lk,
-                annotations_from_model
-            )
+        # Start with the model-based rescue for failed tracks
+        final_annotations = np.where(
+            ~np.isnan(annotations_from_lk[..., 0, np.newaxis]),
+            annotations_from_lk,
+            annotations_from_model
+        )
 
-            app_state.annotations[frame_idx] = final_annotations
-            app_state.human_annotated[frame_idx] = False
+        # Re-inject single-view tracks
+        # Find points that were successfully tracked by LK but only in a single view
+        # (these were lost by the 3D reconstructor but are still useful)
+        is_valid_lk_track = ~np.isnan(annotations_from_lk[..., 0])
+        num_views_per_point = np.sum(is_valid_lk_track, axis=0)
 
-        else:
-            # Fallback path: Mokap failed. Keep only the successful LK tracks.
-            # Create a mask for where to copy
-            mask = ~np.isnan(annotations_from_lk[..., 0])
-            app_state.annotations[frame_idx][mask] = annotations_from_lk[mask]
-            # Set confidence to NaN where LK failed
-            app_state.annotations[frame_idx][~mask, 2] = np.nan
-            app_state.human_annotated[frame_idx] = False
+        for p_idx in range(app_state.num_points):
+            if num_views_per_point[p_idx] == 1:
+
+                cam_idx = np.where(is_valid_lk_track[:, p_idx])[0][0]
+
+                # Ensure this point is preserved in the final annotation set for next frame
+                # (it's possible the model-based rescue filled it with nan so explicitly overwrite it)
+                final_annotations[cam_idx, p_idx] = annotations_from_lk[cam_idx, p_idx]
+
+        app_state.annotations[frame_idx] = final_annotations
+        app_state.human_annotated[frame_idx] = False
 
 
 # ============================================================================
