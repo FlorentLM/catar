@@ -1,6 +1,7 @@
 """
 Worker threads for video reading, tracking, rendering, and calibration.
 """
+import collections
 import threading
 import multiprocessing
 import queue
@@ -36,6 +37,9 @@ class VideoReaderWorker(threading.Thread):
         self.shutdown_event = threading.Event()
         self.video_captures = []
 
+        self.frame_caches = [collections.OrderedDict() for _ in video_paths]
+        self.cache_size = 300
+
     def run(self):
         print("Video reader worker started.")
         try:
@@ -52,13 +56,61 @@ class VideoReaderWorker(threading.Thread):
             print("ERROR: Video reader failed to open one or more videos.")
             self.shutdown_event.set()
 
+    def _get_frames(self, frame_idx: int, is_sequential: bool) -> List[np.ndarray]:
+        """
+        Gets frames for a specific index, using a cache to avoid slow seeks,
+        and using the fast sequential read when possible.
+        """
+        all_frames = []
+        for i, cap in enumerate(self.video_captures):
+            cache = self.frame_caches[i]
+            frame = None
+
+            # Check cache first
+            if frame_idx in cache:
+                frame = cache[frame_idx]
+                # Move to end to mark as most recently used
+                cache.move_to_end(frame_idx)
+
+            # if not, read from video file
+            else:
+                read_successful = False
+                new_frame = None
+
+                # For sequential frames, use the fast way
+                if is_sequential:
+                    ret, new_frame = cap.read()
+                    if ret:
+                        read_successful = True
+
+                # For non-sequential frames, use the slow way
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, new_frame = cap.read()
+                    if ret:
+                        read_successful = True
+
+                if read_successful:
+                    frame = new_frame
+                    cache[frame_idx] = frame
+                    # Enforce the cache size limit
+                    if len(cache) > self.cache_size:
+                        cache.popitem(last=False)  # remove oldest item
+
+            if frame is None:
+                # if failed to get a frame, abort
+                return []
+
+            all_frames.append(frame)
+
+        return all_frames
+
     def _read_loop(self):
         """Main reading loop."""
 
         prev_frame_idx = -1
 
         while not self.shutdown_event.is_set():
-            # Check for shutdown command
             try:
                 command = self.command_queue.get_nowait()
                 if command.get("action") == "shutdown":
@@ -67,7 +119,6 @@ class VideoReaderWorker(threading.Thread):
             except queue.Empty:
                 pass
 
-            # Get current state
             with self.app_state.lock:
                 current_frame_idx = self.app_state.frame_idx
                 is_paused = self.app_state.paused
@@ -75,33 +126,26 @@ class VideoReaderWorker(threading.Thread):
                 num_frames = self.app_state.video_metadata['num_frames']
 
             if is_seeking:
-                time.sleep(0.01)  # Prevent busy-waiting
+                time.sleep(0.01)
                 continue
 
-            # Read frames only if index changed
             if current_frame_idx != prev_frame_idx:
                 is_sequential = (current_frame_idx == prev_frame_idx + 1)
 
-                if is_sequential:
-                    frames = self._read_next_frames()
-                else:
-                    frames = self._seek_and_read(current_frame_idx)
+                frames = self._get_frames(current_frame_idx, is_sequential)
 
                 if not frames:
                     with self.app_state.lock:
                         self.app_state.paused = True
                     continue
 
-                # Put frames in all output queues
                 frame_data = {
                     "frame_idx": current_frame_idx,
                     "raw_frames": frames,
-                    "was_sequential": is_sequential
                 }
                 self._distribute_frames(frame_data)
                 prev_frame_idx = current_frame_idx
 
-            # Advance if not paused
             if not is_paused:
                 with self.app_state.lock:
                     if self.app_state.frame_idx < num_frames - 1:
@@ -110,27 +154,6 @@ class VideoReaderWorker(threading.Thread):
                         self.app_state.paused = True
             else:
                 time.sleep(0.01)
-
-    def _seek_and_read(self, frame_idx: int) -> List[np.ndarray]:
-        """Seek to specific frame and read from all cameras."""
-        frames = []
-        for cap in self.video_captures:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                return []
-            frames.append(frame)
-        return frames
-
-    def _read_next_frames(self) -> List[np.ndarray]:
-        """Read next frame from all cameras (sequentially)."""
-        frames = []
-        for cap in self.video_captures:
-            ret, frame = cap.read()
-            if not ret:
-                return []
-            frames.append(frame)
-        return frames
 
     def _distribute_frames(self, frame_data: dict):
         """Send frame data to all output queues, clearing old data."""
