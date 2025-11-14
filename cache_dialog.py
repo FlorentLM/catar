@@ -18,7 +18,13 @@ from video_cache import VideoCacheBuilder, VideoCacheReader
 class CacheManagerDialog:
     """Manages the video cache management dialog and the build process."""
 
-    def __init__(self, app_state, queues: Queues, data_folder: Path, video_format: str, on_complete: Optional[Callable]):
+    def __init__(self,
+    app_state,
+    queues: Queues,
+    data_folder: Path,
+    video_format: str,
+    on_complete: Optional[Callable]
+    ):
         self.app_state = app_state
         self.queues = queues
         self.data_folder = data_folder
@@ -42,85 +48,98 @@ class CacheManagerDialog:
         if dpg.does_item_exist(self.dialog_tag):
             dpg.delete_item(self.dialog_tag)
 
-        cache_reader = getattr(self.app_state, 'cache_reader', None)
-
         with dpg.window(label="Manage video cache", tag=self.dialog_tag, modal=True, width=550, pos=(350, 300)):
-            if cache_reader:
-                self._render_cache_exists_view(cache_reader)
-            else:
-                self._render_no_cache_view()
+            self._render_initial_view()
+
+    def _render_initial_view(self):
+        """Clears and re-draws the initial view (cache exists or not)."""
+
+        dpg.delete_item(self.dialog_tag, children_only=True)
+
+        cache_reader = getattr(self.app_state, 'cache_reader', None)
+        if cache_reader:
+            self._render_cache_exists_view(cache_reader)
+        else:
+            self._render_no_cache_view()
 
     def _render_cache_exists_view(self, cache_reader: VideoCacheReader):
         """Renders the UI for when the cache is present."""
 
         info = cache_reader.get_cache_info()
 
-        dpg.add_text("Video cache is Active.", color=(100, 255, 100))
-        dpg.add_separator()
-        dpg.add_spacer(height=5)
+        dpg.add_text("Video cache is Active.", color=(100, 255, 100), parent=self.dialog_tag)
+        dpg.add_separator(parent=self.dialog_tag)
+        dpg.add_spacer(height=5, parent=self.dialog_tag)
 
-        dpg.add_text("Cache details:", color=(200, 200, 255))
-        dpg.add_text(f"  Location: {info['cache_dir']}", indent=10)
-        dpg.add_text(f"  Size on disk: {info['total_size_gb']:.2f} GB", indent=10)
-        dpg.add_text(f"  Created: {info['creation_time']}", indent=10)
-        dpg.add_spacer(height=5)
+        dpg.add_text("Cache details:", color=(200, 200, 255), parent=self.dialog_tag)
+        dpg.add_text(f"  Location: {info['cache_dir']}", indent=10, parent=self.dialog_tag)
+        dpg.add_text(f"  Size on disk: {info['total_size_gb']:.2f} GB", indent=10, parent=self.dialog_tag)
+        dpg.add_text(f"  Created: {info['creation_time']}", indent=10, parent=self.dialog_tag)
+        dpg.add_spacer(height=5, parent=self.dialog_tag)
 
-        dpg.add_text("Video details:", color=(200, 200, 255))
-        dpg.add_text(f"  Videos: {info['num_videos']}", indent=10)
-        dpg.add_text(f"  Frames: {info['frame_count']}", indent=10)
-        dpg.add_text(f"  Total chunks: {info['total_chunks']}", indent=10)
-        dpg.add_spacer(height=5)
+        dpg.add_text("Video details:", color=(200, 200, 255), parent=self.dialog_tag)
+        dpg.add_text(f"  Videos: {info['num_videos']}", indent=10, parent=self.dialog_tag)
+        dpg.add_text(f"  Frames: {info['frame_count']}", indent=10, parent=self.dialog_tag)
+        dpg.add_text(f"  Total chunks: {info['total_chunks']}", indent=10, parent=self.dialog_tag)
+        dpg.add_spacer(height=5, parent=self.dialog_tag)
 
-        dpg.add_text("Memory usage:", color=(200, 200, 255))
-        dpg.add_text(f"  Chunks in RAM: {info['chunks_in_ram']} / {info['total_chunks']}", indent=10)
+        dpg.add_text("Memory usage:", color=(200, 200, 255), parent=self.dialog_tag)
+        dpg.add_text(f"  Chunks in RAM: {info['chunks_in_ram']} / {info['total_chunks']}", indent=10,
+                     parent=self.dialog_tag)
         ram_pct = (info['chunks_in_ram'] / info['total_chunks'] * 100) if info['total_chunks'] > 0 else 0
-        dpg.add_progress_bar(default_value=ram_pct / 100.0, width=-1, overlay=f"{ram_pct:.1f}%")
-        dpg.add_spacer(height=15)
+        dpg.add_progress_bar(default_value=ram_pct / 100.0, width=-1, overlay=f"{ram_pct:.1f}%", parent=self.dialog_tag)
+        dpg.add_spacer(height=15, parent=self.dialog_tag)
 
-        dpg.add_text("Actions:", color=(200, 200, 255))
-        with dpg.group(horizontal=True):
+        dpg.add_text("Actions:", color=(200, 200, 255), parent=self.dialog_tag)
+        with dpg.group(horizontal=True, parent=self.dialog_tag):
             dpg.add_button(label="Clear RAM Cache", width=160, callback=lambda: self._clear_ram_chunks(cache_reader))
             dpg.add_button(label="Recreate video cache", width=160, callback=self._on_build_cache)
-        dpg.add_spacer(height=10)
+        dpg.add_spacer(height=10, parent=self.dialog_tag)
 
-        dpg.add_button(label="Close", width=-1, callback=lambda: dpg.delete_item(self.dialog_tag))
+        dpg.add_button(label="Close", width=-1, callback=lambda: dpg.delete_item(self.dialog_tag),
+                       parent=self.dialog_tag)
 
     def _render_no_cache_view(self):
         """Renders the UI for when the cache is absent."""
 
-        dpg.add_text("No video cache available.", color=(255, 100, 100))
-        dpg.add_separator()
-        dpg.add_spacer(height=5)
+        dpg.add_text("No video cache available.", color=(255, 100, 100), parent=self.dialog_tag)
+        dpg.add_separator(parent=self.dialog_tag)
+        dpg.add_spacer(height=5, parent=self.dialog_tag)
         dpg.add_text(
             "Building a cache pre-processes the videos into a format that allows for instant, "
             "smooth frame seeking. Without a cache, seeking will be slow.",
-            wrap=500
+            wrap=500, parent=self.dialog_tag
         )
-        dpg.add_spacer(height=10)
+        dpg.add_spacer(height=10, parent=self.dialog_tag)
 
         if self.video_load_error:
-            dpg.add_text(f"Could not load video information: {self.video_load_error}", color=(255, 150, 150), wrap=500)
+            dpg.add_text(f"Could not load video information: {self.video_load_error}", color=(255, 150, 150), wrap=500,
+                         parent=self.dialog_tag)
 
         elif self.video_paths:
             try:
                 metadata = get_video_metadata(self.video_paths[0])
-                dpg.add_text("Video information:", color=(200, 200, 255))
-                dpg.add_text(f"  Videos found: {len(self.video_paths)}", indent=10)
-                dpg.add_text(f"  Frames per video: {metadata['num_frames']}", indent=10)
-                dpg.add_text(f"  Resolution: {metadata['width']}x{metadata['height']}", indent=10)
+                dpg.add_text("Video information:", color=(200, 200, 255), parent=self.dialog_tag)
+                dpg.add_text(f"  Videos found: {len(self.video_paths)}", indent=10, parent=self.dialog_tag)
+                dpg.add_text(f"  Frames per video: {metadata['num_frames']}", indent=10, parent=self.dialog_tag)
+                dpg.add_text(f"  Resolution: {metadata['width']}x{metadata['height']}", indent=10,
+                             parent=self.dialog_tag)
             except Exception as e:
-                dpg.add_text(f"Could not load video metadata: {e}", color=(255, 150, 150), wrap=500)
+                dpg.add_text(f"Could not load video metadata: {e}", color=(255, 150, 150), wrap=500,
+                             parent=self.dialog_tag)
 
-        dpg.add_spacer(height=15)
+        dpg.add_spacer(height=15, parent=self.dialog_tag)
 
         dpg.add_button(
             label="Create Cache",
             callback=self._on_build_cache,
             width=-1,
-            enabled=bool(self.video_paths)
+            enabled=bool(self.video_paths),
+            parent=self.dialog_tag
         )
-        dpg.add_spacer(height=10)
-        dpg.add_button(label="Close", width=-1, callback=lambda: dpg.delete_item(self.dialog_tag))
+        dpg.add_spacer(height=10, parent=self.dialog_tag)
+        dpg.add_button(label="Close", width=-1, callback=lambda: dpg.delete_item(self.dialog_tag),
+                       parent=self.dialog_tag)
 
     def _on_build_cache(self):
         """Handles the creation button click."""
@@ -133,33 +152,32 @@ class CacheManagerDialog:
         cache_exists, _ = builder.check_cache_exists()
 
         if cache_exists:
-            confirm_dialog_tag = "confirm_recreate_dialog"
-            if dpg.does_item_exist(confirm_dialog_tag):
-                dpg.delete_item(confirm_dialog_tag)
 
-            with dpg.window(label="Confirm Recreate", tag=confirm_dialog_tag, modal=False, width=400, pos=(400, 400)):
-                dpg.add_text("A valid cache already exists for this video set.", wrap=380)
-                dpg.add_text("Recreating it is not necessary. Are you sure you want to proceed?", wrap=380,
-                             color=(255, 255, 100))
-                dpg.add_spacer(height=10)
-
-                with dpg.group(horizontal=True):
-                    dpg.add_button(
-                        label="Recreate Anyway",
-                        callback=self._confirm_and_recreate,
-                        user_data={"dialog_tag": confirm_dialog_tag},
-                        width=190
-                    )
-                    dpg.add_button(label="Cancel", callback=lambda: dpg.delete_item(confirm_dialog_tag), width=190)
-
-            dpg.focus_item(confirm_dialog_tag)
+            self._render_confirmation_view()
         else:
             self._start_build_process()
 
-    def _confirm_and_recreate(self, sender, app_data, user_data):
-        confirm_dialog_tag = user_data["dialog_tag"]
-        dpg.delete_item(confirm_dialog_tag)
-        self._start_build_process()
+    def _render_confirmation_view(self):
+        """Clears the dialog and shows the confirmation message."""
+
+        dpg.delete_item(self.dialog_tag, children_only=True)
+        dpg.configure_item(self.dialog_tag, label="Confirm Recreate")
+
+        dpg.add_text("A valid cache already exists for this video set.", wrap=530, parent=self.dialog_tag)
+        dpg.add_text("Recreating it is not necessary. Are you sure you want to proceed?", wrap=530,
+                     color=(255, 255, 100), parent=self.dialog_tag)
+        dpg.add_spacer(height=20, parent=self.dialog_tag)
+        with dpg.group(horizontal=True, parent=self.dialog_tag):
+            dpg.add_button(
+                label="Recreate Anyway",
+                callback=self._start_build_process,
+                width=260
+            )
+            dpg.add_button(
+                label="Cancel",
+                callback=self._render_initial_view,
+                width=260
+            )
 
     def _start_build_process(self):
         """Closes the manager and opens the progress dialog to start the build."""

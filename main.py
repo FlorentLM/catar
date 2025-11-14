@@ -70,6 +70,7 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
             if msg_type == "overall":
                 if dpg.does_item_exist("cache_progress_bar_total"):
                     dpg.configure_item("cache_progress_bar_total", default_value=progress['progress'])
+
                 if dpg.does_item_exist("cache_progress_status"):
                     dpg.set_value("cache_progress_status", progress['status_text'])
 
@@ -89,16 +90,20 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                 # Update progress
                 if dpg.does_item_exist(bar_tag):
                     dpg.configure_item(bar_tag, default_value=progress['progress_pct'] / 100.0)
+
                 if dpg.does_item_exist(text_tag):
                     dpg.set_value(text_tag, f"Video {video_idx + 1}/{total_videos}: {progress['progress_pct']:.0f}%")
 
             elif msg_type == "complete":
                 if dpg.does_item_exist("cache_progress_status"):
                     dpg.set_value("cache_progress_status", progress['status_text'])
+
                 if dpg.does_item_exist("cache_progress_bar_total"):
+
                     dpg.configure_item("cache_progress_bar_total", default_value=1.0)
                 if dpg.does_item_exist("cache_cancel_button"):
                     dpg.delete_item("cache_cancel_button")
+
                 if dpg.does_item_exist("cache_progress_dialog"):
                     dpg.add_button(
                         label="Close", width=-1, parent="cache_progress_dialog",
@@ -106,12 +111,22 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                     )
 
             elif msg_type == "error":
+                # cache is invalid or deleted: update app state
+                app_state.cache_reader = None
+
+                # VideoReaderWorker should stop using the cache reader
+                queues.command.put({"action": "reload_cache", "cache_reader": None})
+                print("Cache invalidated due to build error/cancellation.")
+
                 if dpg.does_item_exist("cache_progress_status"):
                     dpg.set_value("cache_progress_status", progress['status_text'])
+
                 if dpg.does_item_exist("cache_progress_bar_total"):
                     dpg.configure_item("cache_progress_bar_total", overlay="ERROR")
+
                 if dpg.does_item_exist("cache_cancel_button"):
                     dpg.delete_item("cache_cancel_button")
+
                 if dpg.does_item_exist("cache_progress_dialog"):
                     dpg.add_button(
                         label="Close", width=-1, parent="cache_progress_dialog",
