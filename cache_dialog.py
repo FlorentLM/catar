@@ -137,20 +137,29 @@ class CacheManagerDialog:
             if dpg.does_item_exist(confirm_dialog_tag):
                 dpg.delete_item(confirm_dialog_tag)
 
-            with dpg.window(label="Confirm Recreate", tag=confirm_dialog_tag, modal=True, width=400, pos=(400, 400)):
+            with dpg.window(label="Confirm Recreate", tag=confirm_dialog_tag, modal=False, width=400, pos=(400, 400)):
                 dpg.add_text("A valid cache already exists for this video set.", wrap=380)
                 dpg.add_text("Recreating it is not necessary. Are you sure you want to proceed?", wrap=380,
                              color=(255, 255, 100))
                 dpg.add_spacer(height=10)
-                with dpg.group(horizontal=True):
-                    def _recreate():
-                        dpg.delete_item(confirm_dialog_tag)
-                        self._start_build_process()
 
-                    dpg.add_button(label="Recreate Anyway", callback=_recreate, width=190)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(
+                        label="Recreate Anyway",
+                        callback=self._confirm_and_recreate,
+                        user_data={"dialog_tag": confirm_dialog_tag},
+                        width=190
+                    )
                     dpg.add_button(label="Cancel", callback=lambda: dpg.delete_item(confirm_dialog_tag), width=190)
+
+            dpg.focus_item(confirm_dialog_tag)
         else:
             self._start_build_process()
+
+    def _confirm_and_recreate(self, sender, app_data, user_data):
+        confirm_dialog_tag = user_data["dialog_tag"]
+        dpg.delete_item(confirm_dialog_tag)
+        self._start_build_process()
 
     def _start_build_process(self):
         """Closes the manager and opens the progress dialog to start the build."""
