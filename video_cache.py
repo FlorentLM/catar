@@ -13,7 +13,7 @@ from typing import List, Optional, Dict, Tuple
 import cv2
 import numpy as np
 import blosc
-from multiprocessing import Pool, cpu_count, Manager, Event
+from multiprocessing import Pool, cpu_count, Event
 
 
 class VideoCacheBuilder:
@@ -152,8 +152,25 @@ class VideoCacheBuilder:
             'total_compressed_bytes': sum(compressed_sizes),
         }
 
-    def build_cache(self, progress_callback=None, video_progress_callback=None, cancel_event: Optional[Event] = None) -> dict:
+    def build_cache(self, progress_callback=None, video_progress_callback=None, cancel_event: Optional[Event] = None,
+                    manager=None) -> dict:
         """Build the video cache."""
+
+        if manager is None:
+
+            from multiprocessing import Manager
+            with Manager() as managed_context:
+                return self._build_cache_internal(
+                    progress_callback, video_progress_callback, cancel_event, managed_context
+                )
+        else:
+            # if a manager is provided use it directly
+            return self._build_cache_internal(
+                progress_callback, video_progress_callback, cancel_event, manager
+            )
+
+    def _build_cache_internal(self, progress_callback, video_progress_callback, cancel_event, manager) -> dict:
+        """Internal cache building logic that assumes a manager is present."""
 
         video_info = self.gather_video_info()
         if not video_info:
@@ -167,46 +184,45 @@ class VideoCacheBuilder:
         height = video_info[0]['height']
         fps = video_info[0]['fps']
 
-        # Calculate chunking parameters
         frame_size_bytes = width * height * 3
         frames_per_chunk = max(1, int((self.ram_budget_gb * (1024 ** 3)) // frame_size_bytes))
 
         print(f"Frames per chunk: {frames_per_chunk}")
 
-        with Manager() as manager:
-            video_progress_q = manager.Queue()
-            args_list = [
-                (idx, info['path'], info['frame_count'], info['width'], info['height'],
-                 frames_per_chunk, self.cache_dir, video_progress_q, cancel_event)
-                for idx, info in enumerate(video_info)
-            ]
-            num_workers = min(len(self.video_paths), cpu_count())
-            time_start = time.time()
-            total_frames = frame_count * len(video_info)
-            video_progress = {i: 0.0 for i in range(len(video_info))}
+        # Use the passed-in manager to create the queue
+        video_progress_q = manager.Queue()
+        args_list = [
+            (idx, info['path'], info['frame_count'], info['width'], info['height'],
+             frames_per_chunk, self.cache_dir, video_progress_q, cancel_event)
+            for idx, info in enumerate(video_info)
+        ]
+        num_workers = min(len(self.video_paths), cpu_count())
+        time_start = time.time()
+        total_frames = frame_count * len(video_info)
+        video_progress = {i: 0.0 for i in range(len(video_info))}
 
-            with Pool(num_workers) as pool:
-                async_results = pool.map_async(self._chunk_video_worker, args_list)
-                while not async_results.ready():
-                    if cancel_event and cancel_event.is_set():
-                        pool.terminate()
-                        pool.join()
-                        raise InterruptedError("Cache build was cancelled.")
-                    try:
-                        v_idx, pct = video_progress_q.get(timeout=0.1)
-                        video_progress[v_idx] = pct
-                        if video_progress_callback:
-                            video_progress_callback(v_idx, pct)
-                        current_total_pct = sum(video_progress.values()) / len(video_info)
-                        completed_frames = int(total_frames * (current_total_pct / 100.0))
-                        if progress_callback:
-                            progress_callback(completed_frames, total_frames)
-                    except Exception:
-                        pass
-                results = async_results.get()
+        with Pool(num_workers) as pool:
+            async_results = pool.map_async(self._chunk_video_worker, args_list)
+            while not async_results.ready():
+                if cancel_event and cancel_event.is_set():
+                    pool.terminate()
+                    pool.join()
+                    raise InterruptedError("Cache build was cancelled.")
+                try:
+                    v_idx, pct = video_progress_q.get(timeout=0.1)
+                    video_progress[v_idx] = pct
+                    if video_progress_callback:
+                        video_progress_callback(v_idx, pct)
+                    current_total_pct = sum(video_progress.values()) / len(video_info)
+                    completed_frames = int(total_frames * (current_total_pct / 100.0))
+                    if progress_callback:
+                        progress_callback(completed_frames, total_frames)
+                except Exception:
+                    pass
+            results = async_results.get()
 
         if any(r.get('cancelled') for r in results):
-             raise InterruptedError("Cache build was cancelled by a worker.")
+            raise InterruptedError("Cache build was cancelled by a worker.")
 
         elapsed = time.time() - time_start
         if progress_callback:

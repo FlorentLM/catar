@@ -237,7 +237,6 @@ class CacheManagerDialog:
         cache_dir = str(self.data_folder / 'video_cache')
 
         try:
-
             builder = VideoCacheBuilder(
                 video_paths=self.video_paths,
                 cache_dir=cache_dir,
@@ -249,7 +248,7 @@ class CacheManagerDialog:
                     progress = completed / total
                     self.queues.cache_progress.put({
                         "type": "overall", "progress": progress,
-                        "status_text": f"Processing: {completed}/{total} frames ({progress*100:.1f}%)"
+                        "status_text": f"Processing: {completed}/{total} frames ({progress * 100:.1f}%)"
                     })
 
             def on_video_progress(video_idx, pct):
@@ -260,7 +259,8 @@ class CacheManagerDialog:
             metadata = builder.build_cache(
                 progress_callback=on_progress,
                 video_progress_callback=on_video_progress,
-                cancel_event=self.cancel_build_event
+                cancel_event=self.cancel_build_event,
+                manager=self.manager
             )
 
             if self.cancel_build_event.is_set():
@@ -285,12 +285,12 @@ class CacheManagerDialog:
                 print("Cleaning up cancelled cache build...")
                 time.sleep(0.5)
 
-                # Ensure builder was instantiated before trying to delete
                 if builder:
                     builder.delete_cache()
-                elif Path(cache_dir).exists(): # Fallback cleanup
+                elif Path(cache_dir).exists():  # fallback cleaning
                     shutil.rmtree(cache_dir)
                 print("Cleanup complete.")
+
             if self.manager:
                 self.manager.shutdown()
 
