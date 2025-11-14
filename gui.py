@@ -10,6 +10,9 @@ from state import AppState, Queues
 from viz_3d import Open3DVisualizer
 from core import snap_annotation
 from utils import reproject_points, line_box_intersection
+from cache_dialog import CacheDialog, show_cache_info_dialog
+
+# TODO: Would probably be nice to move all the dialogs in a single separate dialogs file
 
 
 # ============================================================================
@@ -167,6 +170,18 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
             dpg.add_menu_item(
                 label="Add Frame to Calibration Set (C)",
                 callback=_add_to_calib_frames_callback,
+                user_data=user_data
+            )
+        
+        with dpg.menu(label="Tools"):
+            dpg.add_menu_item(
+                label="Build Video Cache...",
+                callback=_build_cache_callback,
+                user_data=user_data
+            )
+            dpg.add_menu_item(
+                label="Cache Information...",
+                callback=_show_cache_info_callback,
                 user_data=user_data
             )
 
@@ -927,6 +942,43 @@ def _save_state_callback(sender, app_data, user_data):
 
 def _load_state_callback(sender, app_data, user_data):
     user_data["app_state"].load_from_disk(config.DATA_FOLDER)
+
+
+def _build_cache_callback(sender, app_data, user_data):
+    """Show cache build dialog."""
+    app_state = user_data["app_state"]
+    queues = user_data["queues"]
+
+    # Create dialog with completion callback
+    def on_cache_complete(metadata, cache_dir):
+        """Called when cache build completes."""
+        print(f"Cache built successfully: {cache_dir}")
+
+        try:
+            from video_cache import VideoCacheReader
+            cache_reader = VideoCacheReader(cache_dir=cache_dir)
+            app_state.cache_reader = cache_reader
+
+            # Update the video reader worker to use the cache
+            queues.command.put({"action": "reload_cache", "cache_reader": cache_reader})
+
+            print("Cache loaded successfully.")
+        except Exception as e:
+            print(f"ERROR loading cache: {e}")
+
+    dialog = CacheDialog(
+        data_folder=config.DATA_FOLDER,
+        video_format=config.VIDEO_FORMAT,
+        on_complete=on_cache_complete
+    )
+    dialog.show_menu_build_dialog()
+
+
+def _show_cache_info_callback(sender, app_data, user_data):
+    """Show cache information dialog."""
+    app_state = user_data["app_state"]
+    cache_reader = getattr(app_state, 'cache_reader', None)
+    show_cache_info_dialog(cache_reader)
 
 
 # ============================================================================

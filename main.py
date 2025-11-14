@@ -14,6 +14,7 @@ from gui import create_ui, update_ui, resize_video_widgets
 from utils import load_and_match_videos, get_video_metadata
 from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker
 from viz_3d import Open3DVisualizer
+from video_cache import VideoCacheBuilder, VideoCacheReader
 
 from mokap.reconstruction.config import PipelineConfig
 from mokap.reconstruction.anatomy import StatsBootstrapper
@@ -74,11 +75,40 @@ def main():
         print(f"Created '{config.DATA_FOLDER}' directory. Please add videos and calibration.")
         sys.exit(0)
 
-    # Load videos and calibration
+    # Load videos and calibration first (with proper matching)
+    print("Loading videos and calibration...")
     video_paths, video_names, calibration = load_and_match_videos(
         config.DATA_FOLDER,
         config.VIDEO_FORMAT
     )
+
+    # Check for video cache
+    print("Checking for video cache...")
+    cache_dir = config.DATA_FOLDER / 'video_cache'
+
+    builder = VideoCacheBuilder(
+        video_paths=video_paths,
+        cache_dir=str(cache_dir),
+        ram_budget_gb=2.0
+    )
+    cache_exists, cache_metadata = builder.check_cache_exists()
+
+    # Decide on cache without blocking UI init
+    cache_reader = None
+
+    if cache_exists:
+        # Cache exists, try to load it immediately
+        try:
+            cache_reader = VideoCacheReader(cache_dir=str(cache_dir))
+            use_cache = True
+            print(f"Using video cache: {cache_reader}")
+        except Exception as e:
+            print(f"WARNING: Could not load cache: {e}")
+            print("Continuing without cache.")
+            cache_reader = None
+    else:
+        print("No video cache found. Will use direct (slower) video files access.")
+        print("You can build cache later via Tools > Build Video Cache...")
 
     # Get video metadata
     metadata = get_video_metadata(video_paths[0])
@@ -164,6 +194,7 @@ def main():
     app_state.video_names = video_names
     app_state.set_calibration(calibration)
     app_state.load_from_disk(config.DATA_FOLDER)
+    app_state.cache_reader = cache_reader
 
     # Initialise communication queues
     queues = Queues()
@@ -177,7 +208,8 @@ def main():
             app_state,
             video_paths,
             queues.command,
-            [queues.frames_for_tracking, queues.frames_for_rendering]
+            [queues.frames_for_tracking, queues.frames_for_rendering],
+            cache_reader=cache_reader
         ),
         TrackingWorker(
             app_state,

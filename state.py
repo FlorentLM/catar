@@ -13,6 +13,9 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
 from utils import calculate_fundamental_matrices
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from video_cache import VideoCacheReader
 
 
 @dataclass
@@ -52,6 +55,7 @@ class AppState:
         # Video metadata (read-only after init)
         self.video_metadata = video_metadata
         self.video_names: List[str] = []
+        self.cache_reader: Optional['VideoCacheReader'] = None
 
         # Skeleton configuration (read-only after init)
         self.point_names = skeleton_config['point_names']

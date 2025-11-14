@@ -8,12 +8,13 @@ import queue
 import time
 import cv2
 import numpy as np
-from typing import List
+from typing import List, Optional
 
 import config
 from core import create_camera_visual, run_genetic_step, process_frame
 from state import AppState
 from viz_3d import Open3DVisualizer, SceneObject
+from video_cache import VideoCacheReader
 
 from mokap.reconstruction.reconstruction import Reconstructor
 from mokap.reconstruction.tracking import MultiObjectTracker
@@ -28,17 +29,23 @@ class VideoReaderWorker(threading.Thread):
         video_paths: List[str],
         command_queue: queue.Queue,
         output_queues: List[queue.Queue],
+        cache_reader: Optional[VideoCacheReader] = None,
     ):
         super().__init__(daemon=True, name="VideoReaderWorker")
         self.app_state = app_state
         self.video_paths = video_paths
         self.command_queue = command_queue
         self.output_queues = output_queues
+        self.cache_reader = cache_reader
         self.shutdown_event = threading.Event()
         self.video_captures = []
 
-        self.frame_caches = [collections.OrderedDict() for _ in video_paths]
-        self.cache_size = 300
+        # We only need the on-the-fly cache if not using the cached reader
+        if self.cache_reader is None:
+            self.onthefly_cache = [collections.OrderedDict() for _ in video_paths]
+            self.onthefly_cache_size = 300
+        else:
+            self.onthefly_cache = None
 
     def run(self):
         print("Video reader worker started.")
@@ -49,7 +56,11 @@ class VideoReaderWorker(threading.Thread):
             self._cleanup()
 
     def _initialize_captures(self):
-        """Open all video files."""
+        """Open all video files (if not using cache)."""
+        
+        if self.cache_reader is not None:
+            print("Video reader using cached frames.")
+            return
 
         self.video_captures = [cv2.VideoCapture(path) for path in self.video_paths]
         if not all(cap.isOpened() for cap in self.video_captures):
@@ -58,18 +69,26 @@ class VideoReaderWorker(threading.Thread):
 
     def _get_frames(self, frame_idx: int, is_sequential: bool) -> List[np.ndarray]:
         """
-        Gets frames for a specific index, using a cache to avoid slow seeks,
-        and using the fast sequential read when possible.
+        Gets frames for a specific index.
+        Uses cache reader if available, otherwise falls back to cv2.VideoCapture with on-the-fly caching.
         """
+        # Fast path: use cache reader if available
+        if self.cache_reader is not None:
+            try:
+                return self.cache_reader.get_frame(frame_idx)
+            except Exception as e:
+                print(f"ERROR reading from cache: {e}")
+                return []
+
+        # Fallback: use cv2.VideoCapture with on the fly frame caching
         all_frames = []
         for i, cap in enumerate(self.video_captures):
-            cache = self.frame_caches[i]
+            cache = self.onthefly_cache[i]
             frame = None
 
             # Check cache first
             if frame_idx in cache:
                 frame = cache[frame_idx]
-                # Move to end to mark as most recently used
                 cache.move_to_end(frame_idx)
 
             # if not, read from video file
@@ -94,11 +113,10 @@ class VideoReaderWorker(threading.Thread):
                     frame = new_frame
                     cache[frame_idx] = frame
                     # Enforce the cache size limit
-                    if len(cache) > self.cache_size:
+                    if len(cache) > self.onthefly_cache_size:
                         cache.popitem(last=False)  # remove oldest item
 
             if frame is None:
-                # if failed to get a frame, abort
                 return []
 
             all_frames.append(frame)
@@ -113,9 +131,17 @@ class VideoReaderWorker(threading.Thread):
         while not self.shutdown_event.is_set():
             try:
                 command = self.command_queue.get_nowait()
-                if command.get("action") == "shutdown":
+                action = command.get("action")
+                if action == "shutdown":
                     self.shutdown_event.set()
                     break
+                elif action == "reload_cache":
+                    # Hotswap the cache reader
+                    new_cache_reader = command.get("cache_reader")
+                    if new_cache_reader is not None:
+                        self.cache_reader = new_cache_reader
+                        self.onthefly_cache = None  # on the fly cache is not needed in this case
+                        print("VideoReaderWorker: Cache reader reloaded successfully")
             except queue.Empty:
                 pass
 
@@ -169,8 +195,9 @@ class VideoReaderWorker(threading.Thread):
 
     def _cleanup(self):
         """Release all video captures."""
-        for cap in self.video_captures:
-            cap.release()
+        if self.cache_reader is None:
+            for cap in self.video_captures:
+                cap.release()
         print("Video reader worker shut down.")
 
 
