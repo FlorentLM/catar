@@ -425,7 +425,8 @@ def create_individual(video_metadata: Dict, scene_centre: np.ndarray) -> List[Di
     w, h = video_metadata['width'], video_metadata['height']
     num_cameras = video_metadata['num_videos']
 
-    radius = 250.0    # TODO: this should be scene-scale-dependant
+    radius = np.linalg.norm(scene_centre) if np.linalg.norm(scene_centre) > 1 else 100.0
+    # TODO: A better approach would be to estimate this from initial annotations
 
     individual = []
     for i in range(num_cameras):
@@ -454,7 +455,6 @@ def create_individual(video_metadata: Dict, scene_centre: np.ndarray) -> List[Di
         })
 
     return individual
-
 
 def compute_fitness(
     individual: List[Dict],
@@ -521,6 +521,7 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
     best_individual = ga_state.get("best_individual")
     generation = ga_state.get("generation", 0)
     scene_centre = ga_state.get("scene_centre", np.zeros(3))
+    stagnation_counter = ga_state.get("stagnation_counter", 0)
 
     if population is None:
         if best_individual:
@@ -558,6 +559,15 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
     if fitness_scores[sorted_indices[0]] < best_fitness:
         best_fitness = fitness_scores[sorted_indices[0]]
         best_individual = population[sorted_indices[0]]
+        stagnation_counter = 0  # Reset on improvement
+    else:
+        stagnation_counter += 1  # Increment if no improvement
+
+    # Adaptive mutation strength
+    current_mutation_strength = config.GA_MUTATION_STRENGTH
+    if stagnation_counter > 20:  # After 20 generations with no improvement
+        print("GA is stagnating, temporarily increasing mutation strength.")
+        current_mutation_strength *= 2.5  # Kick the simulation
 
     # Create next generation
     num_elites = int(config.GA_POPULATION_SIZE * config.GA_ELITISM_RATE)
@@ -593,10 +603,10 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
             # Mutation
             if np.random.rand() < config.GA_MUTATION_RATE:
                 for key in ['fx', 'fy', 'cx', 'cy']:
-                    child_cam[key] = child_cam[key] + np.random.normal(0, config.GA_MUTATION_STRENGTH * abs(
+                    child_cam[key] = child_cam[key] + np.random.normal(0, current_mutation_strength * abs(
                         child_cam[key]))
                 for key in ['rvec', 'tvec', 'dist']:
-                    child_cam[key] = child_cam[key] + np.random.normal(0, config.GA_MUTATION_STRENGTH,
+                    child_cam[key] = child_cam[key] + np.random.normal(0, current_mutation_strength,
                                                                        size=child_cam[key].shape)
 
             child.append(child_cam)
@@ -612,5 +622,6 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
         "generation": generation + 1,
         "mean_fitness": mean_fitness,
         "std_fitness": std_fitness,
-        "next_population": next_population
+        "next_population": next_population,
+        "stagnation_counter": stagnation_counter,
     }

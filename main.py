@@ -136,26 +136,25 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
         except queue.Empty:
             pass
 
+        # Check for progress from the GA worker
         try:
             ga_progress = queues.ga_progress.get_nowait()
-            status = ga_progress.get("status")
 
-            if status == "running":
-                # new best individual has been found: update main app state
-                if ga_progress["best_fitness"] < app_state.best_fitness:
-                    with app_state.lock:
-                        app_state.best_fitness = ga_progress["best_fitness"]
-                        app_state.best_individual = ga_progress["new_best_individual"]
-                        # Recalculate fundamental matrices for epipolar lines
-                        app_state.fundamental_matrices = calculate_fundamental_matrices(app_state.best_individual)
-                        app_state.needs_3d_reconstruction = True
+            if ga_progress.get("status") == "running":
+                new_best_fitness = ga_progress["best_fitness"]
 
-                # Update GUI popup with latest generation stats
+                # Check if a better individual was found
+                if new_best_fitness < app_state.best_fitness:
+                    new_individual = ga_progress["new_best_individual"]
+                    app_state.set_calibration(new_individual)
+                    app_state.best_fitness = new_best_fitness
+
+                # Update the GUI popup text
                 dpg.set_value("ga_generation_text", f"Generation: {ga_progress['generation']}")
-                dpg.set_value("ga_fitness_text", f"Best Fitness: {ga_progress['best_fitness']:.4f}")
-                dpg.set_value("ga_mean_fitness_text", f"Mean Fitness: {ga_progress['mean_fitness']:.4f}")
+                dpg.set_value("ga_fitness_text", f"Best Fitness: {app_state.best_fitness:.2f}")
+                dpg.set_value("ga_mean_fitness_text", f"Mean Fitness: {ga_progress['mean_fitness']:.2f}")
 
-        except (queue.Empty, AttributeError):
+        except queue.Empty:
             pass
 
         # Update UI with current state
