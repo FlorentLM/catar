@@ -8,7 +8,14 @@ import Levenshtein
 import cv2
 import numpy as np
 import polars as pl
+import jax.numpy as jnp
 from scipy.optimize import linear_sum_assignment
+
+from mokap.utils.geometry import projective
+from mokap.utils.geometry import transforms
+
+
+# TODO: These wrappers for mokap should be removed eventually
 
 
 def annotations_to_polars(annotations_slice, frame_idx, camera_names, point_names):
@@ -33,172 +40,131 @@ def annotations_to_polars(annotations_slice, frame_idx, camera_names, point_name
 
 
 # ============================================================================
-# 3D reconstruction & confidence
+# 3D reconstruction & confidence (wrappers for mokap)
 # ============================================================================
-# TODO: These will be replaced by the mokap implementations
 
-def get_camera_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
-    """3x3 intrinsic matrix from parameters."""
-    return np.array([
+def get_projection_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
+    """Computes the 3x4 projection matrix."""
+
+    K = np.array([
         [cam_params['fx'], 0.0, cam_params['cx']],
         [0.0, cam_params['fy'], cam_params['cy']],
         [0.0, 0.0, 1.0]
     ], dtype=np.float32)
 
+    # Mokap expects world-to-camera poses for projection
+    rvec_c2w = cam_params['rvec']
+    tvec_c2w = cam_params['tvec']
+    rvec_w2c, tvec_w2c = transforms.invert_rtvecs(jnp.asarray(rvec_c2w), jnp.asarray(tvec_c2w))
 
-def get_projection_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
-    """3x4 projection matrix from parameters."""
-    K = get_camera_matrix(cam_params)
-
-    # rvec and tvec are camera-to-world but we need world-to-camera for projection
-    R_c2w, _ = cv2.Rodrigues(cam_params['rvec'])
-    t_c2w = cam_params['tvec'].flatten()
-
-    # Invert to get world-to-camera
-    R_w2c = R_c2w.T
-    t_w2c = -R_c2w.T @ t_c2w
-
-    return K @ np.hstack((R_w2c, t_w2c.reshape(-1, 1)))
+    E_w2c = transforms.extrinsics_matrix(rvec_w2c, tvec_w2c)
+    P = transforms.projection_matrix(K, E_w2c)
+    return np.asarray(P)
 
 
 def reproject_points(points_3d: np.ndarray, cam_params: Dict[str, Any]) -> np.ndarray:
-    """
-    Reproject 3D points to 2D.
-    (Assumes rvec and tvec in cam_params are camera-to-world)
-    """
+    """Reprojects 3D points to 2D."""
+
     if points_3d.size == 0:
         return np.array([])
 
-    if points_3d.ndim == 1:
-        points_3d = points_3d.reshape(1, 1, 3)
-    elif points_3d.ndim == 2:
-        points_3d = points_3d[:, np.newaxis, :]
+    K = np.array([
+        [cam_params['fx'], 0.0, cam_params['cx']],
+        [0.0, cam_params['fy'], cam_params['cy']],
+        [0.0, 0.0, 1.0]
+    ], dtype=np.float32)
 
-    # rvec and tvec are camera-to-world but cv2.projectPoints needs world-to-camera
-    R_c2w, _ = cv2.Rodrigues(cam_params['rvec'])
-    t_c2w = cam_params['tvec'].flatten()
+    # get world-to-camera for projection
+    rvec_c2w = cam_params['rvec']
+    tvec_c2w = cam_params['tvec']
+    rvec_w2c, tvec_w2c = transforms.invert_rtvecs(jnp.asarray(rvec_c2w), jnp.asarray(tvec_c2w))
 
-    # Invert to get world-to-camera
-    R_w2c = R_c2w.T
-    t_w2c = -R_c2w.T @ t_c2w
-    rvec_w2c, _ = cv2.Rodrigues(R_w2c)
-
-    reprojected, _ = cv2.projectPoints(
-        points_3d,
-        rvec_w2c,
-        t_w2c,
-        get_camera_matrix(cam_params),
-        cam_params['dist']
+    reprojected, _ = projective.project_points(
+        object_points=jnp.asarray(points_3d),
+        rvec=rvec_w2c,
+        tvec=tvec_w2c,
+        camera_matrix=jnp.asarray(K),
+        dist_coeffs=jnp.asarray(cam_params['dist'])
     )
-    return reprojected.squeeze(axis=1) if reprojected is not None else np.array([])
+
+    return np.asarray(reprojected).reshape(-1, 2)
 
 
 def undistort_points(points_2d: np.ndarray, cam_params: Dict[str, Any]) -> np.ndarray:
-    """Undistort 2D points."""
+    """Undistorts 2D points."""
 
     valid_mask = ~np.isnan(points_2d).any(axis=-1)
     if not np.any(valid_mask):
         return np.full_like(points_2d, np.nan)
 
+    K = np.array([
+        [cam_params['fx'], 0.0, cam_params['cx']],
+        [0.0, cam_params['fy'], cam_params['cy']],
+        [0.0, 0.0, 1.0]
+    ], dtype=np.float32)
+
     valid_points = points_2d[valid_mask]
-    undistorted = cv2.undistortImagePoints(
-        valid_points.reshape(-1, 1, 2),
-        get_camera_matrix(cam_params),
-        cam_params['dist']
+
+    undistorted = projective.undistort_points(
+        points2d=jnp.asarray(valid_points),
+        camera_matrix=jnp.asarray(K),
+        dist_coeffs=jnp.asarray(cam_params['dist'])
     )
 
     result = np.full_like(points_2d, np.nan)
-    result[valid_mask] = undistorted.reshape(-1, 2)
+    result[valid_mask] = np.asarray(undistorted).reshape(-1, 2)
     return result
 
 
 def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, int], np.ndarray]:
-    """
-    Calculate F mat for each camera pair
-    (rvec and tvec are camera-to-world)
-    """
+    """Calculates F matrix for each camera pair."""
+
     num_cams = len(calibration)
+    if num_cams < 2:
+        return {}
+
     f_mats = {}
+    Ks = jnp.asarray([np.array([[c['fx'], 0, c['cx']], [0, c['fy'], c['cy']], [0, 0, 1]]) for c in calibration])
+    rvecs_c2w = jnp.asarray([c['rvec'] for c in calibration])
+    tvecs_c2w = jnp.asarray([c['tvec'] for c in calibration])
 
-    Ks = [get_camera_matrix(cam) for cam in calibration]
-    Rs_c2w = []
-    ts_c2w = []
+    # invert poses from camera-to-world to world-to-camera
+    rvecs_w2c, tvecs_w2c = transforms.invert_rtvecs(rvecs_c2w, tvecs_c2w)
 
-    for cam in calibration:
-        R, _ = cv2.Rodrigues(cam['rvec'])
-        Rs_c2w.append(R)
-        ts_c2w.append(cam['tvec'].flatten())
+    # Create (from_cam, to_cam) pairs
+    cam_indices = list(range(num_cams))
+    pairs = [p for p in itertools.product(cam_indices, repeat=2) if p[0] != p[1]]
 
-    for i, j in itertools.product(range(num_cams), repeat=2):
+    # Prepare for batched mokap function (num_pairs, 2, ...)
+    K_pairs = jnp.asarray([(Ks[i], Ks[j]) for i, j in pairs])
+    rvecs_w2c_pairs = jnp.asarray([(rvecs_w2c[i], rvecs_w2c[j]) for i, j in pairs])
+    tvecs_w2c_pairs = jnp.asarray([(tvecs_w2c[i], tvecs_w2c[j]) for i, j in pairs])
 
-        if i == j:
-            continue
+    F_matrices_batched = transforms.batched_fundamental_matrices(K_pairs, rvecs_w2c_pairs, tvecs_w2c_pairs)
 
-        K_i, K_j = Ks[i], Ks[j]
-        R_i, t_i = Rs_c2w[i], ts_c2w[i]
-        R_j, t_j = Rs_c2w[j], ts_c2w[j]
-
-        # Relative transformation camera i to camera j
-        R_rel = R_j.T @ R_i
-        t_rel = R_j.T @ (t_i - t_j)
-
-        # Essential mat E = [t]_x @ R
-        t_skew = np.array([
-            [0, -t_rel[2], t_rel[1]],
-            [t_rel[2], 0, -t_rel[0]],
-            [-t_rel[1], t_rel[0], 0]
-        ])
-        E = t_skew @ R_rel
-
-        # Fundamental mat F = K_j^-T @ E @ K_i^-1
-        F = np.linalg.inv(K_j).T @ E @ np.linalg.inv(K_i)
-
-        # rank-2 constraint
-        U, S, Vt = np.linalg.svd(F)
-        S[2] = 0.0
-        F_corrected = U @ np.diag(S) @ Vt
-
-        f_mats[(i, j)] = F_corrected
+    for idx, (i, j) in enumerate(pairs):
+        f_mats[(i, j)] = np.asarray(F_matrices_batched[idx])
 
     return f_mats
 
 
 def triangulate_points(frame_annotations: np.ndarray, proj_matrices: List[np.ndarray]) -> np.ndarray:
-    """
-    Triangulates 3D points from 2D correspondences using SVD.
-    """
-    # TODO: Also use mokap's implementation
+    """Triangulates 3D points using mokap."""
 
     num_cams, num_points, _ = frame_annotations.shape
-    points_3d = np.full((num_points, 3), np.nan, dtype=np.float32)
+    if num_points == 0:
+        return np.full((0, 3), np.nan, dtype=np.float32)
 
-    for p_idx in range(num_points):
-        # Gather valid observations for this specific point
-        valid_annots = []
-        valid_proj_mats = []
-        for cam_idx in range(num_cams):
-            if not np.isnan(frame_annotations[cam_idx, p_idx]).any():
-                valid_annots.append(frame_annotations[cam_idx, p_idx])
-                valid_proj_mats.append(proj_matrices[cam_idx])
+    # Expected input shape for points2d is (C, N, 2)
+    points_2d_all = jnp.asarray(frame_annotations)
+    P_mats_all = jnp.asarray(proj_matrices)
 
-        if len(valid_annots) < 2:
-            continue
+    triangulated = projective.triangulate_points_from_projections(
+        points2d=points_2d_all,
+        P_mats=P_mats_all
+    )
 
-        A = []
-        for p2d, P in zip(valid_annots, valid_proj_mats):
-            A.append(p2d[0] * P[2, :] - P[0, :])
-            A.append(p2d[1] * P[2, :] - P[1, :])
-        A = np.array(A)
-
-        # Solve using SVD
-        u, s, vh = np.linalg.svd(A)
-        point_4d = vh[-1, :]
-
-        # Dehomogenize to get 3D coordinates
-        if point_4d[3] != 0:
-            points_3d[p_idx] = point_4d[:3] / point_4d[3]
-
-    return points_3d
+    return np.asarray(triangulated)
 
 
 def calculate_reproj_confidence(app_state: 'AppState', frame_idx: int, point_idx: int) -> np.ndarray:

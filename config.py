@@ -47,7 +47,8 @@ NUM_DIST_COEFFS = 14
 GA_POPULATION_SIZE = 200
 GA_ELITISM_RATE = 0.1
 GA_MUTATION_RATE = 0.8
-GA_MUTATION_STRENGTH = 0.1
+GA_MUTATION_STRENGTH = 0.05  # General mutation strength
+GA_MUTATION_STRENGTH_INIT = 0.01 # Strength for seeding initial population
 
 # UI interaction
 ANNOTATION_DRAG_THRESHOLD = 15  # in pixels
