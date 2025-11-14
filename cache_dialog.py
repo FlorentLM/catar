@@ -11,7 +11,7 @@ from typing import Optional, Callable
 import dearpygui.dearpygui as dpg
 
 from state import Queues
-from utils import load_and_match_videos, get_video_metadata
+from utils import load_and_match_videos, probe_video
 from video_cache import VideoCacheBuilder, VideoCacheReader
 
 
@@ -118,7 +118,7 @@ class CacheManagerDialog:
 
         elif self.video_paths:
             try:
-                metadata = get_video_metadata(self.video_paths[0])
+                metadata = probe_video(self.video_paths[0])
                 dpg.add_text("Video information:", color=(200, 200, 255), parent=self.dialog_tag)
                 dpg.add_text(f"  Videos found: {len(self.video_paths)}", indent=10, parent=self.dialog_tag)
                 dpg.add_text(f"  Frames per video: {metadata['num_frames']}", indent=10, parent=self.dialog_tag)

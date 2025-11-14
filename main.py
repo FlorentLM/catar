@@ -11,7 +11,7 @@ import dearpygui.dearpygui as dpg
 import config
 from state import AppState, Queues
 from gui import create_ui, update_ui, resize_video_widgets
-from utils import load_and_match_videos, get_video_metadata, calculate_fundamental_matrices
+from utils import load_and_match_videos, probe_video, calculate_fundamental_matrices
 from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker
 from viz_3d import Open3DVisualizer
 from video_cache import VideoCacheBuilder, VideoCacheReader
@@ -207,7 +207,7 @@ def main():
         print("You can build cache later via Tools > Build Video Cache...")
 
     # Get video metadata
-    metadata = get_video_metadata(video_paths[0])
+    metadata = probe_video(video_paths[0])
     metadata['num_videos'] = len(video_paths)
 
     # Initialise mokap config

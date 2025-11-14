@@ -5,12 +5,13 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
 import Levenshtein
-import cv2
+
 import numpy as np
 import polars as pl
 import jax.numpy as jnp
 from scipy.optimize import linear_sum_assignment
 
+from mokap.utils.fileio import probe_video
 from mokap.utils.geometry import projective
 from mokap.utils.geometry import transforms
 
@@ -271,25 +272,6 @@ def load_and_match_videos(data_folder: Path, video_format: str):
         })
 
     return ordered_paths, ordered_names, calibration
-
-
-def get_video_metadata(video_path: str) -> dict:
-    """Extract metadata from a video."""
-    # TODO: This is also already implemented in mokap
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"ERROR: Could not open video: {video_path}")
-        sys.exit(1)
-
-    metadata = {
-        'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-        'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-        'num_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
-        'fps': cap.get(cv2.CAP_PROP_FPS)
-    }
-    cap.release()
-    return metadata
 
 
 # ============================================================================
