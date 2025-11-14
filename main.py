@@ -11,7 +11,7 @@ import dearpygui.dearpygui as dpg
 import config
 from state import AppState, Queues
 from gui import create_ui, update_ui, resize_video_widgets
-from utils import load_and_match_videos, get_video_metadata
+from utils import load_and_match_videos, get_video_metadata, calculate_fundamental_matrices
 from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker
 from viz_3d import Open3DVisualizer
 from video_cache import VideoCacheBuilder, VideoCacheReader
@@ -134,6 +134,28 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                     )
 
         except queue.Empty:
+            pass
+
+        try:
+            ga_progress = queues.ga_progress.get_nowait()
+            status = ga_progress.get("status")
+
+            if status == "running":
+                # new best individual has been found: update main app state
+                if ga_progress["best_fitness"] < app_state.best_fitness:
+                    with app_state.lock:
+                        app_state.best_fitness = ga_progress["best_fitness"]
+                        app_state.best_individual = ga_progress["new_best_individual"]
+                        # Recalculate fundamental matrices for epipolar lines
+                        app_state.fundamental_matrices = calculate_fundamental_matrices(app_state.best_individual)
+                        app_state.needs_3d_reconstruction = True
+
+                # Update GUI popup with latest generation stats
+                dpg.set_value("ga_generation_text", f"Generation: {ga_progress['generation']}")
+                dpg.set_value("ga_fitness_text", f"Best Fitness: {ga_progress['best_fitness']:.4f}")
+                dpg.set_value("ga_mean_fitness_text", f"Mean Fitness: {ga_progress['mean_fitness']:.4f}")
+
+        except (queue.Empty, AttributeError):
             pass
 
         # Update UI with current state

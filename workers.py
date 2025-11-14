@@ -526,7 +526,14 @@ class GAWorker(multiprocessing.Process):
                 self.ga_state["generation"] = progress["generation"]
                 self.ga_state["population"] = progress["next_population"]
 
-                self.progress_queue.put(progress)
+                progress_payload = {
+                    "status": "running",
+                    "generation": progress["generation"],
+                    "best_fitness": progress["new_best_fitness"],
+                    "mean_fitness": progress["mean_fitness"],
+                    "new_best_individual": progress["new_best_individual"]
+                }
+                self.progress_queue.put(progress_payload)
             else:
                 time.sleep(0.01)
 

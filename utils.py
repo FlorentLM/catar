@@ -164,30 +164,41 @@ def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, i
 
 
 def triangulate_points(frame_annotations: np.ndarray, proj_matrices: List[np.ndarray]) -> np.ndarray:
-    """Triangulate 3D points from 2D correspondences."""
+    """
+    Triangulates 3D points from 2D correspondences using SVD.
+    """
     # TODO: Also use mokap's implementation
 
     num_cams, num_points, _ = frame_annotations.shape
-    if num_cams < 2:
-        return np.full((num_points, 3), np.nan, dtype=np.float32)
+    points_3d = np.full((num_points, 3), np.nan, dtype=np.float32)
 
-    camera_pairs = list(itertools.combinations(range(num_cams), 2))
-    votes = np.full((len(camera_pairs), num_points, 3), np.nan, dtype=np.float32)
+    for p_idx in range(num_points):
+        # Gather valid observations for this specific point
+        valid_annots = []
+        valid_proj_mats = []
+        for cam_idx in range(num_cams):
+            if not np.isnan(frame_annotations[cam_idx, p_idx]).any():
+                valid_annots.append(frame_annotations[cam_idx, p_idx])
+                valid_proj_mats.append(proj_matrices[cam_idx])
 
-    for i, (cam1, cam2) in enumerate(camera_pairs):
-        p1 = frame_annotations[cam1]
-        p2 = frame_annotations[cam2]
-        valid = ~np.isnan(p1).any(axis=1) & ~np.isnan(p2).any(axis=1)
-
-        if not np.any(valid):
+        if len(valid_annots) < 2:
             continue
 
-        points_4d = cv2.triangulatePoints(
-            proj_matrices[cam1], proj_matrices[cam2], p1[valid].T, p2[valid].T
-        )
-        points_3d = (points_4d[:3] / (points_4d[3] + 1e-6)).T
-        votes[i, valid] = points_3d
-    return np.nanmean(votes, axis=0)
+        A = []
+        for p2d, P in zip(valid_annots, valid_proj_mats):
+            A.append(p2d[0] * P[2, :] - P[0, :])
+            A.append(p2d[1] * P[2, :] - P[1, :])
+        A = np.array(A)
+
+        # Solve using SVD
+        u, s, vh = np.linalg.svd(A)
+        point_4d = vh[-1, :]
+
+        # Dehomogenize to get 3D coordinates
+        if point_4d[3] != 0:
+            points_3d[p_idx] = point_4d[:3] / point_4d[3]
+
+    return points_3d
 
 
 def calculate_reproj_confidence(app_state: 'AppState', frame_idx: int, point_idx: int) -> np.ndarray:

@@ -993,6 +993,7 @@ def _start_ga_callback(sender, app_data, user_data):
     queues = user_data["queues"]
 
     with app_state.lock:
+        app_state.best_fitness = float('inf')   # this needs to not be 0.0 on start
         app_state.is_ga_running = True
         ga_snapshot = app_state.get_ga_snapshot()
 
