@@ -248,7 +248,6 @@ def load_and_match_videos(data_folder: Path, video_format: str):
         calib_data = tomllib.load(f)
 
     toml_names = sorted(calib_data.keys())
-    print(f"Found {len(toml_names)} cameras in TOML")
 
     # Find video files
     video_paths = sorted(data_folder.glob(video_format))
@@ -257,7 +256,6 @@ def load_and_match_videos(data_folder: Path, video_format: str):
         sys.exit(1)
 
     video_filenames = [p.name for p in video_paths]
-    print(f"Found {len(video_filenames)} video files")
 
     if len(toml_names) != len(video_paths):
         print("ERROR: Number of cameras in TOML doesn't match number of videos")
