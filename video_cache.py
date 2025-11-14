@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Tuple
 import cv2
 import numpy as np
 import blosc
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, Manager
 
 
 class VideoCacheBuilder:
@@ -99,7 +99,7 @@ class VideoCacheBuilder:
     def _chunk_video_worker(args) -> dict:
         """Worker function to chunk a single video."""
 
-        video_idx, video_path, frame_count, width, height, frames_per_chunk, chunk_dir = args
+        video_idx, video_path, frame_count, width, height, frames_per_chunk, chunk_dir, progress_q = args
 
         cap = cv2.VideoCapture(video_path)
         chunk_files = []
@@ -137,12 +137,14 @@ class VideoCacheBuilder:
             chunk_files.append(filename)
             compressed_sizes.append(len(compressed))
 
-            # Console progress every 5 chunks
-            if chunk_idx % 5 == 0 or chunk_idx == total_chunks - 1:
+            # Report progress
+            if progress_q:
                 progress_pct = ((start + frames_in_chunk) / frame_count) * 100
-                print(f"  [Video {video_idx}] {progress_pct:.0f}%")
+                progress_q.put((video_idx, progress_pct))
 
         cap.release()
+        if progress_q:
+            progress_q.put((video_idx, 100.0)) # Final update
 
         return {
             'video_idx': video_idx,
@@ -151,12 +153,8 @@ class VideoCacheBuilder:
             'total_compressed_bytes': sum(compressed_sizes)
         }
 
-    def build_cache(self, progress_callback=None) -> dict:
+    def build_cache(self, progress_callback=None, video_progress_callback=None) -> dict:
         """Build the video cache."""
-
-        print("=" * 70)
-        print("Building Video Cache")
-        print("=" * 70)
 
         video_info = self.gather_video_info()
         if not video_info:
@@ -173,45 +171,61 @@ class VideoCacheBuilder:
         frames_per_chunk = max(1, int((self.ram_budget_gb * (1024 ** 3)) // frame_size_bytes))
         total_chunks_per_video = (frame_count + frames_per_chunk - 1) // frames_per_chunk
 
-        print(f"\nVideo Properties:")
+        print(f"Video Properties:")
         print(f"  Videos: {len(self.video_paths)}")
         print(f"  Frames: {frame_count}")
         print(f"  Resolution: {width}x{height}")
         print(f"  Frames per chunk: {frames_per_chunk}")
         print(f"  Total chunks: {total_chunks_per_video * len(self.video_paths)}")
 
+        manager = Manager()
+        video_progress_q = manager.Queue()
+
         args_list = [
             (idx, info['path'], info['frame_count'], info['width'], info['height'],
-             frames_per_chunk, self.cache_dir)
+             frames_per_chunk, self.cache_dir, video_progress_q)
             for idx, info in enumerate(video_info)
         ]
 
         num_workers = min(len(self.video_paths), cpu_count())
-        print(f"\nStarting parallel chunking with {num_workers} workers...")
 
         time_start = time.time()
 
         # Run parallel chunking
         with Pool(num_workers) as pool:
-            if progress_callback:
-                results = []
-                for result in pool.imap_unordered(self._chunk_video_worker, args_list):
-                    results.append(result)
-                    completed_videos = len(results)
-                    progress_callback(completed_videos * frame_count, len(video_info) * frame_count)
-            else:
-                results = pool.map(self._chunk_video_worker, args_list)
+            async_results = pool.map_async(self._chunk_video_worker, args_list)
+
+            # Monitor progress while workers are running
+            total_frames = frame_count * len(video_info)
+            completed_frames = 0
+            video_progress = {i: 0.0 for i in range(len(video_info))}
+
+            while not async_results.ready():
+                try:
+                    v_idx, pct = video_progress_q.get(timeout=0.1)
+                    video_progress[v_idx] = pct
+                    if video_progress_callback:
+                        video_progress_callback(v_idx, pct)
+
+                    # Update total progress
+                    current_total_pct = sum(video_progress.values()) / len(video_info)
+                    completed_frames = int(total_frames * (current_total_pct / 100.0))
+                    if progress_callback:
+                        progress_callback(completed_frames, total_frames)
+                except: # queue.Empty
+                    pass
+            results = async_results.get()
 
         elapsed = time.time() - time_start
+        if progress_callback:
+            progress_callback(total_frames, total_frames)
 
         total_compressed = sum(r['total_compressed_bytes'] for r in results)
 
-        print("\n" + "=" * 70)
         print("Cache Build Complete!")
-        print("=" * 70)
-        print(f"Time: {elapsed:.1f}s")
-        print(f"Size: {total_compressed / 1024 ** 3:.1f} GB")
-        print(f"Speed: {frame_count * len(self.video_paths) / elapsed:.0f} frames/sec")
+        print(f"  Build time: {elapsed:.1f}s")
+        print(f"  Cache size: {total_compressed / 1024 ** 3:.1f} GB")
+        print(f"  Build speed: {frame_count * len(self.video_paths) / elapsed:.0f} frames/sec")
 
         # Create metadata
         metadata = {
@@ -236,7 +250,7 @@ class VideoCacheBuilder:
                     'num_chunks': len(r['chunk_files']),
                     'total_compressed_bytes': r['total_compressed_bytes']
                 }
-                for r in results
+                for r in sorted(results, key=lambda x: x['video_idx'])
             ]
         }
 
@@ -244,7 +258,7 @@ class VideoCacheBuilder:
         with open(self.metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
 
-        print(f"\nCache saved to: {self.cache_dir}")
+        print(f"Cache saved to: {self.cache_dir}")
         return metadata
 
 

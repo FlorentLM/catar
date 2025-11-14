@@ -30,11 +30,14 @@ class Queues:
     frames_for_tracking: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=2))
     frames_for_rendering: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=2))
 
-    # Worker command and progress queues
+    # Worker command queues
     tracking_command: queue.Queue = field(default_factory=queue.Queue)
-    tracking_progress: queue.Queue = field(default_factory=queue.Queue)
     ga_command: multiprocessing.Queue = field(default_factory=multiprocessing.Queue)
+
+    # Worker progress queues
+    tracking_progress: queue.Queue = field(default_factory=queue.Queue)
     ga_progress: multiprocessing.Queue = field(default_factory=multiprocessing.Queue)
+    cache_progress: queue.Queue = field(default_factory=queue.Queue)
 
     def shutdown_all(self):
         """Send shutdown commands to all workers."""

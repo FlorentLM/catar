@@ -8,22 +8,19 @@ import time
 import dearpygui.dearpygui as dpg
 
 from video_cache import VideoCacheBuilder, VideoCacheReader
+from state import Queues
 
 
 class CacheDialog:
     """Manages the cache build dialog and progress."""
 
-    def __init__(self, data_folder: Path, video_format: str, on_complete: Optional[Callable] = None):
+    def __init__(self, data_folder: Path, video_format: str, queues: Queues, on_complete: Optional[Callable] = None):
         self.data_folder = data_folder
         self.video_format = video_format
+        self.queues = queues
         self.on_complete = on_complete
         self.builder_thread: Optional[threading.Thread] = None
         self.is_building = False
-        self.build_progress = {
-            'video_progress': {},
-            'total_progress': 0.0,
-            'status': ''
-        }
 
     def show_menu_build_dialog(self):
         """Show dialog for building cache from menu."""
@@ -73,7 +70,6 @@ class CacheDialog:
 
     def _show_build_progress_dialog(self):
         """Show progress dialog during cache build with per-video progress bars."""
-        # TODO: This is not working
 
         if dpg.does_item_exist("cache_progress_dialog"):
             dpg.delete_item("cache_progress_dialog")
@@ -102,33 +98,14 @@ class CacheDialog:
                 pass
 
             # Cancel button
-            # TODO: This is not working either
+            # TODO: This is not working
             dpg.add_spacer(height=10)
             dpg.add_button(
                 label="Building...",
                 tag="cache_cancel_button",
                 width=-1,
-                enabled=True
+                enabled=False
             )
-
-    def _update_video_progress_ui(self, video_idx: int, progress_pct: float, total_videos: int):
-
-        bar_tag = f"video_progress_bar_{video_idx}"
-        text_tag = f"video_progress_text_{video_idx}"
-
-        if not dpg.does_item_exist(bar_tag):
-
-            if dpg.does_item_exist("video_progress_container"):
-                with dpg.group(parent="video_progress_container", horizontal=False):
-                    dpg.add_text(f"Video {video_idx + 1}/{total_videos}:", tag=text_tag)
-                    dpg.add_progress_bar(tag=bar_tag, width=-1, default_value=0.0)
-                    dpg.add_spacer(height=5)
-
-        # Update progress
-        if dpg.does_item_exist(bar_tag):
-            dpg.configure_item(bar_tag, default_value=progress_pct / 100.0)
-        if dpg.does_item_exist(text_tag):
-            dpg.set_value(text_tag, f"Video {video_idx + 1}/{total_videos}: {progress_pct:.0f}%")
 
     def _build_cache_thread(self):
         """Background thread that builds the cache."""
@@ -147,73 +124,40 @@ class CacheDialog:
             video_info = builder.gather_video_info()
             total_videos = len(video_info)
 
-            # Track progress per video
-            video_completion = {}
-
+            # Callback to send progress to the main thread
             def on_progress(completed_frames, total):
+                if total > 0:
+                    overall_progress = completed_frames / total
+                    status_text = f"Processing: {completed_frames}/{total} frames ({overall_progress*100:.1f}%)"
+                    self.queues.cache_progress.put({
+                        "type": "overall",
+                        "progress": overall_progress,
+                        "status_text": status_text
+                    })
 
-                # estimate which video we're on based on completed frames
-                frames_per_video = video_info[0]['frame_count']
-                current_video = min(completed_frames // frames_per_video, total_videos - 1)
-
-                # Update current video progress
-                frames_in_current = completed_frames % frames_per_video
-                if frames_in_current == 0 and completed_frames > 0:
-                    frames_in_current = frames_per_video
-                    if current_video > 0:
-                        current_video -= 1
-
-                progress_pct = (frames_in_current / frames_per_video) * 100
-
-                # Mark completed videos as 100%
-                for i in range(current_video):
-                    if i not in video_completion:
-                        video_completion[i] = 100.0
-                        self._update_video_progress_ui(i, 100.0, total_videos)
-
-                # Update current video
-                if current_video < total_videos:
-                    video_completion[current_video] = progress_pct
-                    self._update_video_progress_ui(current_video, progress_pct, total_videos)
-
-                # Update overall progress
-                overall_progress = completed_frames / total if total > 0 else 0
-                if dpg.does_item_exist("cache_progress_bar_total"):
-                    dpg.configure_item("cache_progress_bar_total", default_value=overall_progress)
-                if dpg.does_item_exist("cache_progress_status"):
-                    dpg.set_value(
-                        "cache_progress_status",
-                        f"Processing: {completed_frames}/{total} frames ({overall_progress*100:.1f}%)"
-                    )
+            # callback for per-video progress reporting from the worker process
+            def on_video_progress(video_idx, progress_pct):
+                self.queues.cache_progress.put({
+                    "type": "video",
+                    "video_idx": video_idx,
+                    "progress_pct": progress_pct,
+                    "total_videos": total_videos
+                })
 
             print("Starting cache build...")
-            metadata = builder.build_cache(progress_callback=on_progress)
+            metadata = builder.build_cache(
+                progress_callback=on_progress,
+                video_progress_callback=on_video_progress
+            )
             print("Cache build complete!")
 
-            # Mark all videos complete
-            for i in range(total_videos):
-                self._update_video_progress_ui(i, 100.0, total_videos)
+            # Final success message
+            self.queues.cache_progress.put({
+                "type": "complete",
+                "status_text": "Cache built successfully."
+            })
 
-            # Update UI on completion
-            if dpg.does_item_exist("cache_progress_status"):
-                dpg.set_value("cache_progress_status", "Cache built successfully.")
-            if dpg.does_item_exist("cache_progress_bar_total"):
-                dpg.configure_item("cache_progress_bar_total", default_value=1.0)
-
-            # Replace cancel button with close button
-            if dpg.does_item_exist("cache_cancel_button"):
-                dpg.delete_item("cache_cancel_button")
-
-            if dpg.does_item_exist("cache_progress_dialog"):
-                dpg.add_spacer(height=10, parent="cache_progress_dialog")
-                dpg.add_button(
-                    label="Close",
-                    width=-1,
-                    callback=lambda: dpg.delete_item("cache_progress_dialog"),
-                    parent="cache_progress_dialog"
-                )
-
-            # Notify completion
+            # Notify main thread of completion
             if self.on_complete:
                 self.on_complete(metadata=metadata, cache_dir=str(self.data_folder / 'video_cache'))
 
@@ -222,21 +166,11 @@ class CacheDialog:
             import traceback
             traceback.print_exc()
 
-            if dpg.does_item_exist("cache_progress_status"):
-                dpg.set_value("cache_progress_status", f"ERROR: {str(e)}")
-            if dpg.does_item_exist("cache_progress_bar_total"):
-                dpg.configure_item("cache_progress_bar_total", default_value=0.0, overlay="ERROR")
-
-            # Show close button on error too
-            if dpg.does_item_exist("cache_cancel_button"):
-                dpg.delete_item("cache_cancel_button")
-            if dpg.does_item_exist("cache_progress_dialog"):
-                dpg.add_button(
-                    label="Close",
-                    width=-1,
-                    callback=lambda: dpg.delete_item("cache_progress_dialog"),
-                    parent="cache_progress_dialog"
-                )
+            # Send error message to main thread
+            self.queues.cache_progress.put({
+                "type": "error",
+                "status_text": f"ERROR: {str(e)}"
+            })
         finally:
             self.is_building = False
 

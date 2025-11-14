@@ -172,7 +172,7 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 callback=_add_to_calib_frames_callback,
                 user_data=user_data
             )
-        
+
         with dpg.menu(label="Tools"):
             dpg.add_menu_item(
                 label="Build Video Cache...",
@@ -969,6 +969,7 @@ def _build_cache_callback(sender, app_data, user_data):
     dialog = CacheDialog(
         data_folder=config.DATA_FOLDER,
         video_format=config.VIDEO_FORMAT,
+        queues=queues,
         on_complete=on_cache_complete
     )
     dialog.show_menu_build_dialog()

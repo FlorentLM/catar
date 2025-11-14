@@ -62,6 +62,65 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
         except queue.Empty:
             pass
 
+        # Process cache build progress
+        try:
+            progress = queues.cache_progress.get_nowait()
+            msg_type = progress.get("type")
+
+            if msg_type == "overall":
+                if dpg.does_item_exist("cache_progress_bar_total"):
+                    dpg.configure_item("cache_progress_bar_total", default_value=progress['progress'])
+                if dpg.does_item_exist("cache_progress_status"):
+                    dpg.set_value("cache_progress_status", progress['status_text'])
+
+            elif msg_type == "video":
+                video_idx = progress['video_idx']
+                total_videos = progress['total_videos']
+                bar_tag = f"video_progress_bar_{video_idx}"
+                text_tag = f"video_progress_text_{video_idx}"
+
+                # Create widgets if they don't exist
+                if not dpg.does_item_exist(bar_tag) and dpg.does_item_exist("video_progress_container"):
+                    with dpg.group(parent="video_progress_container", horizontal=False):
+                        dpg.add_text(f"Video {video_idx + 1}/{total_videos}:", tag=text_tag)
+                        dpg.add_progress_bar(tag=bar_tag, width=-1, default_value=0.0)
+                        dpg.add_spacer(height=5)
+
+                # Update progress
+                if dpg.does_item_exist(bar_tag):
+                    dpg.configure_item(bar_tag, default_value=progress['progress_pct'] / 100.0)
+                if dpg.does_item_exist(text_tag):
+                    dpg.set_value(text_tag, f"Video {video_idx + 1}/{total_videos}: {progress['progress_pct']:.0f}%")
+
+            elif msg_type == "complete":
+                if dpg.does_item_exist("cache_progress_status"):
+                    dpg.set_value("cache_progress_status", progress['status_text'])
+                if dpg.does_item_exist("cache_progress_bar_total"):
+                    dpg.configure_item("cache_progress_bar_total", default_value=1.0)
+                if dpg.does_item_exist("cache_cancel_button"):
+                    dpg.delete_item("cache_cancel_button")
+                if dpg.does_item_exist("cache_progress_dialog"):
+                    dpg.add_button(
+                        label="Close", width=-1, parent="cache_progress_dialog",
+                        callback=lambda: dpg.delete_item("cache_progress_dialog")
+                    )
+
+            elif msg_type == "error":
+                if dpg.does_item_exist("cache_progress_status"):
+                    dpg.set_value("cache_progress_status", progress['status_text'])
+                if dpg.does_item_exist("cache_progress_bar_total"):
+                    dpg.configure_item("cache_progress_bar_total", overlay="ERROR")
+                if dpg.does_item_exist("cache_cancel_button"):
+                    dpg.delete_item("cache_cancel_button")
+                if dpg.does_item_exist("cache_progress_dialog"):
+                    dpg.add_button(
+                        label="Close", width=-1, parent="cache_progress_dialog",
+                        callback=lambda: dpg.delete_item("cache_progress_dialog")
+                    )
+
+        except queue.Empty:
+            pass
+
         # Update UI with current state
         update_ui(app_state)
 
