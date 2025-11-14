@@ -172,6 +172,14 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 callback=_add_to_calib_frames_callback,
                 user_data=user_data
             )
+            dpg.add_separator()
+            dpg.add_text("--- DEBUG ---")
+            dpg.add_button(
+                label="/!\\ Clear Current Calibration /!\\",
+                callback=_clear_calibration_callback,
+                user_data=user_data,
+                width=-1
+            )
 
         with dpg.menu(label="Tools"):
             dpg.add_menu_item(
@@ -1017,6 +1025,15 @@ def _stop_ga_callback(sender, app_data, user_data):
     queues.ga_command.put({"action": "stop"})
     dpg.hide_item("ga_popup")
 
+
+def _clear_calibration_callback(sender, app_data, user_data):
+    """Clears the current calibration from the app state."""
+
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        app_state.best_individual = None
+        app_state.best_fitness = float('inf')
+        app_state.fundamental_matrices = None  # also clear dependent properties
 
 # ============================================================================
 # Callbacks - Keyboard

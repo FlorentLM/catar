@@ -245,7 +245,7 @@ def main():
         sys.exit(1)
 
     # Define the 3D volume of interest (same units as the calibration, like mm)
-    volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}
+    volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}   # TODO: should be loaded from disk
     scene_centre = np.vstack([b for b in volume_bounds.values()]).mean(axis=1)
     print(f"Using 3D volume bounds: {volume_bounds}")
 

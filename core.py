@@ -425,7 +425,7 @@ def create_individual(video_metadata: Dict, scene_centre: np.ndarray) -> List[Di
     w, h = video_metadata['width'], video_metadata['height']
     num_cameras = video_metadata['num_videos']
 
-    radius = 5.0    # TODO: this should be scene-scale-dependant
+    radius = 250.0    # TODO: this should be scene-scale-dependant
 
     individual = []
     for i in range(num_cameras):
@@ -520,6 +520,7 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
     best_fitness = ga_state.get("best_fitness", float('inf'))
     best_individual = ga_state.get("best_individual")
     generation = ga_state.get("generation", 0)
+    scene_centre = ga_state.get("scene_centre", np.zeros(3))
 
     if population is None:
         if best_individual:
@@ -538,7 +539,7 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
                     mutated_ind.append(mutated_cam)
                 population.append(mutated_ind)
         else:
-            population = [create_individual(ga_state['video_metadata']) for _ in range(config.GA_POPULATION_SIZE)]
+            population = [create_individual(ga_state['video_metadata'], scene_centre) for _ in range(config.GA_POPULATION_SIZE)]
 
     # Evaluate fitness
     fitness_scores = np.array([
@@ -601,12 +602,15 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
             child.append(child_cam)
         next_population.append(child)
 
+    mean_fitness = np.nanmean(fitness_scores)
+    std_fitness = np.nanstd(fitness_scores)
+
     return {
         "status": "running",
         "new_best_fitness": best_fitness,
         "new_best_individual": best_individual,
         "generation": generation + 1,
-        "mean_fitness": np.mean(fitness_scores),
-        "std_fitness": np.std(fitness_scores),
+        "mean_fitness": mean_fitness,
+        "std_fitness": std_fitness,
         "next_population": next_population
     }
