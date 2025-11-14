@@ -10,7 +10,7 @@ from state import AppState, Queues
 from viz_3d import Open3DVisualizer
 from core import snap_annotation
 from utils import reproject_points, line_box_intersection
-from cache_dialog import CacheDialog, show_cache_info_dialog
+from cache_dialog import CacheDialog, cache_info_dialog
 
 # TODO: Would probably be nice to move all the dialogs in a single separate dialogs file
 
@@ -972,14 +972,14 @@ def _build_cache_callback(sender, app_data, user_data):
         queues=queues,
         on_complete=on_cache_complete
     )
-    dialog.show_menu_build_dialog()
+    dialog.cache_build_dialog()
 
 
 def _show_cache_info_callback(sender, app_data, user_data):
     """Show cache information dialog."""
     app_state = user_data["app_state"]
     cache_reader = getattr(app_state, 'cache_reader', None)
-    show_cache_info_dialog(cache_reader)
+    cache_info_dialog(cache_reader)
 
 
 # ============================================================================

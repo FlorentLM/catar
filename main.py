@@ -84,7 +84,7 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                     with dpg.group(parent="video_progress_container", horizontal=False):
                         dpg.add_text(f"Video {video_idx + 1}/{total_videos}:", tag=text_tag)
                         dpg.add_progress_bar(tag=bar_tag, width=-1, default_value=0.0)
-                        dpg.add_spacer(height=5)
+                        dpg.add_spacer(height=2)
 
                 # Update progress
                 if dpg.does_item_exist(bar_tag):

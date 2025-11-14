@@ -9,6 +9,7 @@ import dearpygui.dearpygui as dpg
 
 from video_cache import VideoCacheBuilder, VideoCacheReader
 from state import Queues
+from utils import load_and_match_videos
 
 
 class CacheDialog:
@@ -22,15 +23,15 @@ class CacheDialog:
         self.builder_thread: Optional[threading.Thread] = None
         self.is_building = False
 
-    def show_menu_build_dialog(self):
+    def cache_build_dialog(self):
         """Show dialog for building cache from menu."""
 
-        if dpg.does_item_exist("cache_menu_dialog"):
-            dpg.delete_item("cache_menu_dialog")
+        if dpg.does_item_exist("cache_build_dialog"):
+            dpg.delete_item("cache_build_dialog")
 
         with dpg.window(
-            label="Build Video Cache",
-            tag="cache_menu_dialog",
+            label="Build video cache",
+            tag="cache_build_dialog",
             modal=True,
             width=500,
             height=280,
@@ -44,44 +45,57 @@ class CacheDialog:
             with dpg.group(horizontal=True):
                 dpg.add_button(
                     label="Build Cache",
-                    width=230,
+                    width=150,
                     callback=self._on_build_cache
                 )
                 dpg.add_button(
                     label="Cancel",
-                    width=230,
-                    callback=lambda: dpg.delete_item("cache_menu_dialog")
+                    width=150,
+                    callback=lambda: dpg.delete_item("cache_build_dialog")
                 )
 
     def _on_build_cache(self):
 
         # Close menu dialog
-        if dpg.does_item_exist("cache_menu_dialog"):
-            dpg.delete_item("cache_menu_dialog")
+        if dpg.does_item_exist("cache_build_dialog"):
+            dpg.delete_item("cache_build_dialog")
 
         # Small delay to ensure dialog is properly closed
         time.sleep(0.05)
 
-        self._show_build_progress_dialog()
+        # To calculate the required window height, we need to know the number of videos first.
+        try:
+            video_paths, _, _ = load_and_match_videos(self.data_folder, self.video_format)
+            num_videos = len(video_paths)
+        except Exception as e:
+            print(f"Could not count videos before building cache, using default height. Error: {e}")
+            num_videos = 4  # A reasonable default if video loading fails here
+
+        self._show_build_progress_dialog(num_videos)
 
         self.is_building = True
         self.builder_thread = threading.Thread(target=self._build_cache_thread, daemon=True)
         self.builder_thread.start()
 
-    def _show_build_progress_dialog(self):
+    def _show_build_progress_dialog(self, num_videos: int):
         """Show progress dialog during cache build with per-video progress bars."""
 
         if dpg.does_item_exist("cache_progress_dialog"):
             dpg.delete_item("cache_progress_dialog")
 
+        # Calculate height for the progress bar area
+        # Approx 32px per video (text + bar + smaller spacer)
+        # Max height of 250px, after which it will scroll
+        child_height = min(250, num_videos * 32)
+
         with dpg.window(
-            label="Building Video Cache",
+            label="Building video cache",
             tag="cache_progress_dialog",
             modal=True,
             no_close=True,
             no_collapse=True,
-            width=650,
-            height=400,
+            width=550,  # Narrower width
+            autosize=True,  # Auto-resize vertically
             pos=(350, 300)
         ):
             dpg.add_text("Building compressed video cache...", tag="cache_progress_status")
@@ -94,11 +108,11 @@ class CacheDialog:
 
             # per-video progressbars
             dpg.add_text("Per-Video Progress:", color=(200, 200, 255))
-            with dpg.child_window(tag="video_progress_container", height=180, border=True):
-                pass
+            with dpg.child_window(tag="video_progress_container", height=child_height, border=True):
+                pass  # Items are added dynamically from main thread
 
             # Cancel button
-            # TODO: This is not working
+            # TODO: Cancellation is a more complex topic, focusing on progress first.
             dpg.add_spacer(height=10)
             dpg.add_button(
                 label="Building...",
@@ -111,7 +125,6 @@ class CacheDialog:
         """Background thread that builds the cache."""
 
         try:
-            from utils import load_and_match_videos
             video_paths, _, _ = load_and_match_videos(self.data_folder, self.video_format)
 
             builder = VideoCacheBuilder(
@@ -124,7 +137,7 @@ class CacheDialog:
             video_info = builder.gather_video_info()
             total_videos = len(video_info)
 
-            # Callback to send progress to the main thread
+            # Callback to send progress to the main thread via a queue
             def on_progress(completed_frames, total):
                 if total > 0:
                     overall_progress = completed_frames / total
@@ -135,7 +148,7 @@ class CacheDialog:
                         "status_text": status_text
                     })
 
-            # callback for per-video progress reporting from the worker process
+            # This callback is for per-video progress reporting from the worker process
             def on_video_progress(video_idx, progress_pct):
                 self.queues.cache_progress.put({
                     "type": "video",
@@ -157,7 +170,7 @@ class CacheDialog:
                 "status_text": "Cache built successfully."
             })
 
-            # Notify main thread of completion
+            # Notify main application thread of completion
             if self.on_complete:
                 self.on_complete(metadata=metadata, cache_dir=str(self.data_folder / 'video_cache'))
 
@@ -175,7 +188,7 @@ class CacheDialog:
             self.is_building = False
 
 
-def show_cache_info_dialog(cache_reader: Optional[VideoCacheReader]):
+def cache_info_dialog(cache_reader: Optional[VideoCacheReader]):
     """Show information about the current cache."""
 
     if dpg.does_item_exist("cache_info_dialog"):
@@ -186,7 +199,6 @@ def show_cache_info_dialog(cache_reader: Optional[VideoCacheReader]):
         tag="cache_info_dialog",
         modal=True,
         width=500,
-        height=380,
         pos=(400, 300)
     ):
         if cache_reader is None:

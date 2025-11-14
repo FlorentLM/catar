@@ -222,7 +222,7 @@ class VideoCacheBuilder:
 
         total_compressed = sum(r['total_compressed_bytes'] for r in results)
 
-        print("Cache Build Complete!")
+        print("Cache build complete!")
         print(f"  Build time: {elapsed:.1f}s")
         print(f"  Cache size: {total_compressed / 1024 ** 3:.1f} GB")
         print(f"  Build speed: {frame_count * len(self.video_paths) / elapsed:.0f} frames/sec")
