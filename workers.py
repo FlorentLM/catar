@@ -355,7 +355,6 @@ class RenderingWorker(threading.Thread):
         self,
         app_state: AppState,
         open3d_viz: Open3DVisualizer,
-        scene_centre: np.ndarray,
         reconstructor: Reconstructor,
         tracker: MultiObjectTracker,
         frames_in_queue: queue.Queue,
@@ -364,7 +363,6 @@ class RenderingWorker(threading.Thread):
         super().__init__(daemon=True, name="RenderingWorker")
         self.app_state = app_state
         self.open3d_viz = open3d_viz
-        self.scene_centre = scene_centre
         self.reconstructor = reconstructor
         self.tracker = tracker
         self.frames_in_queue = frames_in_queue
@@ -426,7 +424,7 @@ class RenderingWorker(threading.Thread):
             if self.app_state.show_cameras_in_3d and self.app_state.best_individual:
                 for i, cam_params in enumerate(self.app_state.best_individual):
                     scene.extend(
-                        create_camera_visual(cam_params, self.app_state.video_names[i], self.scene_centre)
+                        create_camera_visual(cam_params, self.app_state.video_names[i], self.app_state.scene_centre)
                     )
 
             # Add reconstructed points and skeleton

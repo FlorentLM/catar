@@ -418,29 +418,37 @@ def create_camera_visual(
 # Genetic Algorithm
 # ============================================================================
 
-def create_individual(video_metadata: Dict) -> List[Dict]:
+
+def create_individual(video_metadata: Dict, scene_centre: np.ndarray) -> List[Dict]:
     """Create a random camera calibration individual (camera-to-world convention)."""
+
     w, h = video_metadata['width'], video_metadata['height']
     num_cameras = video_metadata['num_videos']
-    radius = 5.0
+
+    radius = 5.0    # TODO: this should be scene-scale-dependant
 
     individual = []
     for i in range(num_cameras):
-        # Position cameras in a circle around origin
+        # Position cameras in a circle around the scene centre
         angle = (2 * np.pi / num_cameras) * i
-        cam_pos_world = np.array([radius * np.cos(angle), 2.0, radius * np.sin(angle)])
-        target = np.array([0.0, 0.0, 0.0])
+
+        # Offset camera positions by the scene centre
+        cam_pos_world = scene_centre + np.array([radius * np.cos(angle), 2.0, radius * np.sin(angle)])
+
         up_vector = np.array([0.0, 1.0, 0.0])
-        forward = (target - cam_pos_world) / np.linalg.norm(target - cam_pos_world)
+        forward = (scene_centre - cam_pos_world) / np.linalg.norm(scene_centre - cam_pos_world)
+
         right = np.cross(forward, up_vector)
         cam_up = np.cross(right, forward)
+
         R_w2c = np.array([-right, cam_up, -forward])
         R_c2w = R_w2c.T
         tvec_c2w = cam_pos_world
         rvec_c2w = transforms.inverse_rodrigues(R_c2w)
+
         individual.append({
             'fx': random.uniform(w * 0.8, w * 1.5), 'fy': random.uniform(h * 0.8, h * 1.5),
-            'cx': w / 2 + random.uniform(-w*0.05, w*0.05), 'cy': h / 2 + random.uniform(-h*0.05, h*0.05),
+            'cx': w / 2 + random.uniform(-w * 0.05, w * 0.05), 'cy': h / 2 + random.uniform(-h * 0.05, h * 0.05),
             'dist': np.random.normal(0.0, 0.001, size=config.NUM_DIST_COEFFS),
             'rvec': rvec_c2w.flatten(), 'tvec': tvec_c2w.flatten()
         })

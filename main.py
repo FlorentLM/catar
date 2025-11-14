@@ -291,6 +291,7 @@ def main():
     app_state.set_calibration(calibration)
     app_state.load_from_disk(config.DATA_FOLDER)
     app_state.cache_reader = cache_reader
+    app_state.scene_centre = scene_centre
 
     # Initialise communication queues
     queues = Queues()
@@ -319,7 +320,6 @@ def main():
         RenderingWorker(
             app_state,
             open3d_viz,
-            scene_centre,
             reconstructor,
             tracker,
             queues.frames_for_rendering,

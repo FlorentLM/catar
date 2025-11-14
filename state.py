@@ -117,6 +117,8 @@ class AppState:
         self.fundamental_matrices: Optional[Dict[Tuple[int, int], np.ndarray]] = None
         self.is_ga_running: bool = False
 
+        self.scene_centre = np.zeros(3)
+
     def set_calibration(self, individual: List[Dict[str, Any]]):
         """Apply camera calibration and update dependent state."""
 
@@ -138,6 +140,7 @@ class AppState:
                 "best_fitness": self.best_fitness,
                 "best_individual": self.best_individual,
                 "generation": 0,
+                "scene_centre": self.scene_centre.copy()
             }
 
     def save_to_disk(self, folder: Path):
