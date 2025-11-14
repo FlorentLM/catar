@@ -1,6 +1,8 @@
 """
 Cache management UI dialogs for DearPyGUI.
 """
+import multiprocessing
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -24,12 +26,21 @@ class CacheManagerDialog:
         self.on_complete = on_complete
         self.builder_thread: Optional[threading.Thread] = None
         self.dialog_tag = "cache_manager_dialog"
+        self.manager: Optional[multiprocessing.Manager] = None
+        self.cancel_build_event: Optional[multiprocessing.Event] = None
+
+        self.video_paths = []
+        self.video_load_error: Optional[str] = None
+        try:
+            self.video_paths, _, _ = load_and_match_videos(self.data_folder, self.video_format)
+        except Exception as e:
+            self.video_load_error = str(e)
+            print(f"CacheManagerDialog Error: {self.video_load_error}")
 
     def show(self):
         """Creates and shows the main cache management dialog."""
-
         if dpg.does_item_exist(self.dialog_tag):
-            return
+            dpg.delete_item(self.dialog_tag)
 
         cache_reader = getattr(self.app_state, 'cache_reader', None)
 
@@ -87,38 +98,70 @@ class CacheManagerDialog:
         )
         dpg.add_spacer(height=10)
 
-        try:
-            video_paths, _, _ = load_and_match_videos(self.data_folder, self.video_format)
-            metadata = get_video_metadata(video_paths[0])
-            dpg.add_text("Video information:", color=(200, 200, 255))
-            dpg.add_text(f"  Videos found: {len(video_paths)}", indent=10)
-            dpg.add_text(f"  Frames per video: {metadata['num_frames']}", indent=10)
-            dpg.add_text(f"  Resolution: {metadata['width']}x{metadata['height']}", indent=10)
-        except Exception as e:
-            dpg.add_text(f"Could not load video information: {e}", color=(255, 150, 150), wrap=500)
+        if self.video_load_error:
+            dpg.add_text(f"Could not load video information: {self.video_load_error}", color=(255, 150, 150), wrap=500)
+
+        elif self.video_paths:
+            try:
+                metadata = get_video_metadata(self.video_paths[0])
+                dpg.add_text("Video information:", color=(200, 200, 255))
+                dpg.add_text(f"  Videos found: {len(self.video_paths)}", indent=10)
+                dpg.add_text(f"  Frames per video: {metadata['num_frames']}", indent=10)
+                dpg.add_text(f"  Resolution: {metadata['width']}x{metadata['height']}", indent=10)
+            except Exception as e:
+                dpg.add_text(f"Could not load video metadata: {e}", color=(255, 150, 150), wrap=500)
+
         dpg.add_spacer(height=15)
 
-        dpg.add_button(label="Create Cache", callback=self._on_build_cache, width=-1)
+        dpg.add_button(
+            label="Create Cache",
+            callback=self._on_build_cache,
+            width=-1,
+            enabled=bool(self.video_paths)
+        )
         dpg.add_spacer(height=10)
         dpg.add_button(label="Close", width=-1, callback=lambda: dpg.delete_item(self.dialog_tag))
 
     def _on_build_cache(self):
+        """Handles the creation button click."""
+
+        if not self.video_paths:
+            print("Build cache called but no video paths are loaded. Aborting.")
+            return
+
+        builder = VideoCacheBuilder(video_paths=self.video_paths, cache_dir=str(self.data_folder / 'video_cache'))
+        cache_exists, _ = builder.check_cache_exists()
+
+        if cache_exists:
+            confirm_dialog_tag = "confirm_recreate_dialog"
+            if dpg.does_item_exist(confirm_dialog_tag):
+                dpg.delete_item(confirm_dialog_tag)
+
+            with dpg.window(label="Confirm Recreate", tag=confirm_dialog_tag, modal=True, width=400, pos=(400, 400)):
+                dpg.add_text("A valid cache already exists for this video set.", wrap=380)
+                dpg.add_text("Recreating it is not necessary. Are you sure you want to proceed?", wrap=380,
+                             color=(255, 255, 100))
+                dpg.add_spacer(height=10)
+                with dpg.group(horizontal=True):
+                    def _recreate():
+                        dpg.delete_item(confirm_dialog_tag)
+                        self._start_build_process()
+
+                    dpg.add_button(label="Recreate Anyway", callback=_recreate, width=190)
+                    dpg.add_button(label="Cancel", callback=lambda: dpg.delete_item(confirm_dialog_tag), width=190)
+        else:
+            self._start_build_process()
+
+    def _start_build_process(self):
         """Closes the manager and opens the progress dialog to start the build."""
 
         if dpg.does_item_exist(self.dialog_tag):
             dpg.delete_item(self.dialog_tag)
         time.sleep(0.05)
 
-        try:
-            video_paths, _, _ = load_and_match_videos(self.data_folder, self.video_format)
-            num_videos = len(video_paths)
-
-        except Exception as e:
-            print(f"Could not count videos before building cache. Error: {e}")
-            num_videos = 4
-        
+        num_videos = len(self.video_paths) if self.video_paths else 4
         self._show_build_progress_dialog(num_videos)
-        
+
         self.builder_thread = threading.Thread(target=self._build_cache_thread, daemon=True)
         self.builder_thread.start()
 
@@ -143,16 +186,34 @@ class CacheManagerDialog:
                 pass
 
             dpg.add_spacer(height=10)
-            dpg.add_button(label="Building...", tag="cache_cancel_button", width=-1, enabled=False)
+            dpg.add_button(label="Cancel", tag="cache_cancel_button", width=-1, callback=self._on_cancel_build)
+
+    def _on_cancel_build(self):
+        """Callback for the cancel button."""
+
+        print("Cancel build requested.")
+
+        if self.cancel_build_event:
+            self.cancel_build_event.set()
+
+        if dpg.does_item_exist("cache_cancel_button"):
+            dpg.configure_item("cache_cancel_button", label="Cancelling...", enabled=False)
+        if dpg.does_item_exist("cache_progress_status"):
+            dpg.set_value("cache_progress_status", "Cancellation requested, please wait...")
 
     def _build_cache_thread(self):
         """Background thread that runs the cache builder."""
 
+        builder = None
+        self.manager = multiprocessing.Manager()
+        self.cancel_build_event = self.manager.Event()
+        cache_dir = str(self.data_folder / 'video_cache')
+
         try:
-            video_paths, _, _ = load_and_match_videos(self.data_folder, self.video_format)
+
             builder = VideoCacheBuilder(
-                video_paths=video_paths,
-                cache_dir=str(self.data_folder / 'video_cache'),
+                video_paths=self.video_paths,
+                cache_dir=cache_dir,
                 ram_budget_gb=0.5
             )
 
@@ -166,19 +227,45 @@ class CacheManagerDialog:
 
             def on_video_progress(video_idx, pct):
                 self.queues.cache_progress.put({
-                    "type": "video", "video_idx": video_idx, "progress_pct": pct, "total_videos": len(video_paths)
+                    "type": "video", "video_idx": video_idx, "progress_pct": pct, "total_videos": len(self.video_paths)
                 })
 
-            metadata = builder.build_cache(progress_callback=on_progress, video_progress_callback=on_video_progress)
+            metadata = builder.build_cache(
+                progress_callback=on_progress,
+                video_progress_callback=on_video_progress,
+                cancel_event=self.cancel_build_event
+            )
+
+            if self.cancel_build_event.is_set():
+                self.queues.cache_progress.put({"type": "error", "status_text": "Cache build cancelled by user."})
+                return
+
             self.queues.cache_progress.put({"type": "complete", "status_text": "Cache built successfully."})
 
             if self.on_complete:
-                self.on_complete(metadata=metadata, cache_dir=str(self.data_folder / 'video_cache'))
-        except Exception as e:
-            print(f"ERROR building cache: {e}")
-            import traceback
-            traceback.print_exc()
-            self.queues.cache_progress.put({"type": "error", "status_text": f"ERROR: {str(e)}"})
+                self.on_complete(metadata=metadata, cache_dir=cache_dir)
+
+        except (Exception, InterruptedError) as e:
+            if self.cancel_build_event and self.cancel_build_event.is_set():
+                self.queues.cache_progress.put({"type": "error", "status_text": "Cache build cancelled."})
+            else:
+                print(f"ERROR building cache: {e}")
+                import traceback
+                traceback.print_exc()
+                self.queues.cache_progress.put({"type": "error", "status_text": f"ERROR: {str(e)}"})
+        finally:
+            if self.cancel_build_event and self.cancel_build_event.is_set():
+                print("Cleaning up cancelled cache build...")
+                time.sleep(0.5)
+
+                # Ensure builder was instantiated before trying to delete
+                if builder:
+                    builder.delete_cache()
+                elif Path(cache_dir).exists(): # Fallback cleanup
+                    shutil.rmtree(cache_dir)
+                print("Cleanup complete.")
+            if self.manager:
+                self.manager.shutdown()
 
     def _clear_ram_chunks(self, cache_reader: VideoCacheReader):
         """Clears in-memory cache and shows a confirmation."""
@@ -187,7 +274,6 @@ class CacheManagerDialog:
         if dpg.does_item_exist(self.dialog_tag):
             dpg.delete_item(self.dialog_tag)
 
-        # Show confirmation
         confirm_tag = "cache_cleared_dialog"
         if dpg.does_item_exist(confirm_tag):
             dpg.delete_item(confirm_tag)
