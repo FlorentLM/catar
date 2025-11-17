@@ -11,8 +11,8 @@ import dearpygui.dearpygui as dpg
 import config
 from state import AppState, Queues
 from gui import create_ui, update_ui, resize_video_widgets
-from utils import load_and_match_videos, probe_video, calculate_fundamental_matrices
-from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker
+from utils import load_and_match_videos, probe_video
+from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker, BAWorker
 from viz_3d import Open3DVisualizer
 from video_cache import VideoCacheBuilder, VideoCacheReader
 
@@ -153,6 +153,38 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                 dpg.set_value("ga_generation_text", f"Generation: {ga_progress['generation']}")
                 dpg.set_value("ga_fitness_text", f"Best Fitness: {app_state.best_fitness:.2f}")
                 dpg.set_value("ga_mean_fitness_text", f"Mean Fitness: {ga_progress['mean_fitness']:.2f}")
+
+        except queue.Empty:
+            pass
+
+        # Process bundle adjustment results
+        try:
+            ba_result = queues.ba_results.get_nowait()
+            dpg.hide_item("ba_progress_popup")
+
+            if ba_result['status'] == 'success':
+                print("Applying refined calibration from BA.")
+                refined_calib = ba_result['refined_calibration']
+
+                with app_state.lock:
+                    # Always update the main calibration
+                    app_state.set_calibration(refined_calib)
+
+                    # Conditionally update the 3D points if they were returned
+                    refined_3d_points = ba_result.get('refined_3d_points')
+                    if refined_3d_points is not None:
+                        print("Applying refined 3D points for calibration frames.")
+                        calib_indices = ba_result['calibration_frame_indices']
+                        for i, frame_idx in enumerate(calib_indices):
+                            app_state.reconstructed_3d_points[frame_idx] = refined_3d_points[i]
+                    else:
+                        print("BA was run in scaffolding mode; 3D points were not updated.")
+
+                    app_state.needs_3d_reconstruction = True
+                    app_state.best_fitness = 0.0
+
+            elif ba_result['status'] == 'error':
+                print(f"BA ERROR: {ba_result['message']}")
 
         except queue.Empty:
             pass
@@ -324,7 +356,8 @@ def main():
             queues.frames_for_rendering,
             queues.results
         ),
-        GAWorker(queues.ga_command, queues.ga_progress)
+        GAWorker(queues.ga_command, queues.ga_progress),
+        BAWorker(queues.ba_command, queues.ba_results)
     ]
 
     # Start all workers

@@ -33,6 +33,9 @@ class Queues:
     # Worker command queues
     tracking_command: queue.Queue = field(default_factory=queue.Queue)
     ga_command: multiprocessing.Queue = field(default_factory=multiprocessing.Queue)
+    ba_command: multiprocessing.Queue = field(default_factory=multiprocessing.Queue)
+
+    ba_results: multiprocessing.Queue = field(default_factory=multiprocessing.Queue)
 
     # Worker progress queues
     tracking_progress: queue.Queue = field(default_factory=queue.Queue)
@@ -46,6 +49,7 @@ class Queues:
         self.frames_for_tracking.put({"action": "shutdown"})
         self.frames_for_rendering.put({"action": "shutdown"})
         self.ga_command.put({"action": "shutdown"})
+        self.ba_command.put({"action": "shutdown"})
 
 
 class AppState:
@@ -116,6 +120,7 @@ class AppState:
         self.best_fitness: float = float('inf')
         self.fundamental_matrices: Optional[Dict[Tuple[int, int], np.ndarray]] = None
         self.is_ga_running: bool = False
+        self.ba_independent_points: bool = False
 
         self.scene_centre = np.zeros(3)
 
@@ -141,6 +146,18 @@ class AppState:
                 "best_individual": self.best_individual,
                 "generation": 0,
                 "scene_centre": self.scene_centre.copy()
+            }
+
+    def get_ba_snapshot(self) -> Dict[str, Any]:
+        """Create a snapshot of state needed by the BA worker."""
+
+        with self.lock:
+            return {
+                "annotations": self.annotations.copy(),
+                "calibration_frames": list(self.calibration_frames),
+                "video_metadata": self.video_metadata.copy(),
+                "best_individual": self.best_individual,
+                "ba_independent_points": self.ba_independent_points,
             }
 
     def save_to_disk(self, folder: Path):

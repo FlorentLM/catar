@@ -68,6 +68,8 @@ def create_ui(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
 
     # Popups
     _create_ga_popup(app_state, queues)
+    _create_ba_config_popup(app_state, queues)
+    _create_ba_progress_popup(app_state, queues)
     _create_batch_track_popup(app_state)
     _create_loupe_popup()
 
@@ -171,6 +173,11 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 label="Add Frame to Calibration Set (C)",
                 callback=_add_to_calib_frames_callback,
                 user_data=user_data
+            )
+            dpg.add_menu_item(
+                label="Refine Calibration (Bundle Adjustment)",
+                callback=lambda: dpg.show_item("ba_config_popup"),
+                user_data={"app_state": app_state, "queues": queues}
             )
             dpg.add_separator()
             dpg.add_text("--- DEBUG ---")
@@ -404,6 +411,45 @@ def _create_ga_popup(app_state: AppState, queues: Queues):
             width=-1
         )
 
+
+def _create_ba_config_popup(app_state: AppState, queues: Queues):
+    """Creates the popup for configuring the BA run before starting."""
+
+    user_data = {"app_state": app_state, "queues": queues}
+
+    with dpg.window(label="Refine Calibration Settings", modal=True, show=False, tag="ba_config_popup", width=450,
+                    no_close=True):
+        dpg.add_text("Configure the refinement process before starting.")
+        dpg.add_separator()
+        dpg.add_checkbox(
+            label="Treat points as independent (for arbitrary/scaffolding points)",
+            tag="ba_independent_points_checkbox",
+            default_value=False,
+        )
+        dpg.add_text("Use this if your annotated points are NOT the same keypoints across different frames.", wrap=400)
+        dpg.add_separator()
+
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Start Refinement", callback=_start_ba_callback, user_data=user_data, width=-1)
+            dpg.add_button(label="Cancel", callback=lambda: dpg.hide_item("ba_config_popup"), width=80)
+
+
+def _create_ba_progress_popup(app_state: AppState, queues: Queues):
+    """Create bundle adjustment progress popup."""
+
+    with dpg.window(
+        label="Refining Calibration",
+        modal=True,
+        show=False,
+        tag="ba_progress_popup",
+        width=400,
+        height=150,
+        no_close=True,
+        no_move=True
+    ):
+        dpg.add_text("Running Bundle Adjustment...", tag="ba_status_text")
+        dpg.add_text("This may take a few minutes...")
+        dpg.add_separator()
 
 def _create_batch_track_popup(app_state: AppState):
     """Create batch tracking progress popup."""
@@ -1026,6 +1072,32 @@ def _stop_ga_callback(sender, app_data, user_data):
     dpg.hide_item("ga_popup")
 
 
+def _start_ba_callback(sender, app_data, user_data):
+    """Start bundle adjustment for calibration."""
+
+    app_state = user_data["app_state"]
+    queues = user_data["queues"]
+
+    with app_state.lock:
+        app_state.ba_independent_points = dpg.get_value("ba_independent_points_checkbox")
+        ba_snapshot = app_state.get_ba_snapshot()
+
+    queues.ba_command.put({
+        "action": "start",
+        "ba_state_snapshot": ba_snapshot
+    })
+
+    # Update the status text based on the mode
+    mode_text = "per-frame scaffolding" if app_state.ba_independent_points else "temporally-consistent pose"
+    dpg.set_value("ba_status_text", f"Running Bundle Adjustment ({mode_text})...")
+
+    # Hide the config window and show the progress window
+    dpg.hide_item("ba_config_popup")
+    dpg.show_item("ba_progress_popup")
+
+#TODO: A stop callback and button for the BA
+
+
 def _clear_calibration_callback(sender, app_data, user_data):
     """Clears the current calibration from the app state."""
 
@@ -1034,6 +1106,7 @@ def _clear_calibration_callback(sender, app_data, user_data):
         app_state.best_individual = None
         app_state.best_fitness = float('inf')
         app_state.fundamental_matrices = None  # also clear dependent properties
+
 
 # ============================================================================
 # Callbacks - Keyboard

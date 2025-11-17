@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import jax.numpy as jnp
 
+from mokap.calibration import bundle_adjustment
 from mokap.utils.geometry import transforms
 from mokap.utils.geometry.fitting import quaternion_average
 
@@ -633,4 +634,175 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
         "std_fitness": std_fitness,
         "next_population": next_population,
         "stagnation_counter": stagnation_counter,
+    }
+
+
+def _prepare_ba_data_independent(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Prepares data for BA assuming no temporal correspondence."""
+
+    print("[BA] Mode: Independent per-frame structure (scaffolding).")
+
+    all_annots = snapshot["annotations"]
+    initial_calib = snapshot["best_individual"]
+    calib_frames = snapshot["calibration_frames"]
+
+    proj_matrices = np.array([get_projection_matrix(cam) for cam in initial_calib])
+    annots_in_calib_frames = all_annots[calib_frames, ..., :2]
+    P, C, N_per_frame, _ = annots_in_calib_frames.shape
+
+    # Triangulate and validate initial 3D points
+    initial_per_frame_structure = np.full((P, N_per_frame, 3), np.nan, dtype=np.float32)
+    for i in range(P):
+        frame_annots_for_triang = np.transpose(annots_in_calib_frames[i], (0, 1, 2))
+        initial_per_frame_structure[i] = triangulate_points(frame_annots_for_triang, proj_matrices)
+
+    if np.all(np.isnan(initial_per_frame_structure)):
+        raise ValueError("Initial triangulation failed for all points in independent mode.")
+
+    # Create sparse data structures for BA
+    N_total = P * N_per_frame
+    scene_points3d_initial_flat = initial_per_frame_structure.reshape(N_total, 3)
+
+    annots_for_ba_slicing = np.transpose(annots_in_calib_frames, (1, 0, 2, 3))  # C, P, N, 2
+    scene_points2d_for_ba = np.full((C, P, N_total, 2), np.nan, dtype=np.float32)
+    visibility_mask_for_ba = np.zeros((C, P, N_total), dtype=bool)
+
+    for p in range(P):
+        start_idx, end_idx = p * N_per_frame, (p + 1) * N_per_frame
+        scene_points2d_for_ba[:, p, start_idx:end_idx, :] = annots_for_ba_slicing[:, p, :, :]
+        valid_annots_mask = ~np.isnan(annots_for_ba_slicing[:, p, :, 0])
+        visibility_mask_for_ba[:, p, start_idx:end_idx] = valid_annots_mask
+
+    return {
+        "scene_points3d_initial": np.nan_to_num(scene_points3d_initial_flat),
+        "scene_points2d": np.nan_to_num(scene_points2d_for_ba),
+        "scene_visibility_mask": visibility_mask_for_ba,
+        "initial_structure": None,  # not needed for this mode
+        "P": P,
+        "N": N_per_frame  # in this mode N is per frame
+    }
+
+
+def _prepare_ba_data_consistent(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Prepares data for BA assuming temporal correspondence."""
+
+    print("[BA] Mode: Temporally-consistent structure (pose refinement).")
+
+    all_annots = snapshot["annotations"]
+    initial_calib = snapshot["best_individual"]
+    calib_frames = snapshot["calibration_frames"]
+
+    proj_matrices = np.array([get_projection_matrix(cam) for cam in initial_calib])
+    annots_for_ba = all_annots[calib_frames, ..., :2]
+    P, C, N, _ = annots_for_ba.shape
+
+    initial_structure = np.full((P, N, 3), np.nan, dtype=np.float32)
+    for i in range(P):
+        initial_structure[i] = triangulate_points(annots_for_ba[i], proj_matrices)
+
+    if np.all(np.isnan(initial_structure)):
+        raise ValueError("Could not generate any valid 3D points for consistent mode.")
+
+    # CPass the full nan-filled array. The optimizer handles it.
+    scene_points3d_initial = initial_structure.reshape(-1, 3)
+
+    scene_points2d = np.transpose(annots_for_ba, (1, 0, 2, 3))
+    visibility_mask = ~np.isnan(scene_points2d[..., 0])
+
+    return {
+        "scene_points3d_initial": np.nan_to_num(scene_points3d_initial),
+        "scene_points2d": np.nan_to_num(scene_points2d),
+        "scene_visibility_mask": visibility_mask,
+        "initial_structure": initial_structure
+    }
+
+
+def run_adjustment_perframe(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Prepares CATAR data and runs bundle adjustment.
+    """
+
+    print("[BA] Preparing data...")
+
+    initial_calib = snapshot.get("best_individual")
+    video_meta = snapshot.get("video_metadata")
+    calib_frames = snapshot.get("calibration_frames")
+    time_independent_mode = snapshot.get("ba_independent_points", False)
+
+    if not calib_frames or initial_calib is None:
+        return {"status": "error", "message": "Missing calibration frames or initial calibration."}
+
+    try:
+        if time_independent_mode:
+            ba_data = _prepare_ba_data_independent(snapshot)
+        else:
+            ba_data = _prepare_ba_data_consistent(snapshot)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
+    print("[BA] Starting optimization engine...")
+    image_sizes_wh = np.array([[video_meta['width'], video_meta['height']]] * video_meta['num_videos'])
+
+    # Call bundle_adjustment with the new explicit flag
+    success, results = bundle_adjustment.run_bundle_adjustment(
+
+        camera_matrices=jnp.asarray(
+            np.array([[[c['fx'], 0, c['cx']], [0, c['fy'], c['cy']], [0, 0, 1]] for c in initial_calib])),
+        distortion_coeffs=jnp.asarray(np.array([c['dist'] for c in initial_calib])),
+        cam_rvecs=jnp.asarray(np.array([c['rvec'] for c in initial_calib])),
+        cam_tvecs=jnp.asarray(np.array([c['tvec'] for c in initial_calib])),
+
+        images_sizes_wh=image_sizes_wh,
+
+        scene_points3d_initial=jnp.asarray(ba_data["scene_points3d_initial"]),
+        scene_points2d=jnp.asarray(ba_data["scene_points2d"]),
+        scene_visibility_mask=jnp.asarray(ba_data["scene_visibility_mask"]),
+
+        time_independent_mode=time_independent_mode,
+
+        fix_scene=False,
+        fix_board_poses=True,
+        fix_camera_matrix=False,
+        fix_distortion=False,
+        fix_extrinsics=False,
+
+        origin_idx=0, max_nfev=200
+    )
+
+    if not success:
+        return {"status": "error", "message": "Bundle Adjustment failed to converge."}
+
+    print("[BA] Optimization successful!")
+    K_opt, D_opt, r_opt, t_opt = results['K_opt'], results['D_opt'], results['cam_r_opt'], results['cam_t_opt']
+
+    refined_calib = []
+    for i in range(video_meta['num_videos']):
+        refined_calib.append({
+            'fx': float(K_opt[i, 0, 0]), 'fy': float(K_opt[i, 1, 1]),
+            'cx': float(K_opt[i, 0, 2]), 'cy': float(K_opt[i, 1, 2]),
+            'dist': np.asarray(D_opt[i]), 'rvec': np.asarray(r_opt[i]), 'tvec': np.asarray(t_opt[i]),
+        })
+
+    refined_points_to_return = None
+
+    if not time_independent_mode:
+        initial_structure = ba_data["initial_structure"]
+        P, N, _ = initial_structure.shape
+
+        refined_points_flat = np.asarray(results['scene_points_opt']).copy()
+
+        # Check that the optimizer didn't cull points (it shouldnt)
+        if refined_points_flat.size == initial_structure.size:
+            refined_points_to_return = refined_points_flat.reshape(P, N, 3)
+
+            # Restore nans where points were invalid from the start
+            refined_points_to_return[np.isnan(initial_structure)] = np.nan
+        else:
+            print("WARNING: BA result size mismatch. Cannot update 3D points.")
+
+    return {
+        "status": "success",
+        "refined_calibration": refined_calib,
+        "refined_3d_points": refined_points_to_return,
+        "calibration_frame_indices": calib_frames
     }

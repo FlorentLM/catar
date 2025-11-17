@@ -11,7 +11,7 @@ import numpy as np
 from typing import List, Optional
 
 import config
-from core import create_camera_visual, run_genetic_step, process_frame
+from core import create_camera_visual, run_genetic_step, process_frame, run_adjustment_perframe
 from state import AppState
 from viz_3d import Open3DVisualizer, SceneObject
 from video_cache import VideoCacheReader
@@ -536,3 +536,39 @@ class GAWorker(multiprocessing.Process):
                 time.sleep(0.01)
 
         print("GA worker shut down.")
+
+
+class BAWorker(multiprocessing.Process):
+    """Runs bundle adjustment in a separate process."""
+
+    def __init__(self, command_queue: multiprocessing.Queue, results_queue: multiprocessing.Queue):
+        super().__init__(name="BAWorker")
+        self.command_queue = command_queue
+        self.results_queue = results_queue
+
+    def run(self):
+        print("BA worker started.")
+        while True:
+            try:
+                command = self.command_queue.get()  # Block until a command arrives
+
+                if command.get("action") == "shutdown":
+                    break
+
+                if command.get("action") == "start":
+                    print("BA worker received start command.")
+                    snapshot = command.get("ba_state_snapshot")
+                    try:
+                        results = run_adjustment_perframe(snapshot)
+                        self.results_queue.put(results)
+                    except Exception as e:
+                        import traceback
+                        print(f"--- BA WORKER EXCEPTION ---")
+                        traceback.print_exc()
+                        print(f"--- END EXCEPTION ---")
+                        self.results_queue.put({"status": "error", "message": str(e)})
+
+            except queue.Empty:
+                continue
+
+        print("BA worker shut down.")
