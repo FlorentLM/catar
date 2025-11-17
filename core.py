@@ -533,10 +533,15 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
                     for key in ['fx', 'fy', 'cx', 'cy']:
                         mutated_cam[key] += np.random.normal(0,
                                                              config.GA_MUTATION_STRENGTH_INIT * abs(mutated_cam[key]))
-                    for key in ['rvec', 'tvec', 'dist']:
+                    for key in ['tvec', 'dist']:
                         mutated_cam[key] = np.asarray(mutated_cam[key]) + np.random.normal(0,
                                                                                            config.GA_MUTATION_STRENGTH_INIT,
                                                                                            size=mutated_cam[key].shape)
+                    # TODO: This needs to be done more cleanly
+                    mutated_cam['rvec'] = np.asarray(mutated_cam['rvec']) + np.random.normal(0,
+                                                                                       config.GA_MUTATION_STRENGTH_INIT * 0.001, # Massively reduce mutation on rvec because radians
+                                                                                       size=mutated_cam['rvec'].shape)
+
                     mutated_ind.append(mutated_cam)
                 population.append(mutated_ind)
         else:
@@ -605,9 +610,13 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
                 for key in ['fx', 'fy', 'cx', 'cy']:
                     child_cam[key] = child_cam[key] + np.random.normal(0, current_mutation_strength * abs(
                         child_cam[key]))
-                for key in ['rvec', 'tvec', 'dist']:
+                for key in ['tvec', 'dist']:
                     child_cam[key] = child_cam[key] + np.random.normal(0, current_mutation_strength,
                                                                        size=child_cam[key].shape)
+                # TODO: This needs to be done more cleanly
+                child_cam['rvec'] = child_cam['rvec'] + np.random.normal(0,
+                                                                         current_mutation_strength * 0.001,  # Massively reduce mutation on rvec because radians
+                                                                         size=child_cam['rvec'].shape)
 
             child.append(child_cam)
         next_population.append(child)
