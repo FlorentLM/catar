@@ -2,7 +2,7 @@ import itertools
 import sys
 import tomllib
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Union
 
 import Levenshtein
 
@@ -149,7 +149,7 @@ def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, i
     return f_mats
 
 
-def triangulate_points(frame_annotations: np.ndarray, proj_matrices: List[np.ndarray]) -> np.ndarray:
+def triangulate_points(frame_annotations: np.ndarray, proj_matrices: Union[np.ndarray, List[np.ndarray]]) -> np.ndarray:
     """Triangulates 3D points using mokap."""
 
     num_cams, num_points, _ = frame_annotations.shape

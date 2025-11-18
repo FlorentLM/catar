@@ -637,134 +637,125 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _prepare_ba_data_independent(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    """Prepares data for BA assuming no temporal correspondence."""
-
-    print("[BA] Mode: Independent per-frame structure (scaffolding).")
-
-    all_annots = snapshot["annotations"]
-    initial_calib = snapshot["best_individual"]
-    calib_frames = snapshot["calibration_frames"]
-
-    proj_matrices = np.array([get_projection_matrix(cam) for cam in initial_calib])
-    annots_in_calib_frames = all_annots[calib_frames, ..., :2]
-    P, C, N_per_frame, _ = annots_in_calib_frames.shape
-
-    # Triangulate and validate initial 3D points
-    initial_per_frame_structure = np.full((P, N_per_frame, 3), np.nan, dtype=np.float32)
-    for i in range(P):
-        frame_annots_for_triang = np.transpose(annots_in_calib_frames[i], (0, 1, 2))
-        initial_per_frame_structure[i] = triangulate_points(frame_annots_for_triang, proj_matrices)
-
-    if np.all(np.isnan(initial_per_frame_structure)):
-        raise ValueError("Initial triangulation failed for all points in independent mode.")
-
-    # Create sparse data structures for BA
-    N_total = P * N_per_frame
-    scene_points3d_initial_flat = initial_per_frame_structure.reshape(N_total, 3)
-
-    annots_for_ba_slicing = np.transpose(annots_in_calib_frames, (1, 0, 2, 3))  # C, P, N, 2
-    scene_points2d_for_ba = np.full((C, P, N_total, 2), np.nan, dtype=np.float32)
-    visibility_mask_for_ba = np.zeros((C, P, N_total), dtype=bool)
-
-    for p in range(P):
-        start_idx, end_idx = p * N_per_frame, (p + 1) * N_per_frame
-        scene_points2d_for_ba[:, p, start_idx:end_idx, :] = annots_for_ba_slicing[:, p, :, :]
-        valid_annots_mask = ~np.isnan(annots_for_ba_slicing[:, p, :, 0])
-        visibility_mask_for_ba[:, p, start_idx:end_idx] = valid_annots_mask
-
-    return {
-        "scene_points3d_initial": np.nan_to_num(scene_points3d_initial_flat),
-        "scene_points2d": np.nan_to_num(scene_points2d_for_ba),
-        "scene_visibility_mask": visibility_mask_for_ba,
-        "initial_structure": None,  # not needed for this mode
-        "P": P,
-        "N": N_per_frame  # in this mode N is per frame
-    }
-
-
-def _prepare_ba_data_consistent(snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    """Prepares data for BA assuming temporal correspondence."""
-
-    print("[BA] Mode: Temporally-consistent structure (pose refinement).")
-
-    all_annots = snapshot["annotations"]
-    initial_calib = snapshot["best_individual"]
-    calib_frames = snapshot["calibration_frames"]
-
-    proj_matrices = np.array([get_projection_matrix(cam) for cam in initial_calib])
-    annots_for_ba = all_annots[calib_frames, ..., :2]
-    P, C, N, _ = annots_for_ba.shape
-
-    initial_structure = np.full((P, N, 3), np.nan, dtype=np.float32)
-    for i in range(P):
-        initial_structure[i] = triangulate_points(annots_for_ba[i], proj_matrices)
-
-    if np.all(np.isnan(initial_structure)):
-        raise ValueError("Could not generate any valid 3D points for consistent mode.")
-
-    # CPass the full nan-filled array. The optimizer handles it.
-    scene_points3d_initial = initial_structure.reshape(-1, 3)
-
-    scene_points2d = np.transpose(annots_for_ba, (1, 0, 2, 3))
-    visibility_mask = ~np.isnan(scene_points2d[..., 0])
-
-    return {
-        "scene_points3d_initial": np.nan_to_num(scene_points3d_initial),
-        "scene_points2d": np.nan_to_num(scene_points2d),
-        "scene_visibility_mask": visibility_mask,
-        "initial_structure": initial_structure
-    }
-
-
-def run_adjustment_perframe(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+def _prepare_ba_data(snapshot: Dict[str, Any], is_independent: bool) -> Dict[str, Any]:
     """
-    Prepares CATAR data and runs bundle adjustment.
+    Prepares data for BA.
+    """
+
+    all_annots = snapshot["annotations"]
+    initial_calib = snapshot["best_individual"]
+    calib_frames = snapshot["calibration_frames"]
+
+    annots_in_calib_frames = all_annots[calib_frames, ..., :2]
+    P, C, N_potential, _ = annots_in_calib_frames.shape
+    proj_matrices = np.array([get_projection_matrix(cam) for cam in initial_calib])
+
+    if not is_independent:
+        initial_structure = np.full((P, N_potential, 3), np.nan, dtype=np.float32)
+        for i in range(P):
+            initial_structure[i] = triangulate_points(annots_in_calib_frames[i], proj_matrices)
+        if np.all(np.isnan(initial_structure)):
+            raise ValueError("Temporally-consistent triangulation failed for all points.")
+        return {
+            "image_points": np.nan_to_num(np.transpose(annots_in_calib_frames, (1, 0, 2, 3))),
+            "visibility_mask": ~np.isnan(np.transpose(annots_in_calib_frames, (1, 0, 2, 3))[..., 0]),
+            "object_points_initial": np.nan_to_num(initial_structure.reshape(-1, 3)),
+            "initial_structure_for_masking": initial_structure
+        }
+    else:
+        # Scaffolding mode
+        per_frame_3d = []
+        per_frame_2d = []
+        num_points_per_frame = []
+
+        for p in range(P):
+            frame_annots = annots_in_calib_frames[p]
+            points_3d = triangulate_points(frame_annots, proj_matrices)
+            valid_mask = ~np.isnan(points_3d).any(axis=-1)
+
+            valid_3d = points_3d[valid_mask]
+            valid_2d = frame_annots[:, valid_mask, :]
+
+            per_frame_3d.append(valid_3d)
+            per_frame_2d.append(valid_2d)
+            num_points_per_frame.append(len(valid_3d))
+
+        if sum(num_points_per_frame) == 0:
+            raise ValueError("Scaffolding triangulation failed. No valid 3D points could be generated.")
+
+        N_max = max(num_points_per_frame) if num_points_per_frame else 0
+
+        padded_3d = np.full((P, N_max, 3), np.nan, dtype=np.float32)
+        padded_2d = np.full((C, P, N_max, 2), np.nan, dtype=np.float32)
+
+        for p in range(P):
+            n_pts = num_points_per_frame[p]
+            if n_pts > 0:
+                padded_3d[p, :n_pts] = per_frame_3d[p]
+                padded_2d[:, p, :n_pts] = per_frame_2d[p]
+
+        return {
+            "image_points": np.nan_to_num(padded_2d),
+            "visibility_mask": ~np.isnan(padded_2d[:, :, :, 0]),
+            "object_points_initial": np.nan_to_num(padded_3d.reshape(-1, 3)),
+            "initial_structure_for_masking": None
+        }
+
+def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Prepares CATAR data and runs bundle adjustment based on the selected mode.
     """
 
     print("[BA] Preparing data...")
 
+    mode = snapshot.get("mode", "full_ba")
     initial_calib = snapshot.get("best_individual")
     video_meta = snapshot.get("video_metadata")
     calib_frames = snapshot.get("calibration_frames")
-    time_independent_mode = snapshot.get("ba_independent_points", False)
 
     if not calib_frames or initial_calib is None:
         return {"status": "error", "message": "Missing calibration frames or initial calibration."}
 
+    # Set flags based on mode
+    if mode == "refine_cameras_only":
+        is_independent_mode = True
+        fix_cameras = False
+        fix_points = False
+    elif mode == "refine_points_only":
+        is_independent_mode = False
+        fix_cameras = True
+        fix_points = False
+    else:  # "full_ba"
+        is_independent_mode = False
+        fix_cameras = False
+        fix_points = False
+
     try:
-        if time_independent_mode:
-            ba_data = _prepare_ba_data_independent(snapshot)
-        else:
-            ba_data = _prepare_ba_data_consistent(snapshot)
+        ba_data = _prepare_ba_data(snapshot, is_independent_mode)
     except ValueError as e:
         return {"status": "error", "message": str(e)}
 
     print("[BA] Starting optimization engine...")
     image_sizes_wh = np.array([[video_meta['width'], video_meta['height']]] * video_meta['num_videos'])
 
-    # Call bundle_adjustment with the new explicit flag
     success, results = bundle_adjustment.run_bundle_adjustment(
-
-        camera_matrices=jnp.asarray(
+        camera_matrices_initial=jnp.asarray(
             np.array([[[c['fx'], 0, c['cx']], [0, c['fy'], c['cy']], [0, 0, 1]] for c in initial_calib])),
-        distortion_coeffs=jnp.asarray(np.array([c['dist'] for c in initial_calib])),
-        cam_rvecs=jnp.asarray(np.array([c['rvec'] for c in initial_calib])),
-        cam_tvecs=jnp.asarray(np.array([c['tvec'] for c in initial_calib])),
-
+        distortion_coeffs_initial=jnp.asarray(np.array([c['dist'] for c in initial_calib])),
+        cam_rvecs_initial=jnp.asarray(np.array([c['rvec'] for c in initial_calib])),
+        cam_tvecs_initial=jnp.asarray(np.array([c['tvec'] for c in initial_calib])),
         images_sizes_wh=image_sizes_wh,
 
-        scene_points3d_initial=jnp.asarray(ba_data["scene_points3d_initial"]),
-        scene_points2d=jnp.asarray(ba_data["scene_points2d"]),
-        scene_visibility_mask=jnp.asarray(ba_data["scene_visibility_mask"]),
+        image_points=jnp.asarray(ba_data["image_points"]),
+        visibility_mask=jnp.asarray(ba_data["visibility_mask"]),
+        object_points_initial=jnp.asarray(ba_data["object_points_initial"]),
 
-        time_independent_mode=time_independent_mode,
-
-        fix_scene=False,
-        fix_board_poses=True,
-        fix_camera_matrix=False,
-        fix_distortion=False,
-        fix_extrinsics=False,
+        # Set flags based on mode
+        fix_cameras_intrinsics=fix_cameras,
+        fix_cameras_extrinsics=fix_cameras,
+        fix_object_points=fix_points,
+        fix_poses=True,  # we never optimize board poses in CATAR (well, at least for now)
+        time_independent_points=is_independent_mode,
 
         origin_idx=0, max_nfev=200
     )
@@ -784,21 +775,12 @@ def run_adjustment_perframe(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         })
 
     refined_points_to_return = None
-
-    if not time_independent_mode:
-        initial_structure = ba_data["initial_structure"]
-        P, N, _ = initial_structure.shape
-
-        refined_points_flat = np.asarray(results['scene_points_opt']).copy()
-
-        # Check that the optimizer didn't cull points (it shouldnt)
-        if refined_points_flat.size == initial_structure.size:
-            refined_points_to_return = refined_points_flat.reshape(P, N, 3)
-
-            # Restore nans where points were invalid from the start
-            refined_points_to_return[np.isnan(initial_structure)] = np.nan
-        else:
-            print("WARNING: BA result size mismatch. Cannot update 3D points.")
+    if not is_independent_mode and not fix_points:
+        P, _, N, _ = ba_data["image_points"].shape
+        refined_points_flat = np.asarray(results['object_points_opt']).copy()
+        refined_points_to_return = refined_points_flat.reshape(P, N, 3)
+        initial_invalid_mask = np.isnan(ba_data["initial_structure_for_masking"])
+        refined_points_to_return[initial_invalid_mask] = np.nan
 
     return {
         "status": "success",

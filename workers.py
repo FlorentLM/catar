@@ -11,7 +11,7 @@ import numpy as np
 from typing import List, Optional
 
 import config
-from core import create_camera_visual, run_genetic_step, process_frame, run_adjustment_perframe
+from core import create_camera_visual, run_genetic_step, process_frame, run_refinement
 from state import AppState
 from viz_3d import Open3DVisualizer, SceneObject
 from video_cache import VideoCacheReader
@@ -559,7 +559,7 @@ class BAWorker(multiprocessing.Process):
                     print("BA worker received start command.")
                     snapshot = command.get("ba_state_snapshot")
                     try:
-                        results = run_adjustment_perframe(snapshot)
+                        results = run_refinement(snapshot)
                         self.results_queue.put(results)
                     except Exception as e:
                         import traceback

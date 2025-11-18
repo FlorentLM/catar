@@ -417,17 +417,27 @@ def _create_ba_config_popup(app_state: AppState, queues: Queues):
 
     user_data = {"app_state": app_state, "queues": queues}
 
-    with dpg.window(label="Refine Calibration Settings", modal=True, show=False, tag="ba_config_popup", width=450,
+    with dpg.window(label="Bundle Adjustment Settings", modal=True, show=False, tag="ba_config_popup", width=450,
                     no_close=True):
-        dpg.add_text("Configure the refinement process before starting.")
-        dpg.add_separator()
-        dpg.add_checkbox(
-            label="Treat points as independent (for arbitrary/scaffolding points)",
-            tag="ba_independent_points_checkbox",
-            default_value=False,
+        dpg.add_text("What is your primary goal?")
+        dpg.add_radio_button(
+            tag="ba_mode_radio",
+            items=[
+                "Refine Cameras",
+                "Refine Cameras and 3D Points",
+                "Refine 3D Points only (Trajectory Smoothing)"
+            ],
+            default_value="Refine Cameras",
+            callback=_ba_mode_changed_callback
         )
-        dpg.add_text("Use this if your annotated points are NOT the same keypoints across different frames.", wrap=400)
+
         dpg.add_separator()
+        with dpg.group():
+            dpg.add_text("", tag="ba_help_text", wrap=420)
+        dpg.add_separator()
+
+        # Initialise the help text for the default selection
+        _ba_mode_changed_callback(None, "Refine Camera Calibration", None)
 
         with dpg.group(horizontal=True):
             dpg.add_button(label="Start Refinement", callback=_start_ba_callback, user_data=user_data, width=-1)
@@ -438,18 +448,11 @@ def _create_ba_progress_popup(app_state: AppState, queues: Queues):
     """Create bundle adjustment progress popup."""
 
     with dpg.window(
-        label="Refining Calibration",
-        modal=True,
-        show=False,
-        tag="ba_progress_popup",
-        width=400,
-        height=150,
-        no_close=True,
-        no_move=True
+            label="Refining Calibration", modal=True, show=False, tag="ba_progress_popup",
+            width=400, height=100, no_close=True, no_move=True
     ):
         dpg.add_text("Running Bundle Adjustment...", tag="ba_status_text")
         dpg.add_text("This may take a few minutes...")
-        dpg.add_separator()
 
 def _create_batch_track_popup(app_state: AppState):
     """Create batch tracking progress popup."""
@@ -1072,26 +1075,59 @@ def _stop_ga_callback(sender, app_data, user_data):
     dpg.hide_item("ga_popup")
 
 
+def _ba_mode_changed_callback(sender, app_data, user_data):
+    """Updates the help text in the BA config popup when the mode changes."""
+
+    help_text = ""
+    if app_data == "refine_cameras_only":
+        help_text = (
+            "What will be optimized: Camera Intrinsics and Extrinsics.\n\n"
+            "Annotation Requirement: None. Point labels do NOT need to be consistent across frames.\n\n"
+            "Use Case: Fixing a poor initial camera calibration using points on a moving animal or static background features."
+        )
+    elif app_data == "full_ba":
+        help_text = (
+            "What will be optimized: Camera parameters AND the 3D positions of your points in each frame.\n\n"
+            "Annotation Requirement: CRITICAL. Keypoints must be labeled consistently for the same body part across all selected frames.\n\n"
+            "Use Case: The most powerful mode. Simultaneously improves camera calibration and the 3D reconstruction."
+        )
+    elif app_data == "refine_points_only":
+        help_text = (
+            "What will be optimized: Only the 3D positions of your points in each frame.\n\n"
+            "Annotation Requirement: CRITICAL. Keypoints must be labeled consistently.\n\n"
+            "Use Case: Smoothing or refining a 3D trajectory when you are highly confident that your camera calibration is already perfect."
+        )
+
+    dpg.set_value("ba_help_text", help_text)
+
+
 def _start_ba_callback(sender, app_data, user_data):
-    """Start bundle adjustment for calibration."""
+    """Reads the BA config, starts the BA worker, and manages popups."""
 
     app_state = user_data["app_state"]
     queues = user_data["queues"]
 
+    # Map UI selection to mode strings
+    selected_mode_label = dpg.get_value("ba_mode_radio")
+    mode_map = {
+        "Refine Camera Calibration": "refine_cameras_only",
+        "Refine Cameras AND 3D Points": "full_ba",
+        "Refine 3D Points Only (Trajectory Smoothing)": "refine_points_only"
+    }
+    mode = mode_map[selected_mode_label]
+
     with app_state.lock:
-        app_state.ba_independent_points = dpg.get_value("ba_independent_points_checkbox")
         ba_snapshot = app_state.get_ba_snapshot()
+
+    # Add the selected mode to the snapshot dictionary
+    ba_snapshot["mode"] = mode
 
     queues.ba_command.put({
         "action": "start",
         "ba_state_snapshot": ba_snapshot
     })
 
-    # Update the status text based on the mode
-    mode_text = "per-frame scaffolding" if app_state.ba_independent_points else "temporally-consistent pose"
-    dpg.set_value("ba_status_text", f"Running Bundle Adjustment ({mode_text})...")
-
-    # Hide the config window and show the progress window
+    dpg.set_value("ba_status_text", f"Running Bundle Adjustment ({selected_mode_label})...")
     dpg.hide_item("ba_config_popup")
     dpg.show_item("ba_progress_popup")
 

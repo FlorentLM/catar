@@ -120,7 +120,6 @@ class AppState:
         self.best_fitness: float = float('inf')
         self.fundamental_matrices: Optional[Dict[Tuple[int, int], np.ndarray]] = None
         self.is_ga_running: bool = False
-        self.ba_independent_points: bool = False
 
         self.scene_centre = np.zeros(3)
 
@@ -157,7 +156,6 @@ class AppState:
                 "calibration_frames": list(self.calibration_frames),
                 "video_metadata": self.video_metadata.copy(),
                 "best_individual": self.best_individual,
-                "ba_independent_points": self.ba_independent_points,
             }
 
     def save_to_disk(self, folder: Path):
