@@ -416,11 +416,21 @@ def _create_video_cell(cam_idx: int, app_state: AppState):
             height=config.DISPLAY_HEIGHT,
             tag=f"drawlist_{cam_idx}"
         ):
+            color = config.CAMERA_COLORS[cam_idx % len(config.CAMERA_COLORS)]
+            frame_thickness = 2
+
             dpg.draw_image(
                 f"video_texture_{cam_idx}",
                 pmin=(0, 0),
                 pmax=(config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT),
                 tag=f"video_image_{cam_idx}"
+            )
+            dpg.draw_rectangle(
+                pmin=(0, 0),
+                pmax=(config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT),
+                tag=f"video_border_{cam_idx}",
+                color=color,
+                thickness=frame_thickness
             )
             dpg.add_draw_layer(tag=f"annotation_layer_{cam_idx}")
 
@@ -1298,18 +1308,24 @@ def resize_video_widgets(sender, app_data, user_data):
 
     grid_width = dpg.get_item_rect_size("video_grid_window")[0]
     item_width = (grid_width / config.GRID_COLS) - 20
+    num_videos = app_state.video_metadata['num_videos']
 
     if item_width <= 0:
         return
 
     aspect_ratio = app_state.video_metadata['width'] / app_state.video_metadata['height']
     item_height = item_width / aspect_ratio
+    frame_thicnkess = 2
 
     # Resize video views
-    for i in range(app_state.video_metadata['num_videos']):
+    for i in range(num_videos):
         dpg.configure_item(f"drawlist_{i}", width=item_width, height=item_height)
-        dpg.configure_item(f"video_image_{i}", pmax=(item_width, item_height))
-
+        dpg.configure_item(
+            f"video_image_{i}",
+            pmin=(frame_thicnkess, frame_thicnkess),
+            pmax=(item_width - frame_thicnkess, item_height - frame_thicnkess)
+        )
+        dpg.configure_item(f"video_border_{i}", pmax=(item_width, item_height))
 
 def update_ui(app_state: AppState):
     """Update all UI elements."""
@@ -1364,6 +1380,7 @@ def update_annotation_overlays(app_state: AppState):
     point_names = app_state.point_names
     point_colors = app_state.point_colors
     camera_colors = app_state.camera_colors
+    camera_names = app_state.camera_names
 
     # Selected point data for special overlays
     p_idx = app_state.selected_point_idx
@@ -1372,7 +1389,6 @@ def update_annotation_overlays(app_state: AppState):
     selected_annots = app_state.annotations[frame_idx, :, p_idx]
     point_3d = app_state.reconstructed_3d_points[frame_idx, p_idx]
 
-    # Draw
     for cam_idx in range(num_videos):
         layer_tag = f"annotation_layer_{cam_idx}"
         drawlist_tag = f"drawlist_{cam_idx}"
@@ -1390,7 +1406,7 @@ def update_annotation_overlays(app_state: AppState):
             _draw_epipolar_lines(
                 cam_idx, selected_annots, f_mats, num_videos,
                 video_w, video_h, scale_x, scale_y,
-                camera_colors, layer_tag
+                camera_colors, camera_names, layer_tag
             )
 
         # reprojection for selected point
@@ -1410,14 +1426,13 @@ def update_annotation_overlays(app_state: AppState):
 
 
 def _draw_epipolar_lines(
-    cam_idx, selected_annots, f_mats, num_videos,
-    video_w, video_h, scale_x, scale_y,
-    camera_colors, layer_tag
+        cam_idx, selected_annots, f_mats, num_videos,
+        video_w, video_h, scale_x, scale_y,
+        camera_colors, camera_names, layer_tag
 ):
-    """Draws epipolar lines from the other cameras."""
+    """Draws epipolar lines from the other cameras with labels placed inside the view."""
 
     for from_cam in range(num_videos):
-
         if cam_idx == from_cam:
             continue
 
@@ -1429,29 +1444,44 @@ def _draw_epipolar_lines(
         if F is None:
             continue
 
-        # epipolar line: l = F @ p
         p_hom = np.array([point_2d[0], point_2d[1], 1.0])
-        line = F @ p_hom
-        a, b, c = line
+        a, b, c = F @ p_hom
 
-        # Find two points on the line
-        if abs(b) > 1e-6:
-            x0, x1 = 0, video_w
-            y0 = (-a * x0 - c) / b
-            y1 = (-a * x1 - c) / b
-            p1, p2 = (x0, y0), (x1, y1)
-        else:
-            y0, y1 = 0, video_h
-            x0 = (-b * y0 - c) / a
-            x1 = (-b * y1 - c) / a
-            p1, p2 = (x0, y0), (x1, y1)
+        intersection_points = line_box_intersection(a, b, c, 0, 0, video_w, video_h)
 
-        # Scale and draw
-        p1_scaled = (p1[0] * scale_x, p1[1] * scale_y)
-        p2_scaled = (p2[0] * scale_x, p2[1] * scale_y)
-        color = camera_colors[from_cam % len(camera_colors)]
-        dpg.draw_line(p1_scaled, p2_scaled, color=color, thickness=1, parent=layer_tag)
+        if len(intersection_points) == 2:
+            p1_video, p2_video = intersection_points
+            color = camera_colors[from_cam % len(camera_colors)]
 
+            p1_scaled = (p1_video[0] * scale_x, p1_video[1] * scale_y)
+            p2_scaled = (p2_video[0] * scale_x, p2_video[1] * scale_y)
+            dpg.draw_line(p1_scaled, p2_scaled, color=color, thickness=1, parent=layer_tag)
+
+            # Draw the camera name label
+            anchor_pos = list(p1_scaled) # use first intersection point as anchor
+            widget_size = (video_w * scale_x, video_h * scale_y)
+            font_size = 12
+            inset = 5
+
+            # Adjust position based on which edge anchor is on
+            if anchor_pos[0] < 1:  # Left edge
+                anchor_pos[0] = inset
+            elif anchor_pos[0] > widget_size[0] - 1:  # Right edge
+                text_width_estimate = len(camera_names[from_cam]) * font_size * 0.6
+                anchor_pos[0] = widget_size[0] - text_width_estimate - inset
+
+            if anchor_pos[1] < 1:  # Top edge
+                anchor_pos[1] = inset
+            elif anchor_pos[1] > widget_size[1] - 1:  # Bottom edge
+                anchor_pos[1] = widget_size[1] - font_size - inset
+
+            dpg.draw_text(
+                pos=anchor_pos,
+                text=camera_names[from_cam],
+                color=color,
+                size=font_size,
+                parent=layer_tag
+            )
 
 def _draw_reprojection(
     cam_idx, point_3d, selected_annots,
