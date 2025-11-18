@@ -53,13 +53,12 @@ def create_ui(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
     with dpg.window(label="Main Window", tag="main_window"):
         _create_menu_bar(app_state, queues)
 
-        with dpg.child_window(
-            tag="main_content_window",
-            height=-config.BOTTOM_PANEL_HEIGHT_FULL
-        ):
+        with dpg.child_window(tag="main_content_window", height=-config.BOTTOM_PANEL_HEIGHT_FULL):
+
             with dpg.group(horizontal=True):
                 with dpg.child_window(width=config.CONTROL_PANEL_WIDTH, tag="control_panel_window"):
                     _create_control_panel(app_state, queues, open3d_viz)
+
                 with dpg.child_window(width=-1, tag="video_grid_window"):
                     _create_video_grid(app_state)
 
@@ -163,31 +162,6 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 user_data=user_data
             )
 
-        with dpg.menu(label="Calibration"):
-            dpg.add_menu_item(
-                label="Run Genetic Algorithm",
-                callback=_start_ga_callback,
-                user_data=user_data
-            )
-            dpg.add_menu_item(
-                label="Add Frame to Calibration Set (C)",
-                callback=_add_to_calib_frames_callback,
-                user_data=user_data
-            )
-            dpg.add_menu_item(
-                label="Refine (Bundle Adjustment)...",
-                callback=lambda: dpg.show_item("ba_config_popup"),
-                user_data={"app_state": app_state, "queues": queues}
-            )
-            dpg.add_separator()
-            dpg.add_text("--- DEBUG ---")
-            dpg.add_button(
-                label="/!\\ Clear Current Calibration /!\\",
-                callback=_clear_calibration_callback,
-                user_data=user_data,
-                width=-1
-            )
-
         with dpg.menu(label="Tools"):
             dpg.add_menu_item(
                 label="Manage video cache...",
@@ -201,53 +175,109 @@ def _create_control_panel(app_state: AppState, queues: Queues, open3d_viz: Open3
 
     user_data = {"app_state": app_state, "queues": queues}
 
-    dpg.add_text("--- Info ---")
+    dpg.add_text("Info")
     dpg.add_text("Focus Mode: Disabled", tag="focus_text")
-    dpg.add_text("Calibration Frames: 0", tag="num_calib_frames_text")
     dpg.add_text("Best Fitness: inf", tag="fitness_text")
     dpg.add_separator()
 
-    dpg.add_text("--- 3D View ---")
+    dpg.add_text("3D View")
+    # TODO: this debug section probably needs to be removed now
     dpg.add_button(
         label="Refresh 3D View",
         callback=lambda: open3d_viz.reset_view()
     )
     dpg.add_separator()
 
-    dpg.add_text("--- Controls ---")
-    dpg.add_combo(
-        label="Keypoint",
-        items=app_state.point_names,
-        default_value=app_state.point_names[0],
-        callback=_set_selected_point_callback,
-        user_data=user_data,
-        tag="point_combo"
-    )
-    dpg.add_button(
-        label="Track Keypoints",
-        callback=_toggle_tracking_callback,
-        user_data=user_data,
-        tag="keypoint_tracking_button"
-    )
-    dpg.add_button(
-        label="Track Forward",
-        callback=_start_batch_track_callback,
-        user_data=user_data,
-        tag="batch_track_button"
-    )
+    with dpg.collapsing_header(label="Annotate", default_open=True):
+        dpg.add_combo(
+            label="Keypoint",
+            items=app_state.point_names,
+            default_value=app_state.point_names[0],
+            callback=_set_selected_point_callback,
+            user_data=user_data,
+            tag="point_combo"
+        )
+        dpg.add_button(
+            label="Toggle live tracking",
+            callback=_toggle_tracking_callback,
+            user_data=user_data,
+            tag="keypoint_tracking_button"
+        )
+        dpg.add_button(
+            label="Track Forward",
+            callback=_start_batch_track_callback,
+            user_data=user_data,
+            tag="batch_track_button"
+        )
+
+        dpg.add_button(
+            label="Set as Human annotated (H)",
+            callback=_set_human_annotated_callback,
+            user_data=user_data
+        )
+        dpg.add_button(
+            label="Delete future annots (D)",
+            callback=_clear_future_annotations_callback,
+            user_data=user_data
+        )
 
     dpg.add_separator()
 
-    dpg.add_button(
-        label="Set Prev as Annotated (H)",
-        callback=_set_human_annotated_callback,
-        user_data=user_data
-    )
-    dpg.add_button(
-        label="Delete Future Annots (D)",
-        callback=_clear_future_annotations_callback,
-        user_data=user_data
-    )
+    with dpg.collapsing_header(label="Calibration", default_open=True):
+
+        dpg.add_text("Calibration Frames: 0", tag="num_calib_frames_text")
+
+        with dpg.group(horizontal=True):
+            dpg.add_button(
+                label="< Prev",
+                callback=_navigate_calib_frame_callback,
+                user_data={"app_state": app_state, "direction": -1},
+                width=60
+            )
+
+            dpg.add_button(
+                label="Add (C)",
+                tag="toggle_calib_frame_button",
+                callback=_toggle_calib_frame_callback,
+                user_data=user_data,
+                width=75
+            )
+
+            dpg.add_button(
+                label="Next >",
+                callback=_navigate_calib_frame_callback,
+                user_data={"app_state": app_state, "direction": 1},
+                width=60
+            )
+
+        dpg.add_button(
+            label="Clear calib set",
+            callback=_clear_calib_frames_callback,
+            user_data=user_data,
+            width=-1
+        )
+
+        dpg.add_separator()
+
+        dpg.add_button(
+            label="Create calibration (Genetic Algorithm)",
+            callback=_start_ga_callback,
+            user_data=user_data,
+            width=-1
+        )
+        dpg.add_button(
+            label="Refine (Bundle Adjustment)",
+            callback=lambda: dpg.show_item("ba_config_popup"),
+            user_data={"app_state": app_state, "queues": queues},
+            width=-1
+        )
+
+        # dpg.add_button(
+        #     label="/!\\ DEBUG: Clear Current Calibration /!\\",
+        #     callback=_clear_calibration_callback,
+        #     user_data=user_data,
+        #     width=-1
+        # )
 
     dpg.add_separator()
 
@@ -810,9 +840,8 @@ def _image_drag_callback(sender, app_data, user_data):
     )
 
     # State for handling normal vs. slow-down (Shift key) movement
-    final_scaled_pos = None
     slowdown_factor = 0.25
-    shift_is_down = dpg.is_key_down(340) or dpg.is_key_down(344) # L-Shift or R-Shift
+    shift_is_down = dpg.is_key_down(dpg.mvKey_LShift) or dpg.is_key_down(dpg.mvKey_RShift)
 
     drag_state = app_state.drag_state
     is_slowing_down = drag_state["is_slowing_down"]
@@ -1045,6 +1074,22 @@ def _show_cache_manager_callback(sender, app_data, user_data):
 # Callbacks - Calibration
 # ============================================================================
 
+
+def _toggle_calib_frame_callback(sender, app_data, user_data):
+    """Add or remove the current frame from the calibration set."""
+
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        frame_idx = app_state.frame_idx
+        if frame_idx in app_state.calibration_frames:
+            app_state.calibration_frames.remove(frame_idx)
+            print(f"Frame {frame_idx} removed from calibration set.")
+        else:
+            app_state.calibration_frames.append(frame_idx)
+            app_state.calibration_frames.sort()  # Keep the list sorted
+            print(f"Frame {frame_idx} added to calibration set.")
+
+
 def _add_to_calib_frames_callback(sender, app_data, user_data):
     """Add current frame to calibration set."""
 
@@ -1054,6 +1099,44 @@ def _add_to_calib_frames_callback(sender, app_data, user_data):
         if app_state.frame_idx not in app_state.calibration_frames:
             app_state.calibration_frames.append(app_state.frame_idx)
             print(f"Frame {app_state.frame_idx} added to calibration set.")
+
+
+def _clear_calib_frames_callback(sender, app_data, user_data):
+    """Clears the entire calibration set."""
+
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        app_state.calibration_frames.clear()
+    print("Calibration frame set has been cleared.")
+
+
+def _navigate_calib_frame_callback(sender, app_data, user_data):
+    """Jump to the next or previous frame in the calibration set."""
+
+    app_state = user_data["app_state"]
+    direction = user_data["direction"]  # +1 for next, -1 for previous
+
+    with app_state.lock:
+        calib_frames = sorted(app_state.calibration_frames)
+        if not calib_frames:
+            print("No calibration frames to navigate.")
+            return
+
+        current_frame = app_state.frame_idx
+
+        if direction == 1:  # Next
+            next_frames = [f for f in calib_frames if f > current_frame]
+            if next_frames:
+                app_state.frame_idx = next_frames[0]
+            else:
+                app_state.frame_idx = calib_frames[0]  # wrap around
+
+        elif direction == -1:  # Previous
+            prev_frames = [f for f in calib_frames if f < current_frame]
+            if prev_frames:
+                app_state.frame_idx = prev_frames[-1]
+            else:
+                app_state.frame_idx = calib_frames[-1]  # wrap around
 
 
 def _start_ga_callback(sender, app_data, user_data):
@@ -1073,6 +1156,8 @@ def _start_ga_callback(sender, app_data, user_data):
     })
 
     dpg.show_item("ga_popup")
+
+# TODO: Add a stop refinement button
 
 
 def _stop_ga_callback(sender, app_data, user_data):
@@ -1180,8 +1265,6 @@ def _on_key_press(sender, app_data, user_data):
             _save_state_callback(sender, app_data, user_data)
         case dpg.mvKey_L:
             _load_state_callback(sender, app_data, user_data)
-        case dpg.mvKey_C:
-            _add_to_calib_frames_callback(sender, app_data, user_data)
         case dpg.mvKey_Z:
             _toggle_focus_mode_callback(sender, app_data, user_data)
         case dpg.mvKey_H:
@@ -1189,6 +1272,12 @@ def _on_key_press(sender, app_data, user_data):
         case dpg.mvKey_D:
             _clear_future_annotations_callback(sender, app_data, user_data)
 
+        case dpg.mvKey_C:
+            _toggle_calib_frame_callback(sender, app_data, user_data)
+        # case dpg.mvKey_Next:
+        #     _navigate_calib_frame_callback(sender, None, {"app_state": user_data["app_state"], "direction": 1})
+        # case dpg.mvKey_Prior:
+        #     _navigate_calib_frame_callback(sender, None, {"app_state": user_data["app_state"], "direction": -1})
 
 # ============================================================================
 # UI Update Functions
@@ -1236,6 +1325,14 @@ def _update_control_panel(app_state: AppState):
 
         focus_status = "Enabled" if app_state.focus_selected_point else "Disabled"
         dpg.set_value("focus_text", f"Focus Mode: {focus_status}")
+
+        # Update calibration button text
+        if app_state.frame_idx in app_state.calibration_frames:
+            dpg.configure_item("toggle_calib_frame_button", label="Remove (C)")
+        else:
+            dpg.configure_item("toggle_calib_frame_button", label="Add (C)")
+
+        focus_status = "Enabled" if app_state.focus_selected_point else "Disabled"
 
         dpg.set_value(
             "num_calib_frames_text",
