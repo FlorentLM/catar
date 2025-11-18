@@ -175,7 +175,7 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 user_data=user_data
             )
             dpg.add_menu_item(
-                label="Refine Calibration (Bundle Adjustment)",
+                label="Refine (Bundle Adjustment)...",
                 callback=lambda: dpg.show_item("ba_config_popup"),
                 user_data={"app_state": app_state, "queues": queues}
             )
@@ -417,9 +417,13 @@ def _create_ba_config_popup(app_state: AppState, queues: Queues):
 
     user_data = {"app_state": app_state, "queues": queues}
 
-    with dpg.window(label="Bundle Adjustment Settings", modal=True, show=False, tag="ba_config_popup", width=450,
-                    no_close=True):
-        dpg.add_text("What is your primary goal?")
+    with app_state.lock:
+        nb_views = app_state.video_metadata['num_videos']
+
+    with dpg.window(label="Bundle Adjustment Settings", modal=True, show=False, tag="ba_config_popup",
+                    width=450, height=270, no_close=False):
+
+        dpg.add_text("Workflow selection:")
         dpg.add_radio_button(
             tag="ba_mode_radio",
             items=[
@@ -433,15 +437,15 @@ def _create_ba_config_popup(app_state: AppState, queues: Queues):
 
         dpg.add_separator()
         with dpg.group():
-            dpg.add_text("", tag="ba_help_text", wrap=420)
-        dpg.add_separator()
+            dpg.add_text("", tag="ba_help_text", wrap=410)
 
-        # Initialise the help text for the default selection
-        _ba_mode_changed_callback(None, "Refine Camera Calibration", None)
+        dpg.add_separator()
 
         with dpg.group(horizontal=True):
             dpg.add_button(label="Start Refinement", callback=_start_ba_callback, user_data=user_data, width=-1)
             dpg.add_button(label="Cancel", callback=lambda: dpg.hide_item("ba_config_popup"), width=80)
+
+    _ba_mode_changed_callback(None, dpg.get_value("ba_mode_radio"), None)
 
 
 def _create_ba_progress_popup(app_state: AppState, queues: Queues):
@@ -453,6 +457,7 @@ def _create_ba_progress_popup(app_state: AppState, queues: Queues):
     ):
         dpg.add_text("Running Bundle Adjustment...", tag="ba_status_text")
         dpg.add_text("This may take a few minutes...")
+
 
 def _create_batch_track_popup(app_state: AppState):
     """Create batch tracking progress popup."""
@@ -852,6 +857,7 @@ def _image_drag_callback(sender, app_data, user_data):
     x1, y1 = max(0, int(src_x)), max(0, int(src_y))
     x2, y2 = min(video_w, int(src_x + src_patch_width)), min(video_h, int(src_y + src_patch_width))
     patch = video_frame[y1:y2, x1:x2]
+
     if patch.size > 0:
         zoomed_patch = cv2.resize(patch, (loupe_size, loupe_size), interpolation=cv2.INTER_NEAREST)
         zoomed_patch_rgba = cv2.cvtColor(zoomed_patch, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
@@ -860,7 +866,9 @@ def _image_drag_callback(sender, app_data, user_data):
     # Add the overlays to the loupe
     dpg.delete_item("loupe_overlay_layer", children_only=True)
     layer_tag = "loupe_overlay_layer"
-    def to_loupe_coords(p): return ((p[0] - src_x) * zoom_factor, (p[1] - src_y) * zoom_factor)
+
+    def to_loupe_coords(p):
+        return ((p[0] - src_x) * zoom_factor, (p[1] - src_y) * zoom_factor)
 
     # Draw all annotated points
     for i in range(app_state.num_points):
@@ -875,8 +883,10 @@ def _image_drag_callback(sender, app_data, user_data):
     # Draw epipolar lines for selected point
     if best_individual and f_mats:
         for from_cam in range(len(current_frames)):
+
             point_2d = all_annotations[from_cam, p_idx]
             F = f_mats.get((from_cam, cam_idx))
+
             if cam_idx == from_cam or np.isnan(point_2d).any() or F is None:
                 continue
 
@@ -884,10 +894,13 @@ def _image_drag_callback(sender, app_data, user_data):
             line = F @ p_hom
             a, b, c = line
             intersection_points = line_box_intersection(a, b, c, src_x, src_y, src_patch_width, src_patch_width)
+
             if len(intersection_points) == 2:
+
                 p1_video_coords, p2_video_coords = intersection_points
                 p1_loupe, p2_loupe = to_loupe_coords(p1_video_coords), to_loupe_coords(p2_video_coords)
                 color = camera_colors[from_cam % len(camera_colors)]
+
                 dpg.draw_line(p1_loupe, p2_loupe, color=color, thickness=1, parent=layer_tag)
 
     # Draw reprojection for the selected point
@@ -1079,23 +1092,20 @@ def _ba_mode_changed_callback(sender, app_data, user_data):
     """Updates the help text in the BA config popup when the mode changes."""
 
     help_text = ""
-    if app_data == "refine_cameras_only":
+    if app_data == "Refine Cameras":
         help_text = (
-            "What will be optimized: Camera Intrinsics and Extrinsics.\n\n"
-            "Annotation Requirement: None. Point labels do NOT need to be consistent across frames.\n\n"
-            "Use Case: Fixing a poor initial camera calibration using points on a moving animal or static background features."
+            f"Point labels do not need to be consistent across frames, you can use anything as long as each is consistent across all the cameras.\n\n"
+            "Use case: Scaffolding: fixing or improving a suboptimal initial calibration using points on a moving animal or static background features."
         )
-    elif app_data == "full_ba":
+    elif app_data == "Refine Cameras and 3D Points":
         help_text = (
-            "What will be optimized: Camera parameters AND the 3D positions of your points in each frame.\n\n"
-            "Annotation Requirement: CRITICAL. Keypoints must be labeled consistently for the same body part across all selected frames.\n\n"
-            "Use Case: The most powerful mode. Simultaneously improves camera calibration and the 3D reconstruction."
+            "Keypoints must be labeled consistently for the same body part across all selected frames.\n\n"
+            "Use case: Simultaneously improves camera calibration and the 3D reconstruction (Full Bundle Adjustment)."
         )
-    elif app_data == "refine_points_only":
+    elif app_data == "Refine 3D Points only":
         help_text = (
-            "What will be optimized: Only the 3D positions of your points in each frame.\n\n"
-            "Annotation Requirement: CRITICAL. Keypoints must be labeled consistently.\n\n"
-            "Use Case: Smoothing or refining a 3D trajectory when you are highly confident that your camera calibration is already perfect."
+            "Keypoints must be labeled consistently for the same body part across all selected frames.\n\n"
+            "Use case: Refining a 3D trajectory (including interpolating gaps) when you are confident your camera calibration is really good."
         )
 
     dpg.set_value("ba_help_text", help_text)
@@ -1107,7 +1117,7 @@ def _start_ba_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
     queues = user_data["queues"]
 
-    # Map UI selection to mode strings
+    # Map UI selection to mode strings for the worker
     selected_mode_label = dpg.get_value("ba_mode_radio")
     mode_map = {
         "Refine Cameras": "refine_cameras_only",
@@ -1130,8 +1140,6 @@ def _start_ba_callback(sender, app_data, user_data):
     dpg.set_value("ba_status_text", f"Running Bundle Adjustment ({selected_mode_label})...")
     dpg.hide_item("ba_config_popup")
     dpg.show_item("ba_progress_popup")
-
-#TODO: A stop callback and button for the BA
 
 
 def _clear_calibration_callback(sender, app_data, user_data):
