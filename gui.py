@@ -1359,8 +1359,6 @@ def _update_control_panel(app_state: AppState):
         else:
             dpg.configure_item("toggle_calib_frame_button", label="Add (C)")
 
-        focus_status = "Enabled" if app_state.focus_selected_point else "Disabled"
-
         dpg.set_value(
             "num_calib_frames_text",
             f"Calibration Frames: {len(app_state.calibration_frames)}"
