@@ -178,7 +178,7 @@ def process_frame(
     Runs one full cycle: LK prediction -> mokap correction -> feedback
     """
     with app_state.lock:
-        camera_names = app_state.video_names
+        camera_names = app_state.camera_names
         point_names = app_state.point_names
 
     # Get geometric prediction and confidence score from LK tracking
