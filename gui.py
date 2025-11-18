@@ -178,11 +178,19 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 callback=_toggle_histogram_visibility_callback
             )
             dpg.add_menu_item(
-                label="Always Show Labels",
+                label="Show All Labels",
                 tag="show_all_labels_checkbox",
                 check=True,
                 default_value=False,
                 callback=_toggle_show_all_labels_callback,
+                user_data=user_data
+            )
+            dpg.add_menu_item(
+                label="Show Reproj. Errors",
+                tag="show_reprojection_error_checkbox",
+                check=True,
+                default_value=True,
+                callback=_toggle_show_reprojection_error_callback,
                 user_data=user_data
             )
 
@@ -801,7 +809,7 @@ def _image_mouse_down_callback(sender, app_data, user_data):
 
             else:
                 # Create a new point
-                snapped_pos = snap_annotation(app_state, cam_idx, p_idx, frame_idx)
+                snapped_pos = snap_annotation(app_state, cam_idx, p_idx, frame_idx, scaled_pos)
                 final_pos = snapped_pos if snapped_pos is not None else scaled_pos
 
                 # Assign the new annotation
@@ -1054,12 +1062,22 @@ def _toggle_focus_mode_callback(sender, app_data, user_data):
         status = "Enabled" if app_state.focus_selected_point else "Disabled"
         print(f"Focus mode: {status}")
 
+
 def _toggle_show_all_labels_callback(sender, app_data, user_data):
     """Toggle visibility of all keypoint labels."""
 
     app_state = user_data["app_state"]
     with app_state.lock:
         app_state.show_all_labels = dpg.get_value(sender)
+
+
+def _toggle_show_reprojection_error_callback(sender, app_data, user_data):
+    """Toggle visibility of the reprojection error lines."""
+
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        app_state.show_reprojection_error = dpg.get_value(sender)
+
 
 def _toggle_histogram_visibility_callback(sender, app_data, user_data):
     """Toggle histogram visibility."""
@@ -1413,6 +1431,7 @@ def update_annotation_overlays(app_state: AppState):
         video_h = app_state.video_metadata['height']
         focus_mode = app_state.focus_selected_point
         show_all_labels = app_state.show_all_labels
+        show_reprojection_error = app_state.show_reprojection_error
 
     # Get data for all points
     all_annotations = app_state.annotations[frame_idx]
@@ -1454,7 +1473,8 @@ def update_annotation_overlays(app_state: AppState):
             _draw_reprojection(
                 cam_idx, point_3d, selected_annots,
                 best_individual[cam_idx], p_idx,
-                point_colors, scale_x, scale_y, layer_tag
+                point_colors, scale_x, scale_y, layer_tag,
+                show_reprojection_error
             )
 
         # and all annotated points
@@ -1523,10 +1543,12 @@ def _draw_epipolar_lines(
                 parent=layer_tag
             )
 
+
 def _draw_reprojection(
-    cam_idx, point_3d, selected_annots,
-    cam_params, p_idx, point_colors,
-    scale_x, scale_y, layer_tag
+        cam_idx, point_3d, selected_annots,
+        cam_params, p_idx, point_colors,
+        scale_x, scale_y, layer_tag,
+        show_reprojection_error
 ):
     """Draws reproj and error line for reconstructed point."""
 
@@ -1537,29 +1559,59 @@ def _draw_reprojection(
 
     reproj_2d = reprojected[0]
     reproj_scaled = (reproj_2d[0] * scale_x, reproj_2d[1] * scale_y)
+    color_reproj = (255, 0, 0)
+    color_line = (255, 100, 100)
 
-    # red X at reprojection
+    # Red X at reprojection
     dpg.draw_line(
         (reproj_scaled[0] - 5, reproj_scaled[1] - 5),
         (reproj_scaled[0] + 5, reproj_scaled[1] + 5),
-        color=(255, 0, 0),
+        color=color_reproj,
         parent=layer_tag
     )
     dpg.draw_line(
         (reproj_scaled[0] - 5, reproj_scaled[1] + 5),
         (reproj_scaled[0] + 5, reproj_scaled[1] - 5),
-        color=(255, 0, 0),
+        color=color_reproj,
         parent=layer_tag
     )
 
-    # error line (if annotation exists)
-    if not np.isnan(selected_annots[cam_idx]).any():
+    # Error line and distance label (if annotation exists and is enabled)
+    if show_reprojection_error and not np.isnan(selected_annots[cam_idx]).any():
         annot_scaled = (
             selected_annots[cam_idx, 0] * scale_x,
             selected_annots[cam_idx, 1] * scale_y
         )
-        color = point_colors[p_idx].tolist()
-        dpg.draw_line(annot_scaled, reproj_scaled, color=color, thickness=1, parent=layer_tag)
+
+        # Calculate distance
+        p1 = np.array(annot_scaled)
+        p2 = np.array(reproj_scaled)
+        distance = np.linalg.norm(p1 - p2)
+
+        # Draw dotted line
+        # DPG doesn't have dotted lines??
+        vec = p2 - p1
+        vec_norm = vec / (distance + 1e-6)
+        dash_length = 5
+        gap_length = 3
+
+        current_pos = 0
+        while current_pos < distance:
+            start_point = p1 + vec_norm * current_pos
+            end_point = p1 + vec_norm * min(current_pos + dash_length, distance)
+            dpg.draw_line(tuple(start_point), tuple(end_point), color=color_line, thickness=1, parent=layer_tag)
+            current_pos += dash_length + gap_length
+
+        # Draw distance label
+        mid_point = p1 + vec * 0.5
+        label_pos = (mid_point[0] + 5, mid_point[1] - 5)
+        dpg.draw_text(
+            pos=label_pos,
+            text=f"{distance:.1f}px",
+            color=color_line,
+            size=12,
+            parent=layer_tag
+        )
 
 
 def _draw_all_points(

@@ -32,18 +32,13 @@ def snap_annotation(
     app_state: 'AppState',
     target_cam_idx: int,
     point_idx: int,
-    frame_idx: int
+    frame_idx: int,
+    user_click_pos: np.ndarray
 ) -> Optional[np.ndarray]:
     """
-    Refines a 2D annotation by triangulating from other views and reprojecting
-
-    This "snaps" a new user click to a (maybe) more accurate position based
+    Snaps a new user click to a (maybe) more accurate position based
     on the consensus of other existing annotations for the same point, weighted
     by their confidence scores.
-
-    Returns:
-        A (2,) numpy array with the refined 2D coordinates, or None if
-        refinement is not possible (fewer than 2 other views)
     """
 
     with app_state.lock:
@@ -96,7 +91,7 @@ def snap_annotation(
         P_mats=jnp.asarray(proj_matrices),
         weights=jnp.asarray(weights_for_triangulation)
     )
-    point_3d_single = np.asarray(point_3d_single)  # Convert back to numpy
+    point_3d_single = np.asarray(point_3d_single)
 
     if np.isnan(point_3d_single).any():
         return None
@@ -110,7 +105,14 @@ def snap_annotation(
     if reprojected_point_2d.size == 0:
         return None
 
-    return reprojected_point_2d.flatten()
+    reprojected_point_2d = reprojected_point_2d.flatten()
+
+    # Only snap if the click is close enough
+    distance = np.linalg.norm(reprojected_point_2d - user_click_pos)
+    if distance > 15:
+        return None
+
+    return reprojected_point_2d
 
 
 def update_annotations_from_3d(
@@ -260,6 +262,14 @@ def process_frame(
 
         app_state.annotations[frame_idx] = final_annotations
         app_state.human_annotated[frame_idx] = False
+
+        # Update the 3D points
+        app_state.reconstructed_3d_points[frame_idx].fill(np.nan)
+        if final_3d_skeleton_kps:
+            for p_name, pos_3d in final_3d_skeleton_kps.items():
+                if p_name in point_names:
+                    p_idx = point_names.index(p_name)
+                    app_state.reconstructed_3d_points[frame_idx, p_idx] = pos_3d
 
 
 # ============================================================================

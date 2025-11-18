@@ -15,7 +15,9 @@ from core import create_camera_visual, run_genetic_step, process_frame, run_refi
 from state import AppState
 from viz_3d import Open3DVisualizer, SceneObject
 from video_cache import VideoCacheReader
+from utils import get_projection_matrix
 
+from mokap.utils.geometry import projective
 from mokap.reconstruction.reconstruction import Reconstructor
 from mokap.reconstruction.tracking import MultiObjectTracker
 
@@ -203,7 +205,9 @@ class VideoReaderWorker(threading.Thread):
 
 
 class TrackingWorker(threading.Thread):
-    """Point tracking using optic flow."""
+    """
+    Handles automated point tracking and on-demand 3D reconstruction.
+    """
 
     def __init__(
         self,
@@ -239,14 +243,22 @@ class TrackingWorker(threading.Thread):
             except queue.Empty:
                 pass
 
+            # Check if an on-demand reconstruction is needed from the GUI
+            with self.app_state.lock:
+                needs_reconstruction = self.app_state.needs_3d_reconstruction
+                frame_idx = self.app_state.frame_idx
+
+            if needs_reconstruction:
+                self._reconstruct_for_display(frame_idx)
+
             # Realtime tracking mode
             try:
-                data = self.frames_in_queue.get(timeout=0.1)
+                data = self.frames_in_queue.get(timeout=0.01)
                 if data.get("action") == "shutdown":
                     self.shutdown_event.set()
                     break
 
-                self._process_frame(data)
+                self._process_frame_for_tracking(data)
 
             except queue.Empty:
                 continue
@@ -257,14 +269,38 @@ class TrackingWorker(threading.Thread):
 
         print("Tracking worker shut down.")
 
-    def _process_frame(self, data: dict):
-        """Process a single frame for tracking."""
+    def _reconstruct_for_display(self, frame_idx: int):
+        """
+        Triangulates points from manual annotations for immediate UI feedback.
+        This is called when the user clicks or modifies a point.
+        """
+
+        with self.app_state.lock:
+            annotations = self.app_state.annotations[frame_idx, ..., :2]
+            calibration = self.app_state.best_individual
+
+        if calibration is not None:
+            proj_matrices = np.array([get_projection_matrix(cam) for cam in calibration])
+
+            # Triangulate all points for the current frame
+            points_3d = projective.triangulate_points_from_projections(
+                points2d=annotations,
+                P_mats=proj_matrices
+            )
+
+            with self.app_state.lock:
+                self.app_state.reconstructed_3d_points[frame_idx] = np.asarray(points_3d)
+                # Reset the flag now that the reconstruction is done
+                self.app_state.needs_3d_reconstruction = False
+
+    def _process_frame_for_tracking(self, data: dict):
+        """Process a single frame for the automated tracking pipeline."""
         frame_idx = data["frame_idx"]
 
         with self.app_state.lock:
             is_tracking_enabled = self.app_state.keypoint_tracking_enabled
 
-        # runs entire LK -> Mokap -> Feedback loop
+        # Runs entire LK -> Mokap -> Feedback loop
         if is_tracking_enabled and data["was_sequential"] and self.prev_frames:
             print(f"[Frame {frame_idx}] TrackingWorker: Running full processing pipeline.")
             process_frame(
@@ -395,8 +431,6 @@ class RenderingWorker(threading.Thread):
         """Renders the current state for visualisation without modifying it."""
 
         with self.app_state.lock:
-            # frame_idx = self.app_state.frame_idx
-
             # Cache the raw video frames for the loupe tool
             self.app_state.current_video_frames = data["raw_frames"]
 

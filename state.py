@@ -83,6 +83,7 @@ class AppState:
         self.focus_selected_point: bool = False
         self.show_cameras_in_3d: bool = True
         self.drag_state: Dict[str, Any] = {}
+        self.show_reprojection_error: bool = True
         self.show_all_labels: bool = False
 
         # Feature flags
