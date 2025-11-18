@@ -932,6 +932,7 @@ def _image_drag_callback(sender, app_data, user_data):
             center_loupe = to_loupe_coords(point_2d)
             if 0 < center_loupe[0] < loupe_size and 0 < center_loupe[1] < loupe_size:
                 color = point_colors[i].tolist()
+
                 dpg.draw_circle(center_loupe, radius=7, color=color, parent=layer_tag)
                 dpg.draw_circle(center_loupe, radius=1, color=color, fill=color, parent=layer_tag)
 
@@ -954,8 +955,7 @@ def _image_drag_callback(sender, app_data, user_data):
 
                 p1_video_coords, p2_video_coords = intersection_points
                 p1_loupe, p2_loupe = to_loupe_coords(p1_video_coords), to_loupe_coords(p2_video_coords)
-                color = camera_colors[from_cam % len(camera_colors)]
-
+                color = (*camera_colors[from_cam % len(camera_colors)], 120)    # slightly transparent
                 dpg.draw_line(p1_loupe, p2_loupe, color=color, thickness=1, parent=layer_tag)
 
     # Draw reprojection for the selected point
