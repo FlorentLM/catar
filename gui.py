@@ -425,7 +425,7 @@ def _create_ba_config_popup(app_state: AppState, queues: Queues):
             items=[
                 "Refine Cameras",
                 "Refine Cameras and 3D Points",
-                "Refine 3D Points only (Trajectory Smoothing)"
+                "Refine 3D Points only"
             ],
             default_value="Refine Cameras",
             callback=_ba_mode_changed_callback
@@ -1110,9 +1110,9 @@ def _start_ba_callback(sender, app_data, user_data):
     # Map UI selection to mode strings
     selected_mode_label = dpg.get_value("ba_mode_radio")
     mode_map = {
-        "Refine Camera Calibration": "refine_cameras_only",
-        "Refine Cameras AND 3D Points": "full_ba",
-        "Refine 3D Points Only (Trajectory Smoothing)": "refine_points_only"
+        "Refine Cameras": "refine_cameras_only",
+        "Refine Cameras and 3D Points": "full_ba",
+        "Refine 3D Points only": "refine_points_only"
     }
     mode = mode_map[selected_mode_label]
 
