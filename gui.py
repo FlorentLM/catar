@@ -162,6 +162,15 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 user_data=user_data
             )
 
+        with dpg.menu(label="Display"):
+            dpg.add_menu_item(
+                label="Show Timeline Histogram",
+                tag="show_histogram_checkbox",
+                check=True,
+                default_value=True,
+                callback=_toggle_histogram_visibility_callback
+            )
+
         with dpg.menu(label="Tools"):
             dpg.add_menu_item(
                 label="Manage video cache...",
@@ -278,15 +287,6 @@ def _create_control_panel(app_state: AppState, queues: Queues, open3d_viz: Open3
         #     user_data=user_data,
         #     width=-1
         # )
-
-    dpg.add_separator()
-
-    dpg.add_checkbox(
-        label="Show Histogram",
-        default_value=True,
-        tag="show_histogram_checkbox",
-        callback=_toggle_histogram_visibility_callback
-    )
 
 
 def _create_bottom_panel(app_state: AppState):
@@ -1088,17 +1088,6 @@ def _toggle_calib_frame_callback(sender, app_data, user_data):
             app_state.calibration_frames.append(frame_idx)
             app_state.calibration_frames.sort()  # Keep the list sorted
             print(f"Frame {frame_idx} added to calibration set.")
-
-
-def _add_to_calib_frames_callback(sender, app_data, user_data):
-    """Add current frame to calibration set."""
-
-    app_state = user_data["app_state"]
-
-    with app_state.lock:
-        if app_state.frame_idx not in app_state.calibration_frames:
-            app_state.calibration_frames.append(app_state.frame_idx)
-            print(f"Frame {app_state.frame_idx} added to calibration set.")
 
 
 def _clear_calib_frames_callback(sender, app_data, user_data):
