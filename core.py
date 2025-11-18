@@ -738,7 +738,7 @@ def _prepare_ba_data(snapshot: Dict[str, Any], is_independent: bool) -> Dict[str
         return {
             "image_points": np.nan_to_num(padded_2d),
             "visibility_mask": ~np.isnan(padded_2d[:, :, :, 0]),
-            "object_points_initial": np.nan_to_num(padded_3d.reshape(-1, 3)),
+            "object_points_initial": np.nan_to_num(padded_3d.reshape(-1, 3), nan=1e6),
             "initial_structure_for_masking": None
         }
 
