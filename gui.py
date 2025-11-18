@@ -177,6 +177,14 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 default_value=True,
                 callback=_toggle_histogram_visibility_callback
             )
+            dpg.add_menu_item(
+                label="Always Show Labels",
+                tag="show_all_labels_checkbox",
+                check=True,
+                default_value=False,
+                callback=_toggle_show_all_labels_callback,
+                user_data=user_data
+            )
 
         with dpg.menu(label="Tools"):
             dpg.add_menu_item(
@@ -1046,6 +1054,12 @@ def _toggle_focus_mode_callback(sender, app_data, user_data):
         status = "Enabled" if app_state.focus_selected_point else "Disabled"
         print(f"Focus mode: {status}")
 
+def _toggle_show_all_labels_callback(sender, app_data, user_data):
+    """Toggle visibility of all keypoint labels."""
+
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        app_state.show_all_labels = dpg.get_value(sender)
 
 def _toggle_histogram_visibility_callback(sender, app_data, user_data):
     """Toggle histogram visibility."""
@@ -1398,6 +1412,7 @@ def update_annotation_overlays(app_state: AppState):
         video_w = app_state.video_metadata['width']
         video_h = app_state.video_metadata['height']
         focus_mode = app_state.focus_selected_point
+        show_all_labels = app_state.show_all_labels
 
     # Get data for all points
     all_annotations = app_state.annotations[frame_idx]
@@ -1445,7 +1460,8 @@ def update_annotation_overlays(app_state: AppState):
         # and all annotated points
         _draw_all_points(
             cam_idx, all_annotations, all_human_annotated, point_names,
-            p_idx, focus_mode, app_state.num_points, scale_x, scale_y, layer_tag
+            p_idx, focus_mode, app_state.num_points, scale_x, scale_y, layer_tag,
+            show_all_labels
         )
 
 
@@ -1548,7 +1564,7 @@ def _draw_reprojection(
 
 def _draw_all_points(
     cam_idx, annotations, human_annotated, point_names,
-    selected_point_idx, focus_mode, num_points, scale_x, scale_y, layer_tag
+    selected_point_idx, focus_mode, num_points, scale_x, scale_y, layer_tag, show_all_labels
 ):
     """Draws all annotated keypoints and their labels."""
 
@@ -1577,7 +1593,7 @@ def _draw_all_points(
         )
 
         # Label (only for current point)
-        if i == selected_point_idx:
+        if show_all_labels or i == selected_point_idx:
             dpg.draw_text(
                 pos=(center_x + 8, center_y - 8),
                 text=point_names[i],
