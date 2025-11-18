@@ -248,18 +248,22 @@ def load_and_match_videos(data_folder: Path, video_format: str):
 
     toml_indices, video_indices = linear_sum_assignment(cost_matrix)
 
-    # Build ordered lists
-    ordered_paths = []
-    ordered_names = []
+    # Build ordered lists based on the sorted toml_names order
+    ordered_paths = ["" for _ in range(n)]
+    ordered_filenames = ["" for _ in range(n)]
+    ordered_toml_names = toml_names  # Use the alphabetically sorted TOML names as the canonical order
+
+    # Create a map from the toml_index (from the assignment) back to the video_index
+    toml_to_video_map = {ti: vi for ti, vi in zip(toml_indices, video_indices)}
+
+    for i in range(n):  # i is the index in the sorted toml_names list
+        matched_video_idx = toml_to_video_map[i]
+        ordered_paths[i] = str(video_paths[matched_video_idx])
+        ordered_filenames[i] = video_filenames[matched_video_idx]
+
+    # Build calibration list in the same sorted order
     calibration = []
-
-    for i, toml_name in enumerate(toml_names):
-        matched_video_idx = video_indices[np.where(toml_indices == i)][0]
-
-        ordered_paths.append(str(video_paths[matched_video_idx]))
-        ordered_names.append(video_filenames[matched_video_idx])
-
-        # Convert TOML calibration to dict
+    for toml_name in ordered_toml_names:
         cam = calib_data[toml_name]
         calibration.append({
             'fx': cam['camera_matrix'][0][0],
@@ -271,7 +275,8 @@ def load_and_match_videos(data_folder: Path, video_format: str):
             'tvec': np.array(cam['tvec'], dtype=np.float32),
         })
 
-    return ordered_paths, ordered_names, calibration
+    # Return the camera names from the TOML as a new list
+    return ordered_paths, ordered_filenames, ordered_toml_names, calibration
 
 
 # ============================================================================

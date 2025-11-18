@@ -204,7 +204,7 @@ def main():
 
     # Load videos and calibration first (with proper matching)
     print("Loading videos and calibration...")
-    video_paths, video_names, calibration = load_and_match_videos(
+    video_paths, video_filenames, camera_names, calibration = load_and_match_videos(
         config.DATA_FOLDER,
         config.VIDEO_FORMAT
     )
@@ -282,7 +282,7 @@ def main():
 
     # Mokap expects the camera parameters in a certain way
     mokap_calibration = {}
-    for cam_name, catar_cal in zip(video_names, calibration):
+    for cam_name, catar_cal in zip(camera_names, calibration):
         K = np.array([
             [catar_cal['fx'], 0.0, catar_cal['cx']],
             [0.0, catar_cal['fy'], catar_cal['cy']],
@@ -318,7 +318,8 @@ def main():
 
     # Initialise application state
     app_state = AppState(metadata, config.SKELETON_CONFIG)
-    app_state.video_names = video_names
+    app_state.video_names = video_filenames
+    app_state.camera_names = camera_names
     app_state.set_calibration(calibration)
     app_state.load_from_disk(config.DATA_FOLDER)
     app_state.cache_reader = cache_reader

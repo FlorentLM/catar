@@ -144,6 +144,11 @@ def _create_themes():
         with dpg.theme_component(dpg.mvAll):
             dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0, category=dpg.mvThemeCat_Core)
 
+    # Sets text to a faint gray color
+    with dpg.theme(tag="faint_text_theme"):
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_Text, (180, 180, 180, 255))
+
 def _create_menu_bar(app_state: AppState, queues: Queues):
     """Create top menu bar."""
 
@@ -161,6 +166,8 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 callback=_load_state_callback,
                 user_data=user_data
             )
+            dpg.add_separator()
+            dpg.add_menu_item(label="Quit", callback=_quit_callback)
 
         with dpg.menu(label="Display"):
             dpg.add_menu_item(
@@ -394,7 +401,16 @@ def _create_video_cell(cam_idx: int, app_state: AppState):
     """Create a single video view cell."""
 
     with dpg.table_cell():
-        dpg.add_text(app_state.video_names[cam_idx])
+        # Display Camera Name (bold) and Filename (faint)
+
+        with dpg.group(horizontal=True, horizontal_spacing=5):
+            camera_name = app_state.camera_names[cam_idx]
+            file_name = app_state.video_names[cam_idx]
+
+            dpg.add_text(camera_name)
+            faint_text = dpg.add_text(f"({file_name})")
+            dpg.bind_item_theme(faint_text, "faint_text_theme")
+
         with dpg.drawlist(
             width=config.DISPLAY_WIDTH,
             height=config.DISPLAY_HEIGHT,
@@ -1029,6 +1045,9 @@ def _on_histogram_click(sender, app_data, user_data):
 # ============================================================================
 # Callbacks - File ops
 # ============================================================================
+
+def _quit_callback(sender, app_data, user_data):
+    dpg.stop_dearpygui()
 
 def _save_state_callback(sender, app_data, user_data):
     user_data["app_state"].save_to_disk(config.DATA_FOLDER)

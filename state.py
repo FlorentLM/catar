@@ -62,6 +62,7 @@ class AppState:
         # Video metadata (read-only after init)
         self.video_metadata = video_metadata
         self.video_names: List[str] = []
+        self.camera_names: List[str] = []
         self.cache_reader: Optional['VideoCacheReader'] = None
 
         # Skeleton configuration (read-only after init)
