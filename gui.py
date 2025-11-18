@@ -1304,6 +1304,9 @@ def _on_key_press(sender, app_data, user_data):
 def resize_video_widgets(sender, app_data, user_data):
     """Resize video widgets and maintain aspect ratio."""
 
+    if not user_data or "app_state" not in user_data:
+        return
+
     app_state = user_data["app_state"]
 
     grid_width = dpg.get_item_rect_size("video_grid_window")[0]
