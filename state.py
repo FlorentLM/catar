@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 
+import config
 from utils import calculate_fundamental_matrices
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -69,11 +70,7 @@ class AppState:
         self.point_names = skeleton_config['point_names']
         self.skeleton = skeleton_config['skeleton']
         self.point_colors = skeleton_config['point_colors']
-        self.camera_colors = [
-            (255, 255, 0), (0, 255, 255), (255, 0, 255), (255, 128, 0),
-            (128, 0, 255), (0, 255, 128), (255, 255, 255), (0, 255, 0),
-            (128, 128, 0), (0, 128, 128), (128, 0, 128), (128, 128, 128)
-        ]
+        self.camera_colors = config.CAMERA_COLORS
         self.num_points = len(self.point_names)
 
         # Playback state

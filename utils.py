@@ -149,25 +149,6 @@ def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, i
     return f_mats
 
 
-def triangulate_points(frame_annotations: np.ndarray, proj_matrices: Union[np.ndarray, List[np.ndarray]]) -> np.ndarray:
-    """Triangulates 3D points using mokap."""
-
-    num_cams, num_points, _ = frame_annotations.shape
-    if num_points == 0:
-        return np.full((0, 3), np.nan, dtype=np.float32)
-
-    # Expected input shape for points2d is (C, N, 2)
-    points_2d_all = jnp.asarray(frame_annotations)
-    P_mats_all = jnp.asarray(proj_matrices)
-
-    triangulated = projective.triangulate_points_from_projections(
-        points2d=points_2d_all,
-        P_mats=P_mats_all
-    )
-
-    return np.asarray(triangulated)
-
-
 def calculate_reproj_confidence(app_state: 'AppState', frame_idx: int, point_idx: int) -> np.ndarray:
     """
     Calculates reprojection error for a point in a frame using leave-one-out approach.
@@ -194,7 +175,11 @@ def calculate_reproj_confidence(app_state: 'AppState', frame_idx: int, point_idx
         peer_annots = annotations_for_point[peer_indices].reshape(len(peer_indices), 1, 2)
         peer_proj_mats = [get_projection_matrix(calibration[i]) for i in peer_indices]
 
-        point_3d = triangulate_points(peer_annots, peer_proj_mats).flatten()
+        point_3d = projective.triangulate_points_from_projections(
+            points2d=jnp.asarray(peer_annots),
+            P_mats=jnp.asarray(peer_proj_mats)
+        )
+        point_3d = np.asarray(point_3d).flatten()
 
         if not np.isnan(point_3d).any():
             reprojected = reproject_points(point_3d, calibration[cam_to_test])

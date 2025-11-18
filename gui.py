@@ -789,12 +789,23 @@ def _image_mouse_down_callback(sender, app_data, user_data):
             annotation_pos_for_drag = None
             if is_drag_start:
                 # Use the existing point's position for the drag operation
-                annotation_pos_for_drag = app_state.annotations[frame_idx, cam_idx, p_idx].copy()
+                annotation_pos_for_drag = app_state.annotations[frame_idx, cam_idx, p_idx, :2].copy() # :2 to remove confidence (if it's there)
+
             else:
                 # Create a new point
                 snapped_pos = snap_annotation(app_state, cam_idx, p_idx, frame_idx)
                 final_pos = snapped_pos if snapped_pos is not None else scaled_pos
-                app_state.annotations[frame_idx, cam_idx, p_idx] = final_pos
+
+                # Assign the new annotation
+                if app_state.annotations.shape[3] == 3: # shape (x, y, score)
+                    # If the array stores scores, add a confidence of 1.0 (manual annotation)
+                    app_state.annotations[frame_idx, cam_idx, p_idx] = [*final_pos, 1.0]
+                else: #  shape (x, y)
+                    # Otherwise, just store the (x, y) coordinates
+                    app_state.annotations[frame_idx, cam_idx, p_idx] = final_pos
+
+                    # TODO: The array should always have scores anyway, it's a bit dumb to have it variable sized
+
                 app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
                 app_state.needs_3d_reconstruction = True
                 annotation_pos_for_drag = final_pos
@@ -844,11 +855,11 @@ def _image_drag_callback(sender, app_data, user_data):
         best_individual = app_state.best_individual
         f_mats = app_state.fundamental_matrices
         point_3d_selected = app_state.reconstructed_3d_points[frame_idx, p_idx]
-        point_colors = app_state.point_colors
         camera_colors = app_state.camera_colors
 
     if current_frames is None:
         return
+
     video_frame = current_frames[cam_idx]
 
     # Calculate mouse pos
@@ -878,7 +889,8 @@ def _image_drag_callback(sender, app_data, user_data):
             drag_state["is_slowing_down"] = True
             drag_state["slow_down_start_mouse_pos"] = current_scaled_pos.copy()
             with app_state.lock:
-                drag_state["slow_down_start_annotation_pos"] = app_state.annotations[frame_idx, cam_idx, p_idx].copy()
+                drag_state["slow_down_start_annotation_pos"] = app_state.annotations[
+                    frame_idx, cam_idx, p_idx, :2].copy() # :2 to only get (x, y) and not the confidence
 
         # Continue slow movement relative to the anchor point
         mouse_delta = current_scaled_pos - drag_state["slow_down_start_mouse_pos"]
@@ -897,9 +909,12 @@ def _image_drag_callback(sender, app_data, user_data):
     final_scaled_pos[1] = np.clip(final_scaled_pos[1], 0, video_h - 1)
 
     with app_state.lock:
-        app_state.annotations[frame_idx, cam_idx, p_idx] = final_scaled_pos
-        app_state.needs_3d_reconstruction = True
-        app_state.drag_state = drag_state  # write updated state back
+        if app_state.annotations.shape[3] == 3:
+            app_state.annotations[frame_idx, cam_idx, p_idx] = [*final_scaled_pos, 1.0]
+        else:
+            app_state.annotations[frame_idx, cam_idx, p_idx] = final_scaled_pos
+            app_state.needs_3d_reconstruction = True
+            app_state.drag_state = drag_state  # write updated state back
 
     # Update loupe background texture
     loupe_size = 128
@@ -925,17 +940,6 @@ def _image_drag_callback(sender, app_data, user_data):
     def to_loupe_coords(p):
         return ((p[0] - src_x) * zoom_factor, (p[1] - src_y) * zoom_factor)
 
-    # Draw all annotated points
-    for i in range(app_state.num_points):
-        point_2d = all_annotations[cam_idx, i]
-        if not np.isnan(point_2d).any():
-            center_loupe = to_loupe_coords(point_2d)
-            if 0 < center_loupe[0] < loupe_size and 0 < center_loupe[1] < loupe_size:
-                color = point_colors[i].tolist()
-
-                dpg.draw_circle(center_loupe, radius=7, color=color, parent=layer_tag)
-                dpg.draw_circle(center_loupe, radius=1, color=color, fill=color, parent=layer_tag)
-
     # Draw epipolar lines for selected point
     if best_individual and f_mats:
         for from_cam in range(len(current_frames)):
@@ -952,7 +956,6 @@ def _image_drag_callback(sender, app_data, user_data):
             intersection_points = line_box_intersection(a, b, c, src_x, src_y, src_patch_width, src_patch_width)
 
             if len(intersection_points) == 2:
-
                 p1_video_coords, p2_video_coords = intersection_points
                 p1_loupe, p2_loupe = to_loupe_coords(p1_video_coords), to_loupe_coords(p2_video_coords)
                 color = (*camera_colors[from_cam % len(camera_colors)], 120)    # slightly transparent
@@ -961,27 +964,47 @@ def _image_drag_callback(sender, app_data, user_data):
     # Draw reprojection for the selected point
     if best_individual and not np.isnan(point_3d_selected).any():
         reprojected = reproject_points(point_3d_selected, best_individual[cam_idx])
+
         if reprojected.size > 0:
             reproj_loupe = to_loupe_coords(reprojected[0])
             if 0 < reproj_loupe[0] < loupe_size and 0 < reproj_loupe[1] < loupe_size:
-                dpg.draw_line((reproj_loupe[0] - 5, reproj_loupe[1] - 5), (reproj_loupe[0] + 5, reproj_loupe[1] + 5),
+
+                dpg.draw_line((reproj_loupe[0] - 5, reproj_loupe[1] - 5),
+                              (reproj_loupe[0] + 5, reproj_loupe[1] + 5),
                               color=(255, 0, 0), parent=layer_tag)
-                dpg.draw_line((reproj_loupe[0] - 5, reproj_loupe[1] + 5), (reproj_loupe[0] + 5, reproj_loupe[1] - 5),
+
+                dpg.draw_line((reproj_loupe[0] - 5, reproj_loupe[1] + 5),
+                              (reproj_loupe[0] + 5, reproj_loupe[1] - 5),
                               color=(255, 0, 0), parent=layer_tag)
 
     # Draw a small crosshair
     center = loupe_size / 2
-    dpg.draw_line((center - 5, center), (center + 5, center), color=(255, 255, 255), thickness=1, parent=layer_tag)
-    dpg.draw_line((center, center - 5), (center, center + 5), color=(255, 255, 255), thickness=1, parent=layer_tag)
+    size = 15  # length of the arms from the center
+    gap = 5  # half-size of the empty center gap
+
+    # Horizontal lines
+    dpg.draw_line((center - size, center), (center - gap, center), color=(255, 255, 255), thickness=1,
+                  parent=layer_tag)
+    dpg.draw_line((center + gap, center), (center + size, center), color=(255, 255, 255), thickness=1,
+                  parent=layer_tag)
+    # Vertical lines
+    dpg.draw_line((center, center - size), (center, center - gap), color=(255, 255, 255), thickness=1,
+                  parent=layer_tag)
+    dpg.draw_line((center, center + size), (center, center + gap), color=(255, 255, 255), thickness=1,
+                  parent=layer_tag)
+
     dpg.draw_rectangle((0, 0), (loupe_size, loupe_size), color=(255, 255, 255), thickness=1, parent=layer_tag)
 
     # Position loupe to avoid window edges
+    # TODO: this is kinda broken
     viewport_width, viewport_height = dpg.get_viewport_client_width(), dpg.get_viewport_client_height()
     offset_x, offset_y = 20, 20
+
     if mouse_pos[0] + offset_x + loupe_size > viewport_width:
         offset_x = -loupe_size - 20
     if mouse_pos[1] + offset_y + loupe_size > viewport_height:
         offset_y = -loupe_size - 20
+
     final_loupe_pos = (mouse_pos[0] + offset_x, mouse_pos[1] + offset_y)
     dpg.configure_item("loupe_window", pos=final_loupe_pos)
 
@@ -1374,6 +1397,7 @@ def update_annotation_overlays(app_state: AppState):
         num_videos = app_state.video_metadata['num_videos']
         video_w = app_state.video_metadata['width']
         video_h = app_state.video_metadata['height']
+        focus_mode = app_state.focus_selected_point
 
     # Get data for all points
     all_annotations = app_state.annotations[frame_idx]
@@ -1420,9 +1444,8 @@ def update_annotation_overlays(app_state: AppState):
 
         # and all annotated points
         _draw_all_points(
-            cam_idx, all_annotations, all_human_annotated,
-            point_names, point_colors, app_state.num_points,
-            scale_x, scale_y, layer_tag
+            cam_idx, all_annotations, all_human_annotated, point_names,
+            p_idx, focus_mode, app_state.num_points, scale_x, scale_y, layer_tag
         )
 
 
@@ -1524,37 +1547,25 @@ def _draw_reprojection(
 
 
 def _draw_all_points(
-    cam_idx, annotations, human_annotated,
-    point_names, point_colors, num_points,
-    scale_x, scale_y, layer_tag
+    cam_idx, annotations, human_annotated, point_names,
+    selected_point_idx, focus_mode, num_points, scale_x, scale_y, layer_tag
 ):
     """Draws all annotated keypoints and their labels."""
 
     for i in range(num_points):
+
+        if focus_mode and i != selected_point_idx:
+            continue
+
         point_2d = annotations[cam_idx, i]
         if np.isnan(point_2d).any():
             continue
 
         center_x = point_2d[0] * scale_x
         center_y = point_2d[1] * scale_y
-        color = point_colors[i].tolist()
 
-        # White outer ring (human annotations)
-        if human_annotated[cam_idx, i]:
-            dpg.draw_circle(
-                center=(center_x, center_y),
-                radius=9,
-                color=(255, 255, 255),
-                parent=layer_tag
-            )
-
-        # Draw colored circle
-        dpg.draw_circle(
-            center=(center_x, center_y),
-            radius=7,
-            color=color,
-            parent=layer_tag
-        )
+        non_selected_colour = (255, 255, 255) if human_annotated[cam_idx, i] else (0, 255, 255)
+        color = (255, 255, 0) if i == selected_point_idx else non_selected_colour
 
         # Draw center dot
         dpg.draw_circle(
@@ -1565,14 +1576,15 @@ def _draw_all_points(
             parent=layer_tag
         )
 
-        # Label
-        dpg.draw_text(
-            pos=(center_x + 8, center_y - 8),
-            text=point_names[i],
-            color=color,
-            size=14,
-            parent=layer_tag
-        )
+        # Label (only for current point)
+        if i == selected_point_idx:
+            dpg.draw_text(
+                pos=(center_x + 8, center_y - 8),
+                text=point_names[i],
+                color=color,
+                size=14,
+                parent=layer_tag
+            )
 
 
 def update_histogram(app_state: AppState):

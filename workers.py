@@ -168,6 +168,7 @@ class VideoReaderWorker(threading.Thread):
                 frame_data = {
                     "frame_idx": current_frame_idx,
                     "raw_frames": frames,
+                    "was_sequential": is_sequential
                 }
                 self._distribute_frames(frame_data)
                 prev_frame_idx = current_frame_idx

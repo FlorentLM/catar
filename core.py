@@ -10,10 +10,11 @@ import numpy as np
 import jax.numpy as jnp
 
 from mokap.calibration import bundle_adjustment
+from mokap.utils.geometry import projective
 from mokap.utils.geometry import transforms
 from mokap.utils.geometry.fitting import quaternion_average
 
-from utils import annotations_to_polars, get_projection_matrix, reproject_points, undistort_points, triangulate_points
+from utils import annotations_to_polars, get_projection_matrix, reproject_points, undistort_points
 from viz_3d import SceneObject
 import config
 
@@ -37,7 +38,8 @@ def snap_annotation(
     Refines a 2D annotation by triangulating from other views and reprojecting
 
     This "snaps" a new user click to a (maybe) more accurate position based
-    on the consensus of other existing annotations for the same point.
+    on the consensus of other existing annotations for the same point, weighted
+    by their confidence scores.
 
     Returns:
         A (2,) numpy array with the refined 2D coordinates, or None if
@@ -56,13 +58,22 @@ def snap_annotation(
     num_cams = annotations_for_point.shape[0]
     valid_cam_indices = []
     valid_annotations_2d = []
+    valid_scores = []
 
     for i in range(num_cams):
         if i == target_cam_idx:
             continue
         if not np.isnan(annotations_for_point[i]).any():
             valid_cam_indices.append(i)
-            valid_annotations_2d.append(annotations_for_point[i])
+
+            # Append only the (x, y) coordinates for triangulation
+            valid_annotations_2d.append(annotations_for_point[i, :2])
+
+            # Also grab the confidence score for weighting
+            if annotations_for_point.shape[1] == 3:
+                valid_scores.append(annotations_for_point[i, 2])
+            else:
+                valid_scores.append(1.0) # Default to 1.0 if no score exists
 
     # We need at least 2 other views to triangulate
     if len(valid_cam_indices) < 2:
@@ -76,8 +87,16 @@ def snap_annotation(
     # Only one point here so reshape
     point_to_triangulate = valid_annotations_2d.reshape(len(valid_cam_indices), 1, 2)
 
+    # The weights need to be shape (num_cams, num_points)
+    weights_for_triangulation = np.array(valid_scores).reshape(len(valid_cam_indices), 1)
+
     # The function returns shape (num_points, 3), so we get (1, 3)
-    point_3d_single = triangulate_points(point_to_triangulate, proj_matrices)
+    point_3d_single = projective.triangulate_points_from_projections(
+        points2d=jnp.asarray(point_to_triangulate),
+        P_mats=jnp.asarray(proj_matrices),
+        weights=jnp.asarray(weights_for_triangulation)
+    )
+    point_3d_single = np.asarray(point_3d_single)  # Convert back to numpy
 
     if np.isnan(point_3d_single).any():
         return None
@@ -328,10 +347,11 @@ def track_points(
                     proj_mats_pair = [proj_matrices[idx1], proj_matrices[idx2]]
 
                     # Triangulate a hypothesis from this pair
-                    point_3d_hypothesis = triangulate_points(
-                        annots_pair.reshape(2, 1, 2),
-                        proj_mats_pair
-                    ).flatten()
+                    point_3d_hypothesis = projective.triangulate_points_from_projections(
+                        points2d=jnp.asarray(annots_pair.reshape(2, 1, 2)),
+                        P_mats=jnp.asarray(proj_mats_pair)
+                    )
+                    point_3d_hypothesis = np.asarray(point_3d_hypothesis).flatten()
 
                     if np.isnan(point_3d_hypothesis).any():
                         continue
@@ -489,7 +509,10 @@ def compute_fitness(
 
     # Triangulate for each frame
     points_3d = np.array([
-        triangulate_points(frame_annots, proj_matrices)
+        np.asarray(projective.triangulate_points_from_projections(
+            points2d=jnp.asarray(frame_annots),
+            P_mats=jnp.asarray(proj_matrices)
+        ))
         for frame_annots in undistorted_annots
     ])
 
@@ -653,7 +676,11 @@ def _prepare_ba_data(snapshot: Dict[str, Any], is_independent: bool) -> Dict[str
     if not is_independent:
         initial_structure = np.full((P, N_potential, 3), np.nan, dtype=np.float32)
         for i in range(P):
-            initial_structure[i] = triangulate_points(annots_in_calib_frames[i], proj_matrices)
+            triangulated = projective.triangulate_points_from_projections(
+                points2d=jnp.asarray(annots_in_calib_frames[i]),
+                P_mats=jnp.asarray(proj_matrices)
+            )
+            initial_structure[i] = np.asarray(triangulated)
         if np.all(np.isnan(initial_structure)):
             raise ValueError("Temporally-consistent triangulation failed for all points.")
         return {
@@ -670,7 +697,11 @@ def _prepare_ba_data(snapshot: Dict[str, Any], is_independent: bool) -> Dict[str
 
         for p in range(P):
             frame_annots = annots_in_calib_frames[p]
-            points_3d = triangulate_points(frame_annots, proj_matrices)
+            points_3d = projective.triangulate_points_from_projections(
+                points2d=jnp.asarray(frame_annots),
+                P_mats=jnp.asarray(proj_matrices)
+            )
+            points_3d = np.asarray(points_3d)
             valid_mask = ~np.isnan(points_3d).any(axis=-1)
 
             valid_3d = points_3d[valid_mask]
