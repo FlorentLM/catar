@@ -28,17 +28,36 @@ LK_PARAMS = dict(
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01)
 )
 
+# Tracking parameters
+
+# The maximum distance for two sources to be considered in agreement.
+# This defines the tolerance for consensus and the boundary for the confidence bonus falloff.
+FUSION_AGREEMENT_RADIUS = 5.0  # in pixels
+
+# The maximum confidence bonus awarded when sources agree perfectly (distance = 0).
+# The actual bonus decreases linearly to 0 as the distance approaches FUSION_AGREEMENT_RADIUS.
+FUSION_AGREEMENT_BONUS = 0.15
+
+# A hard ceiling on the confidence of any machine-generated annotation.
+# Ensures that user-provided annotations can always remain the highest-trust source.
+FUSION_MAX_AUTO_CONFIDENCE = 0.98
+
+# The initial confidence assigned to an annotation when it is first created or moved by the user.
+# This value establishes it as a high-trust point in the fusion process.
+FUSION_HUMAN_CONFIDENCE = 1.0
+
+# The maximum confidence assigned to a single-view LK track that is geometrically unverified.
+# This value is achieved when the forward-backward tracking error is zero and scales down from there.
+MAX_SINGLE_VIEW_CONFIDENCE = 0.5
+
 # If an LK-tracked point deviates from the multi-view geometric consensus by more
 # than this many pixels, it is considered to be drifting and is invalidated.
 LK_CONFIDENCE_MAX_ERROR = 7.5  # in pixels
 
-# If a reprojection error (leave-one-out) is higher than this,
-# it is considered unreliable and will not be used as a fallback.
-REPROJ_CONFIDENCE_THRESHOLD = 5.0  # in pixels
-
 # Threshold for the forward-backward check. If the endpoint of a backward track
 # is further than this many pixels from the start point, the track is unreliable.
 FORWARD_BACKWARD_THRESHOLD = 5.0  # in pixels
+
 
 # Camera calibration
 NUM_DIST_COEFFS = 14

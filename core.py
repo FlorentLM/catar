@@ -30,11 +30,11 @@ if TYPE_CHECKING:
 # ============================================================================
 
 def snap_annotation(
-    app_state: 'AppState',
-    target_cam_idx: int,
-    point_idx: int,
-    frame_idx: int,
-    user_click_pos: np.ndarray
+        app_state: 'AppState',
+        target_cam_idx: int,
+        point_idx: int,
+        frame_idx: int,
+        user_click_pos: np.ndarray
 ) -> Optional[np.ndarray]:
     """
     Snaps a new user click to a (maybe) more accurate position based
@@ -42,56 +42,38 @@ def snap_annotation(
     """
 
     with app_state.lock:
-        # all annotations for the specific point in the specific frame
         annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
         calibration = app_state.calibration_state.best_individual
 
     if calibration is None:
         return None
 
-    # Which cameras have a valid annotation for this point (excluding target camera)
     num_cams = annotations_for_point.shape[0]
-    valid_cam_indices = []
-    valid_annotations_2d = []
-    valid_scores = []
+    cam_indices = np.arange(num_cams)
 
-    cam_names = list(calibration.keys())
+    # Masks for valid annotations excluding the target camera
+    is_not_target_cam = (cam_indices != target_cam_idx)
+    is_valid_annotation = ~np.isnan(annotations_for_point).any(axis=1)
+    final_mask = is_not_target_cam & is_valid_annotation
 
-
-    # TODO: This loop is stupid, it can just be array manipulation
-
-    for i in range(num_cams):
-
-        if i == target_cam_idx:
-            continue
-
-        # Check if x, y, and score are all valid
-        if not np.isnan(annotations_for_point[i]).any():
-            valid_cam_indices.append(i)
-
-            # Append only the (x, y) coordinates for triangulation
-            valid_annotations_2d.append(annotations_for_point[i, :2])
-
-            # Also grab the confidence score for weighting
-            valid_scores.append(annotations_for_point[i, 2])
+    valid_cam_indices = cam_indices[final_mask]
 
     # We need at least 2 other views to triangulate
     if len(valid_cam_indices) < 2:
         return None
 
-    valid_annotations_2d = np.array(valid_annotations_2d)
+    valid_annotations = annotations_for_point[final_mask]
+    valid_annotations_2d = valid_annotations[:, :2]
+    valid_scores = valid_annotations[:, 2]
 
     # Get calibration parameters for valid cameras
+    cam_names = list(calibration.keys())
     proj_matrices = np.array([get_projection_matrix(calibration[cam_names[i]]) for i in valid_cam_indices])
 
-    # triangulate_points expects shape (num_cams, num_points, 2)
-    # Only one point here so reshape
+    # Reshape for triangulation function
     point_to_triangulate = valid_annotations_2d.reshape(len(valid_cam_indices), 1, 2)
+    weights_for_triangulation = valid_scores.reshape(len(valid_cam_indices), 1)
 
-    # The weights need to be shape (num_cams, num_points)
-    weights_for_triangulation = np.array(valid_scores).reshape(len(valid_cam_indices), 1)
-
-    # The function returns shape (num_points, 3), so we get (1, 3)
     point_3d_single = projective.triangulate_points_from_projections(
         points2d=jnp.asarray(point_to_triangulate),
         P_mats=jnp.asarray(proj_matrices),
@@ -121,61 +103,105 @@ def snap_annotation(
     return reprojected_point_2d
 
 
-def update_annotations_from_3d(
-    app_state: 'AppState',
-    frame_idx: int,
-    final_3d_skeleton_kps: Dict[str, np.ndarray]
-):
+def _fuse_annotations(
+        human_annots: np.ndarray,
+        human_flags: np.ndarray,
+        lk_annots: np.ndarray,
+        model_annots: np.ndarray
+) -> np.ndarray:
     """
-    Reprojects a final 3D skeleton back to all 2D views to create a corrected
-    set of annotations for the next frame's tracking.
+    Fuses annotations from multiple sources. It finds the best source of evidence
+    and boosts its confidence if other sources agree with its position.
+
+    Args:
+        human_annots: Manual annotations with a shape of (C, P, 3)  # TODO: Do we want to ignore confidence here?
+        lk_annots: Annotations from the LK tracker
+        model_annots: Annotations reprojected from the 3D skeleton model
+
+    Returns:
+        final_annotations (np.ndarray): The fused (x, y, confidence) annotations
     """
-    # TODO: This array building not the most efficient
+    num_cams, num_points, _ = human_annots.shape
+    final_annotations = np.full((num_cams, num_points, 3), np.nan, dtype=np.float32)
 
-    if not final_3d_skeleton_kps:
-        return
+    # Note: A vectorised implementation of this would be kinda complex (because of the conditional logic)
+    # A loop is better for now
+    for c in range(num_cams):
+        for p in range(num_points):
+            sources = []
+            # Source 1: Human Annotation
+            # If the human_annotated flag is set for this point, we use the
+            # annotation directly from the main array, respecting its current confidence
+            # TODO: Review role of this flag
 
-    print(f"[Frame {frame_idx}] Feedback Loop: Correcting 2D annotations based on the final 3D pose.")
+            if human_flags[c, p] and not np.isnan(human_annots[c, p, 0]):
+                sources.append({
+                    'pos': human_annots[c, p, :2],
+                    'conf': human_annots[c, p, 2]
+                })
 
-    with app_state.lock:
-        calibration = app_state.calibration_state.best_individual
-        point_names = app_state.point_names
-        num_cams = len(app_state.camera_names)
-        cam_names = app_state.camera_names
+            # Source 2: LK tracker
+            if not np.isnan(lk_annots[c, p, 0]):
+                sources.append({
+                    'pos': lk_annots[c, p, :2],
+                    'conf': lk_annots[c, p, 2]
+                })
 
-    if calibration is None:
-        return
+            # Source 3: 3D Model reprojection
+            if not np.isnan(model_annots[c, p, 0]):
+                sources.append({
+                    'pos': model_annots[c, p, :2],
+                    'conf': model_annots[c, p, 2]
+                })
 
-    points_to_reproject_3d = []
-    point_indices_in_app_state = []
-    for p_name, pos_3d in final_3d_skeleton_kps.items():
-        if p_name in point_names:
-            points_to_reproject_3d.append(pos_3d)
-            point_indices_in_app_state.append(point_names.index(p_name))
+            if not sources:
+                continue
 
-    if not points_to_reproject_3d:
-        return
+            # If only one source, just use it
+            if len(sources) == 1:
+                final_annotations[c, p] = [*sources[0]['pos'], sources[0]['conf']]
+                continue
 
-    points_to_reproject_3d = np.array(points_to_reproject_3d)
+            # Find the best source (highest confidence)
+            sources.sort(key=lambda s: s['conf'], reverse=True)
+            best_source = sources[0]
+            other_sources = sources[1:]
 
-    # TODO: Use batched function, no need to loop
-    for cam_idx in range(num_cams):
-        cam_name = cam_names[cam_idx]
-        # Reproject all points for this camera
-        reprojected_points_2d = reproject_points(points_to_reproject_3d, calibration[cam_name])
+            # Start with the best source's data
+            final_conf = best_source['conf']
 
-        if reprojected_points_2d.size == 0:
-            continue
+            # These will be used for the weighted average of *agreeing* sources
+            sum_of_weights = best_source['conf']
+            weighted_sum_pos = best_source['pos'] * best_source['conf']
 
-        # Update the annotations array
-        for i, p_idx in enumerate(point_indices_in_app_state):
-            with app_state.lock:
-                # only update if the point was not manually annotated
-                if not app_state.human_annotated[frame_idx, cam_idx, p_idx]:
+            # Check for agreement from other sources
+            for other in other_sources:
+                distance = np.linalg.norm(best_source['pos'] - other['pos'])
 
-                    # TODO: Urgent: confidence for reprojections SHOULD NOT BE 1.0 here
-                    app_state.annotations[frame_idx, cam_idx, p_idx] = [*reprojected_points_2d[i], 1.0]
-                    app_state.human_annotated[frame_idx, cam_idx, p_idx] = False
+                if distance < config.FUSION_AGREEMENT_RADIUS:
+                    # Agreement found: add to the average
+                    weighted_sum_pos += other['pos'] * other['conf']
+                    sum_of_weights += other['conf']
+
+                    # Add confidence bonus based on how good the agreement is
+                    bonus = (1.0 - (distance / config.FUSION_AGREEMENT_RADIUS)) * config.FUSION_AGREEMENT_BONUS
+                    final_conf += bonus
+
+            # Calculate final position from agreeing sources
+            final_pos = np.divide(
+                weighted_sum_pos,
+                sum_of_weights,
+                out=np.full(2, np.nan),  # default to nan if sum_of_weights is 0 (but that probably will never happenm)
+                where=sum_of_weights > 1e-6
+            )
+
+            # Clamp confidence to avoid exceeding the max for automated points
+            if best_source['conf'] < config.FUSION_HUMAN_CONFIDENCE:
+                final_conf = min(final_conf, config.FUSION_MAX_AUTO_CONFIDENCE)
+
+            final_annotations[c, p] = [*final_pos, final_conf]
+
+    return final_annotations
 
 
 def process_frame(
@@ -187,7 +213,7 @@ def process_frame(
         current_frames: List[np.ndarray]
 ):
     """
-    Runs one full cycle: LK prediction -> mokap correction -> feedback
+    Runs the full pileline on one frame.
     """
 
     with app_state.lock:
@@ -202,7 +228,7 @@ def process_frame(
     print(f"\n[Frame {frame_idx}]")
     print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
 
-    # Run Mokap reconstruction using the LK results and their confidence score
+    # Run Mokap reconstruction using LK results and their confidence score
     # annotations_from_lk is (C, P, 3) where 3 is (x, y, confidence)
     df_frame = annotations_to_polars(annotations_from_lk, frame_idx, camera_names, point_names)
     points_soup = reconstructor.reconstruct_frame(df_frame=df_frame, keypoint_names=point_names)
@@ -211,80 +237,113 @@ def process_frame(
     active_tracklets = tracker.update(points_soup, frame_idx)
 
     final_3d_skeleton_kps = None
+    skeleton_score = 0.0
+
     if active_tracklets:
         best_tracklet = max(active_tracklets, key=lambda t: len(t.skeleton.keypoints))
         final_3d_skeleton_kps = best_tracklet.skeleton.keypoints
         num_kps = len(final_3d_skeleton_kps)
         score = best_tracklet.skeleton.score
+        skeleton_score = best_tracklet.skeleton.score
         print(f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints (Score: {score:.2f}).")
     else:
         print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
 
-    # feedback loop
     with app_state.lock:
         calibration = app_state.calibration_state.best_individual
         cam_names = app_state.camera_names
         num_cams = len(cam_names)
 
-        # Create base annotation set from the model, rescuing failed multi-view tracks
-        # This will be (C, P, 3)
-        annotations_from_model = np.full_like(annotations_from_lk, np.nan)
-        if final_3d_skeleton_kps:
+        # Get human annotations as a source of evidence
+        human_flags_for_frame = app_state.human_annotated[frame_idx].copy()
+        human_annots_for_frame = app_state.annotations[frame_idx].copy()
 
-            points_to_reproject_3d, p_indices = [], []
+    # Get model-reprojected annotations as a source of evidence
+    annotations_from_model = np.full_like(annotations_from_lk, np.nan)
 
-            for p_name, pos_3d in final_3d_skeleton_kps.items():
-                if p_name in point_names:
-                    points_to_reproject_3d.append(pos_3d)
-                    p_indices.append(point_names.index(p_name))
+    if final_3d_skeleton_kps and calibration is not None:
+        points_to_reproject_3d = []
+        p_indices = []
 
-            points_to_reproject_3d = np.array(points_to_reproject_3d)
-            if points_to_reproject_3d.size > 0 and calibration is not None:
-                for cam_idx in range(num_cams):
-                    cam_params = calibration[cam_names[cam_idx]]
-                    reprojected_2d = reproject_points(points_to_reproject_3d, cam_params)
-                    if reprojected_2d.size > 0:
-                        for i, p_idx in enumerate(p_indices):
-                            # Rescued points get a fixed (medium high) confidence score
-                            annotations_from_model[cam_idx, p_idx] = [*reprojected_2d[i], 0.75]
+        for p_name, pos_3d in final_3d_skeleton_kps.items():
+            if p_name in point_names:
+                points_to_reproject_3d.append(pos_3d)
+                p_indices.append(point_names.index(p_name))
 
-        # Start with the model-based rescue for failed tracks
+        points_to_reproject_3d = np.array(points_to_reproject_3d)
 
-        # If LK failed (nan) but model has a projection (not nan), use model
-        # Otherwise use LK
+        if points_to_reproject_3d.size > 0:
 
-        final_annotations = np.where(
-            ~np.isnan(annotations_from_lk[..., 0, np.newaxis]),
-            annotations_from_lk,
-            annotations_from_model
+            for cam_idx in range(num_cams):
+                cam_params = calibration[cam_names[cam_idx]]
+                reprojected_2d = reproject_points(points_to_reproject_3d, cam_params)
+
+                if reprojected_2d.size > 0:
+                    for i, p_idx in enumerate(p_indices):
+                        model_confidence = skeleton_score * 0.75
+                        annotations_from_model[cam_idx, p_idx] = [*reprojected_2d[i], model_confidence]
+
+    # Step 1: Get best possible 2D annotations by fusing all evidence
+    fused_2d_annotations = _fuse_annotations(
+        human_annots=human_annots_for_frame,
+        human_flags=human_flags_for_frame,
+        lk_annots=annotations_from_lk,
+        model_annots=annotations_from_model
+    ) # shape (C, P, 3)
+
+    # Rescue single-view LK tracks that were lost during fusion because they had no other supporting evidence
+    is_valid_lk = ~np.isnan(annotations_from_lk[..., 0])
+    num_views_per_lk_point = np.sum(is_valid_lk, axis=0)  # shape (P,)
+
+    is_valid_fused = ~np.isnan(fused_2d_annotations[..., 0])
+    is_fused_point_lost = ~np.any(is_valid_fused, axis=0)  # shape (P,)
+
+    for p_idx in range(app_state.num_points):
+        # if LK had exactly one view AND the point was lost in fusion...
+        if num_views_per_lk_point[p_idx] == 1 and is_fused_point_lost[p_idx]:
+            # ...find the camera that had the single track and re-insert it
+            cam_idx = np.where(is_valid_lk[:, p_idx])[0][0]
+            fused_2d_annotations[cam_idx, p_idx] = annotations_from_lk[cam_idx, p_idx]
+
+    # Step 2: Generate (the hopefully high fidelity) 3D data by triangulating these fused 2D points
+    triangulated_3d_points = np.full((app_state.num_points, 3), np.nan, dtype=np.float32)
+    if calibration is not None:
+        proj_matrices = np.array([get_projection_matrix(calibration[name]) for name in cam_names])
+
+        points2d_for_triangulation = fused_2d_annotations[..., :2] # (C, P, 2)
+        weights_for_triangulation = fused_2d_annotations[..., 2] # (C, P)
+
+        triangulated_3d_points = projective.triangulate_points_from_projections(
+            points2d=jnp.asarray(points2d_for_triangulation),
+            P_mats=jnp.asarray(proj_matrices),
+            weights=jnp.asarray(weights_for_triangulation)
         )
+        triangulated_3d_points = np.asarray(triangulated_3d_points)
 
-        # Re-inject single-view tracks
+    # Step 3: Create the final 3D pose for this frame (priority on triangulation)
+    final_3d_pose = np.full((app_state.num_points, 3), np.nan, dtype=np.float32)
 
-        # Find points that were successfully tracked by LK but only in a single view
-        # (these were lost by the 3D reconstructor but are still useful)
+    for p_idx in range(app_state.num_points):
+        p_name = app_state.point_names[p_idx]
 
-        is_valid_lk_track = ~np.isnan(annotations_from_lk[..., 0])
-        num_views_per_point = np.sum(is_valid_lk_track, axis=0)
+        # Priority 1: Use the triangulation result if it's valid
+        if not np.isnan(triangulated_3d_points[p_idx, 0]):
+            final_3d_pose[p_idx] = triangulated_3d_points[p_idx]
 
-        for p_idx in range(app_state.num_points):
-            if num_views_per_point[p_idx] == 1:
-                cam_idx = np.where(is_valid_lk_track[:, p_idx])[0][0]
+        # Priority 2 (Fallback): If triangulation failed, use mokap skeleton's position
+        elif final_3d_skeleton_kps and p_name in final_3d_skeleton_kps:
+            final_3d_pose[p_idx] = final_3d_skeleton_kps[p_name]
 
-                # Ensure this point is preserved in the final annotation set for next frame
-                # (it's possible the model-based rescue filled it with nan so explicitly overwrite it)
-                final_annotations[cam_idx, p_idx] = annotations_from_lk[cam_idx, p_idx]
+    # Step 4: Update app state with the final data for this frame
+    with app_state.lock:
+        app_state.annotations[frame_idx] = fused_2d_annotations
+        app_state.reconstructed_3d_points[frame_idx] = final_3d_pose
 
-        app_state.annotations[frame_idx] = final_annotations
-        app_state.human_annotated[frame_idx] = False
+        # The human_annotated flag is preserved from its state at the beginning of the frame.
+        # Its meaning is now "a human has provided a high-weight piece of evidence for this point".
+        # TODO: Review the role of this flag
 
-        # Update the 3D points
-        app_state.reconstructed_3d_points[frame_idx].fill(np.nan)
-        if final_3d_skeleton_kps:
-            for p_name, pos_3d in final_3d_skeleton_kps.items():
-                if p_name in point_names:
-                    p_idx = point_names.index(p_name)
-                    app_state.reconstructed_3d_points[frame_idx, p_idx] = pos_3d
+        app_state.human_annotated[frame_idx] = human_flags_for_frame
 
 
 # ============================================================================
@@ -319,9 +378,8 @@ def track_points(
 
     num_videos = len(current_frames)
     proj_matrices = {name: get_projection_matrix(calibration[name]) for name in cam_names}
-    raw_lk_coords = np.full_like(annotations_prev, np.nan)
 
-    # Run LK Optic flow
+    # Run LK Optic flow and compute initial confidence
     for cam_idx in range(num_videos):
         prev_gray = cv2.cvtColor(prev_frames[cam_idx], cv2.COLOR_BGR2GRAY)
         curr_gray = cv2.cvtColor(current_frames[cam_idx], cv2.COLOR_BGR2GRAY)
@@ -355,24 +413,33 @@ def track_points(
                 i] == 1 and fb_error < config.FORWARD_BACKWARD_THRESHOLD
 
             if is_lk_successful:
-                raw_lk_coords[cam_idx, p_idx] = p1_forward[i].flatten()
+                # Calculate confidence based on forward-backward error
+                confidence = config.MAX_SINGLE_VIEW_CONFIDENCE * (1.0 - (fb_error / config.FORWARD_BACKWARD_THRESHOLD))
 
-    # Confidence scoring
+                # Store the point and its initial, single-view confidence
+                output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), confidence]
+
+    # Confidence upgrade via multi-view consensus
     for p_idx in range(app_state.num_points):
 
-        for cam_idx_to_check in range(num_videos):
-            point_to_check = raw_lk_coords[cam_idx_to_check, p_idx]
+        # Find all cameras that have a valid track for this point
+        peer_cam_indices = [i for i, p in enumerate(output_annotations[:, p_idx]) if not np.isnan(p).any()]
 
-            if np.isnan(point_to_check).any():
-                continue
+        # if we have enough views for triangulation we can try to upgrade the confidence
+        if len(peer_cam_indices) >= 2:
 
-            peer_cam_indices = [i for i, p in enumerate(raw_lk_coords[:, p_idx]) if i != cam_idx_to_check and not np.isnan(p).any()]
-            if len(peer_cam_indices) < 2:
-                # TODO: uhhh actually I am not sure about this one
-                confidence = 1.0 if len(peer_cam_indices) < 2 else 0.0
-            else:
+            # For each valid point, check consensus with pairs of peers
+            # TODO: Could maybe use batched mokap functions instead of doing it per-pair??
+
+            for cam_idx_to_check in peer_cam_indices:
+                point_to_check = output_annotations[cam_idx_to_check, p_idx, :2]
+
+                # We need at least 2 other peers to make a triangulation hypothesis
+                other_peers = [i for i in peer_cam_indices if i != cam_idx_to_check]
+                if len(other_peers) < 2:
+                    continue
+
                 min_drift_error = float('inf')
-                
                 cam_name_to_check = cam_names[cam_idx_to_check]
 
                 for peer_pair_indices in combinations(peer_cam_indices, 2):
@@ -380,7 +447,7 @@ def track_points(
                     
                     cam_name1, cam_name2 = cam_names[idx1], cam_names[idx2]
                     
-                    annots_pair = np.array([raw_lk_coords[idx1, p_idx], raw_lk_coords[idx2, p_idx]])
+                    annots_pair = np.array([output_annotations[idx1, p_idx, :2], output_annotations[idx2, p_idx, :2]])
                     
                     proj_mats_pair = [proj_matrices[cam_name1], proj_matrices[cam_name2]]
 
@@ -407,12 +474,14 @@ def track_points(
 
                 # at least one valid consensus is found: use it to calculate confidence
                 if min_drift_error != float('inf'):
-                    confidence = max(0.0, 1.0 - (min_drift_error / config.LK_CONFIDENCE_MAX_ERROR))
-                else:
-                    # triangulation failed for all pairs so default to low confidence
-                    confidence = 0.1 
+                    multi_view_confidence = max(0.0, 1.0 - (min_drift_error / config.LK_CONFIDENCE_MAX_ERROR))
 
-            output_annotations[cam_idx_to_check, p_idx] = [*point_to_check, confidence]
+                    # We only update the confidence and never decrease it from this step
+                    # (This ensures a stable single-view track doesn't get punished if triangulation is noisy)
+                    output_annotations[cam_idx_to_check, p_idx, 2] = max(
+                        output_annotations[cam_idx_to_check, p_idx, 2],
+                        multi_view_confidence
+                    )
 
     return output_annotations
 
