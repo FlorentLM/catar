@@ -53,10 +53,10 @@ def create_ui(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
     _register_handlers(app_state, queues)
 
     # Main window layout
-    with dpg.window(label="Main Window", tag="main_window"):
+    with dpg.window(label="Main Window", tag="main_window", no_scrollbar=True):
         _create_menu_bar(app_state, queues)
 
-        with dpg.child_window(tag="main_content_window", height=-config.BOTTOM_PANEL_HEIGHT_FULL):
+        with dpg.child_window(tag="main_content_window", height=-config.BOTTOM_PANEL_HEIGHT_FULL, no_scrollbar=True):
 
             with dpg.group(horizontal=True):
                 with dpg.child_window(width=config.CONTROL_PANEL_WIDTH, tag="control_panel_window"):
@@ -65,7 +65,7 @@ def create_ui(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                 with dpg.child_window(width=-1, tag="video_grid_window"):
                     _create_video_grid(app_state)
 
-        with dpg.child_window(tag="bottom_panel_window", height=config.BOTTOM_PANEL_HEIGHT_FULL):
+        with dpg.child_window(tag="bottom_panel_window", height=config.BOTTOM_PANEL_HEIGHT_FULL, no_scrollbar=True):
             _create_bottom_panel(app_state)
 
     # Popups
@@ -362,10 +362,12 @@ def _create_bottom_panel(app_state: AppState):
 
     dpg.add_separator(tag="histogram_separator")
 
+    footer_height = 25
+
     # Histogram
     with dpg.plot(
         label="Annotation Histogram",
-        height=-1,
+        height=-footer_height,
         width=-1,
         no_menus=True,
         no_box_select=True,
@@ -394,6 +396,13 @@ def _create_bottom_panel(app_state: AppState):
             callback=_set_frame_callback,
             user_data=user_data
         )
+
+    # Footer
+    dpg.add_separator()
+    with dpg.group():
+        help_text_content = "Shift (hold): slow cursor | Alt (hold): hide overlays"
+        help_text_widget = dpg.add_text(help_text_content, tag="hotkey_help_text")
+        dpg.bind_item_theme(help_text_widget, "faint_text_theme")
 
     with dpg.item_handler_registry(tag="histogram_handler"):
         dpg.add_item_clicked_handler(
