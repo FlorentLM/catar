@@ -114,7 +114,7 @@ def _fuse_annotations(
     and boosts its confidence if other sources agree with its position.
 
     Args:
-        human_annots: Manual annotations with a shape of (C, P, 3)  # TODO: Do we want to ignore confidence here?
+        human_annots: Manual annotations
         lk_annots: Annotations from the LK tracker
         model_annots: Annotations reprojected from the 3D skeleton model
 
@@ -130,28 +130,27 @@ def _fuse_annotations(
         for p in range(num_points):
             sources = []
             # Source 1: Human Annotation
-            # If the human_annotated flag is set for this point, we use the
-            # annotation directly from the main array, respecting its current confidence
-            # TODO: Review role of this flag
-
             if human_flags[c, p] and not np.isnan(human_annots[c, p, 0]):
                 sources.append({
                     'pos': human_annots[c, p, :2],
-                    'conf': human_annots[c, p, 2]
+                    'conf': human_annots[c, p, 2],
+                    'type': 'human'
                 })
 
             # Source 2: LK tracker
             if not np.isnan(lk_annots[c, p, 0]):
                 sources.append({
                     'pos': lk_annots[c, p, :2],
-                    'conf': lk_annots[c, p, 2]
+                    'conf': lk_annots[c, p, 2],
+                    'type': 'lk'
                 })
 
             # Source 3: 3D Model reprojection
             if not np.isnan(model_annots[c, p, 0]):
                 sources.append({
                     'pos': model_annots[c, p, :2],
-                    'conf': model_annots[c, p, 2]
+                    'conf': model_annots[c, p, 2],
+                    'type': 'model'
                 })
 
             if not sources:
@@ -195,9 +194,14 @@ def _fuse_annotations(
                 where=sum_of_weights > 1e-6
             )
 
-            # Clamp confidence to avoid exceeding the max for automated points
-            if best_source['conf'] < config.FUSION_HUMAN_CONFIDENCE:
-                final_conf = min(final_conf, config.FUSION_MAX_AUTO_CONFIDENCE)
+            # Confidence ceiling
+            # If the highest-confidence source was a human annotation in this frame, ceiling is 1.0
+            # Otherwise it's capped at the maximum for automated points
+            if best_source['type'] == 'human':
+                max_conf = config.FUSION_HUMAN_CONFIDENCE
+            else:
+                max_conf = config.FUSION_MAX_AUTO_CONFIDENCE
+            final_conf = min(final_conf, max_conf)
 
             final_annotations[c, p] = [*final_pos, final_conf]
 
@@ -339,10 +343,7 @@ def process_frame(
         app_state.annotations[frame_idx] = fused_2d_annotations
         app_state.reconstructed_3d_points[frame_idx] = final_3d_pose
 
-        # The human_annotated flag is preserved from its state at the beginning of the frame.
-        # Its meaning is now "a human has provided a high-weight piece of evidence for this point".
-        # TODO: Review the role of this flag
-
+        # Note: This flag only means 'a human has provided a high-weight piece of evidence for this point in this frame'
         app_state.human_annotated[frame_idx] = human_flags_for_frame
 
 
@@ -365,8 +366,9 @@ def track_points(
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
 
-        # Only take x, y from previous frame annotations for LK input
-        annotations_prev = app_state.annotations[frame_idx - 1][..., :2].copy()
+        # Get previous annotations WITH confidence this time
+        annotations_prev_full = app_state.annotations[frame_idx - 1].copy()
+        annotations_prev = annotations_prev_full[..., :2]  # this is used for LK input
         calibration = app_state.calibration_state.best_individual
         cam_names = app_state.camera_names
 
@@ -413,11 +415,19 @@ def track_points(
                 i] == 1 and fb_error < config.FORWARD_BACKWARD_THRESHOLD
 
             if is_lk_successful:
-                # Calculate confidence based on forward-backward error
-                confidence = config.MAX_SINGLE_VIEW_CONFIDENCE * (1.0 - (fb_error / config.FORWARD_BACKWARD_THRESHOLD))
+                # Get confidence from the previous frame for this point
+                prev_confidence = annotations_prev_full[cam_idx, p_idx, 2]
 
-                # Store the point and its initial, single-view confidence
-                output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), confidence]
+                # If the previous annotation didn't exist, default to a starting confidence
+                if np.isnan(prev_confidence):
+                    prev_confidence = config.MAX_SINGLE_VIEW_CONFIDENCE
+
+                # Quality of this specific LK track (0.0 to 1.0)
+                lk_quality = (1.0 - (fb_error / config.FORWARD_BACKWARD_THRESHOLD))
+
+                # New confidence is the previous confidence modulated by the new track quality
+                new_confidence = prev_confidence * lk_quality
+                output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), new_confidence]
 
     # Confidence upgrade via multi-view consensus
     for p_idx in range(app_state.num_points):
@@ -444,11 +454,11 @@ def track_points(
 
                 for peer_pair_indices in combinations(peer_cam_indices, 2):
                     idx1, idx2 = peer_pair_indices
-                    
+
                     cam_name1, cam_name2 = cam_names[idx1], cam_names[idx2]
-                    
+
                     annots_pair = np.array([output_annotations[idx1, p_idx, :2], output_annotations[idx2, p_idx, :2]])
-                    
+
                     proj_mats_pair = [proj_matrices[cam_name1], proj_matrices[cam_name2]]
 
                     # Triangulate a hypothesis from this pair
@@ -482,6 +492,13 @@ def track_points(
                         output_annotations[cam_idx_to_check, p_idx, 2],
                         multi_view_confidence
                     )
+
+    # Ensure that no automated track's confidence exceeds the maximum allowed value
+    is_valid = ~np.isnan(output_annotations[..., 2])
+    output_annotations[is_valid, 2] = np.fmin(
+        output_annotations[is_valid, 2],
+        config.FUSION_MAX_AUTO_CONFIDENCE
+    )
 
     return output_annotations
 
