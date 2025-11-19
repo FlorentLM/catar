@@ -438,60 +438,50 @@ def track_points(
         # if we have enough views for triangulation we can try to upgrade the confidence
         if len(peer_cam_indices) >= 2:
 
-            # For each valid point, check consensus with pairs of peers
-            # TODO: Could maybe use batched mokap functions instead of doing it per-pair??
-
             for cam_idx_to_check in peer_cam_indices:
                 point_to_check = output_annotations[cam_idx_to_check, p_idx, :2]
 
-                # We need at least 2 other peers to make a triangulation hypothesis
-                other_peers = [i for i in peer_cam_indices if i != cam_idx_to_check]
-                if len(other_peers) < 2:
+                # The consensus group is all the other cameras (that have a valid track)
+                consensus_peer_indices = [i for i in peer_cam_indices if i != cam_idx_to_check]
+
+                # We need at least 2 other views to form a triangulation hypothesis
+                if len(consensus_peer_indices) < 2:
                     continue
 
-                min_drift_error = float('inf')
+                # Prepare data for a single, batched triangulation call.
+                consensus_annots = output_annotations[consensus_peer_indices, p_idx, :2]
+                consensus_cam_names = [cam_names[i] for i in consensus_peer_indices]
+                consensus_proj_mats = np.array([proj_matrices[name] for name in consensus_cam_names])
+
+                points_for_triangulation = consensus_annots.reshape(len(consensus_peer_indices), 1, 2)
+
+                point_3d_hypothesis = projective.triangulate_points_from_projections(
+                    points2d=jnp.asarray(points_for_triangulation),
+                    P_mats=jnp.asarray(consensus_proj_mats)
+                )
+                point_3d_hypothesis = np.asarray(point_3d_hypothesis).flatten()
+
+                if np.isnan(point_3d_hypothesis).any():
+                    continue
+
+                # Reproject the 3D hypothesis back to the camera we are checking
                 cam_name_to_check = cam_names[cam_idx_to_check]
+                reprojected = reproject_points(point_3d_hypothesis, calibration[cam_name_to_check])
+                if reprojected.size == 0:
+                    continue
 
-                for peer_pair_indices in combinations(peer_cam_indices, 2):
-                    idx1, idx2 = peer_pair_indices
+                # Geometric error (drift) for this LK track
+                error = np.linalg.norm(point_to_check - reprojected.flatten())
 
-                    cam_name1, cam_name2 = cam_names[idx1], cam_names[idx2]
+                # Convert error into a confidence score
+                multi_view_confidence = max(0.0, 1.0 - (error / config.LK_CONFIDENCE_MAX_ERROR))
 
-                    annots_pair = np.array([output_annotations[idx1, p_idx, :2], output_annotations[idx2, p_idx, :2]])
-
-                    proj_mats_pair = [proj_matrices[cam_name1], proj_matrices[cam_name2]]
-
-                    # Triangulate a hypothesis from this pair
-                    point_3d_hypothesis = projective.triangulate_points_from_projections(
-                        points2d=jnp.asarray(annots_pair.reshape(2, 1, 2)),
-                        P_mats=jnp.asarray(proj_mats_pair)
-                    )
-                    point_3d_hypothesis = np.asarray(point_3d_hypothesis).flatten()
-
-                    if np.isnan(point_3d_hypothesis).any():
-                        continue
-
-                    # Reproject hypothesis back to the camera we are checking
-                    reprojected = reproject_points(point_3d_hypothesis, calibration[cam_name_to_check])
-                    if reprojected.size == 0:
-                        continue
-
-                    # Calculate error for this specific hypothesis
-                    error = np.linalg.norm(point_to_check - reprojected.flatten())
-
-                    # Keep track of the minimum error found so far
-                    min_drift_error = min(min_drift_error, error)
-
-                # at least one valid consensus is found: use it to calculate confidence
-                if min_drift_error != float('inf'):
-                    multi_view_confidence = max(0.0, 1.0 - (min_drift_error / config.LK_CONFIDENCE_MAX_ERROR))
-
-                    # We only update the confidence and never decrease it from this step
-                    # (This ensures a stable single-view track doesn't get punished if triangulation is noisy)
-                    output_annotations[cam_idx_to_check, p_idx, 2] = max(
-                        output_annotations[cam_idx_to_check, p_idx, 2],
-                        multi_view_confidence
-                    )
+                # We only update the confidence if the multi-view check provides a better score
+                # (This prevents a stable single-view track from being punished by noisy triangulation)
+                output_annotations[cam_idx_to_check, p_idx, 2] = max(
+                    output_annotations[cam_idx_to_check, p_idx, 2],
+                    multi_view_confidence
+                )
 
     # Ensure that no automated track's confidence exceeds the maximum allowed value
     is_valid = ~np.isnan(output_annotations[..., 2])
