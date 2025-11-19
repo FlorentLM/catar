@@ -189,6 +189,9 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
             elif ba_result['status'] == 'error':
                 print(f"BA ERROR: {ba_result['message']}")
 
+            elif ba_result['status'] == 'cancelled':
+                print(f"BA cancelled: {ba_result['message']}")
+
         except queue.Empty:
             pass
 
@@ -337,7 +340,8 @@ def main():
             queues.frames_for_tracking,
             queues.tracking_progress,
             video_paths,
-            queues.tracking_command
+            queues.tracking_command,
+            queues.stop_batch_track
         ),
         RenderingWorker(
             app_state,
@@ -348,7 +352,7 @@ def main():
             queues.results
         ),
         GAWorker(queues.ga_command, queues.ga_progress),
-        BAWorker(queues.ba_command, queues.ba_results)
+        BAWorker(queues.ba_command, queues.ba_results, queues.stop_bundle_adjustment)
     ]
 
     # Start all workers

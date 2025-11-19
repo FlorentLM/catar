@@ -1,6 +1,8 @@
 """
 GUI implementation using DearPyGUI.
 """
+import queue
+
 import cv2
 import dearpygui.dearpygui as dpg
 import numpy as np
@@ -69,7 +71,7 @@ def create_ui(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
     _create_ga_popup(app_state, queues)
     _create_ba_config_popup(app_state, queues)
     _create_ba_progress_popup(app_state, queues)
-    _create_batch_track_popup(app_state)
+    _create_batch_track_popup(app_state, queues)
     _create_loupe_popup()
 
     # Viewport
@@ -523,18 +525,26 @@ def _create_ba_config_popup(app_state: AppState, queues: Queues):
 def _create_ba_progress_popup(app_state: AppState, queues: Queues):
     """Create bundle adjustment progress popup."""
 
+    user_data = {"app_state": app_state, "queues": queues}
+
     with dpg.window(
             label="Refining Calibration", modal=True, show=False, tag="ba_progress_popup",
             width=400, height=100, no_close=True, no_move=True
     ):
         dpg.add_text("Running Bundle Adjustment...", tag="ba_status_text")
         dpg.add_text("This may take a few minutes...")
+        dpg.add_separator()
+        dpg.add_button(
+            label="Cancel Refinement",
+            callback=_stop_ba_callback,
+            user_data=user_data,
+            width=-1
+        )
 
-
-def _create_batch_track_popup(app_state: AppState):
+def _create_batch_track_popup(app_state: AppState, queues: Queues):
     """Create batch tracking progress popup."""
 
-    user_data = {"app_state": app_state}
+    user_data = {"app_state": app_state, "queues": queues}
 
     with dpg.window(
         label="Tracking Progress",
@@ -691,7 +701,7 @@ def _start_batch_track_callback(sender, app_data, user_data):
 
     with app_state.lock:
         start_frame = app_state.frame_idx
-        app_state.stop_batch_track.clear()
+        queues.stop_batch_track.clear()
         queues.tracking_command.put({
             "action": "batch_track",
             "start_frame": start_frame
@@ -704,11 +714,9 @@ def _start_batch_track_callback(sender, app_data, user_data):
 def _stop_batch_track_callback(sender, app_data, user_data):
     """Stop batch tracking."""
 
-    app_state = user_data["app_state"]
-
+    queues = user_data["queues"]
     print("Stop command issued to batch tracker.")
-
-    app_state.stop_batch_track.set()
+    queues.stop_batch_track.set()
     dpg.hide_item("batch_track_popup")
 
 
@@ -1231,8 +1239,6 @@ def _start_ga_callback(sender, app_data, user_data):
 
     dpg.show_item("ga_popup")
 
-# TODO: Add a stop refinement button
-
 
 def _stop_ga_callback(sender, app_data, user_data):
     """Stop genetic algorithm."""
@@ -1276,6 +1282,16 @@ def _start_ba_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
     queues = user_data["queues"]
 
+    # Clear any stale messages from the results queue
+    while not queues.ba_results.empty():
+        try:
+            queues.ba_results.get_nowait()
+        except queue.Empty:
+            break
+
+    # Also ensure the stop event is cleared before a new run
+    queues.stop_bundle_adjustment.clear()
+
     # Map UI selection to mode strings for the worker
     selected_mode_label = dpg.get_value("ba_mode_radio")
     mode_map = {
@@ -1299,6 +1315,15 @@ def _start_ba_callback(sender, app_data, user_data):
     dpg.set_value("ba_status_text", f"Running Bundle Adjustment ({selected_mode_label})...")
     dpg.hide_item("ba_config_popup")
     dpg.show_item("ba_progress_popup")
+
+
+def _stop_ba_callback(sender, app_data, user_data):
+    """Signal the BA worker to stop and discard results."""
+
+    queues = user_data["queues"]
+    print("Sending stop signal to Bundle Adjustment worker.")
+    queues.stop_bundle_adjustment.set()
+    dpg.hide_item("ba_progress_popup")
 
 
 def _clear_calibration_callback(sender, app_data, user_data):

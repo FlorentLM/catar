@@ -220,7 +220,8 @@ class TrackingWorker(threading.Thread):
         frames_in_queue: queue.Queue,
         progress_out_queue: queue.Queue,
         video_paths: List[str],
-        command_queue: queue.Queue
+        command_queue: queue.Queue,
+        stop_batch_track: threading.Event
     ):
         super().__init__(daemon=True, name="TrackingWorker")
         self.app_state = app_state
@@ -230,7 +231,8 @@ class TrackingWorker(threading.Thread):
         self.progress_out_queue = progress_out_queue
         self.video_paths = video_paths
         self.command_queue = command_queue
-        self.shutdown_event = threading.Event()
+        self.stop_batch_track_event = stop_batch_track
+        self.shutdown_event = threading.Event()     # TODO Events should all be defined at the same place probably...
         self.prev_frames = None
         self.prev_frame_idx = -1
 
@@ -345,7 +347,7 @@ class TrackingWorker(threading.Thread):
 
         # Track through remaining frames
         for i, frame_idx in enumerate(range(start_frame + 1, num_frames)):
-            if self.app_state.stop_batch_track.is_set():
+            if self.stop_batch_track_event.is_set():
                 print(f"Batch track stopped by user at frame {frame_idx}.")
                 break
 
@@ -589,10 +591,11 @@ class GAWorker(multiprocessing.Process):
 class BAWorker(multiprocessing.Process):
     """Runs bundle adjustment in a separate process."""
 
-    def __init__(self, command_queue: multiprocessing.Queue, results_queue: multiprocessing.Queue):
+    def __init__(self, command_queue: multiprocessing.Queue, results_queue: multiprocessing.Queue, stop_event: multiprocessing.Event):
         super().__init__(name="BAWorker")
         self.command_queue = command_queue
         self.results_queue = results_queue
+        self.stop_event = stop_event
 
     def run(self):
         print("BA worker started.")
@@ -606,15 +609,29 @@ class BAWorker(multiprocessing.Process):
                 if command.get("action") == "start":
                     print("BA worker received start command.")
                     snapshot = command.get("ba_state_snapshot")
+
                     try:
                         results = run_refinement(snapshot)
                         self.results_queue.put(results)
+
+                        if self.stop_event.is_set():
+                            print("BA worker finished, but a stop was requested. Discarding results.")
+                            self.results_queue.put(
+                                {"status": "cancelled", "message": "Bundle Adjustment was cancelled by the user."})
+                        else:
+                            # if not cancelled, send the results as normal
+                            self.results_queue.put(results)
+
                     except Exception as e:
                         import traceback
+
                         print(f"[ BA WORKER EXCEPTION ]")
                         traceback.print_exc()
                         print(f"[     END EXCEPTION   ]")
-                        self.results_queue.put({"status": "error", "message": str(e)})
+
+                        # check for cancellation before reporting an error
+                        if not self.stop_event.is_set():
+                            self.results_queue.put({"status": "error", "message": str(e)})
 
             except queue.Empty:
                 continue

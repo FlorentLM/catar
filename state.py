@@ -44,6 +44,10 @@ class Queues:
     ga_progress: multiprocessing.Queue = field(default_factory=multiprocessing.Queue)
     cache_progress: queue.Queue = field(default_factory=queue.Queue)
 
+    # Cancellation signals
+    stop_batch_track: threading.Event = field(default_factory=threading.Event)
+    stop_bundle_adjustment: multiprocessing.Event = field(default_factory=multiprocessing.Event)
+
     def shutdown_all(self):
         """Send shutdown commands to all workers."""
 
@@ -52,6 +56,8 @@ class Queues:
         self.frames_for_rendering.put({"action": "shutdown"})
         self.ga_command.put({"action": "shutdown"})
         self.ba_command.put({"action": "shutdown"})
+        self.stop_batch_track.set()
+        self.stop_bundle_adjustment.set()
 
 
 @dataclass
@@ -112,9 +118,6 @@ class AppState:
         # Feature flags
         self.keypoint_tracking_enabled: bool = False
         self.needs_3d_reconstruction: bool = True
-
-        # Batch tracking control
-        self.stop_batch_track = threading.Event()
 
         # Annotation data
         num_frames = video_metadata['num_frames']
