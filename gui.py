@@ -196,6 +196,14 @@ def _create_menu_bar(app_state: AppState, queues: Queues):
                 callback=_toggle_show_reprojection_error_callback,
                 user_data=user_data
             )
+            dpg.add_menu_item(
+                label="Show Epipolar Lines",
+                tag="show_epipolar_lines_checkbox",
+                check=True,
+                default_value=True,
+                callback=_toggle_show_epipolar_lines_callback,
+                user_data=user_data
+            )
 
         with dpg.menu(label="Tools"):
             dpg.add_menu_item(
@@ -620,6 +628,16 @@ def _register_handlers(app_state: AppState, queues: Queues):
             callback=_leftclick_release_callback,
             user_data=user_data
         )
+        dpg.add_key_down_handler(
+            key=dpg.mvKey_LAlt,
+            callback=_on_alt_down,
+            user_data=user_data
+        )
+        dpg.add_key_release_handler(
+            key=dpg.mvKey_LAlt,
+            callback=_on_alt_up,
+            user_data=user_data
+        )
 
 
 # ============================================================================
@@ -872,7 +890,11 @@ def _image_drag_callback(sender, app_data, user_data):
         video_h = app_state.video_metadata['height']
         current_frames = app_state.current_video_frames
         all_annotations = app_state.annotations[frame_idx]
-        best_individual = app_state.calibration.best_calibration
+        best_calib = app_state.calibration.best_calibration
+
+        show_epipolar_lines = app_state.show_epipolar_lines
+        temp_hide_overlays = app_state.temp_hide_overlays
+
         f_mats = app_state.calibration.F_mats
         point_3d_selected = app_state.reconstructed_3d_points[frame_idx, p_idx]
         camera_colors = app_state.camera_colors
@@ -962,7 +984,7 @@ def _image_drag_callback(sender, app_data, user_data):
         return ((p[0] - src_x) * zoom_factor, (p[1] - src_y) * zoom_factor)
 
     # Draw epipolar lines for selected point
-    if best_individual and f_mats:
+    if show_epipolar_lines and not temp_hide_overlays and best_calib and f_mats:
         for from_cam in range(len(current_frames)):
 
             point_2d = all_annotations[from_cam, p_idx, :2]
@@ -983,9 +1005,9 @@ def _image_drag_callback(sender, app_data, user_data):
                 dpg.draw_line(p1_loupe, p2_loupe, color=color, thickness=1, parent=layer_tag)
 
     # Draw reprojection for selected point
-    if best_individual and not np.isnan(point_3d_selected).any():
+    if not temp_hide_overlays and best_calib and not np.isnan(point_3d_selected).any():
         cam_name_target = cam_names[cam_idx]
-        reprojected = reproject_points(point_3d_selected, best_individual[cam_name_target])
+        reprojected = reproject_points(point_3d_selected, best_calib[cam_name_target])
 
         if reprojected.size > 0:
             reproj_video_coords = reprojected[0]
@@ -1110,6 +1132,14 @@ def _toggle_focus_mode_callback(sender, app_data, user_data):
         app_state.focus_selected_point = not app_state.focus_selected_point
         status = "Enabled" if app_state.focus_selected_point else "Disabled"
         print(f"Focus mode: {status}")
+
+
+def _toggle_show_epipolar_lines_callback(sender, app_data, user_data):
+    """Toggle visibility of epipolar lines."""
+
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        app_state.show_epipolar_lines = dpg.get_value(sender)
 
 
 def _toggle_show_all_labels_callback(sender, app_data, user_data):
@@ -1383,6 +1413,24 @@ def _clear_calibration_callback(sender, app_data, user_data):
 # Callbacks - Keyboard
 # ============================================================================
 
+def _on_alt_down(sender, app_data, user_data):
+    """Temporarily hide overlays when Alt is held down."""
+
+    app_state = user_data["app_state"]
+
+    with app_state.lock:
+        app_state.temp_hide_overlays = True
+
+
+def _on_alt_up(sender, app_data, user_data):
+    """Show overlays again when Alt is released."""
+
+    app_state = user_data["app_state"]
+
+    with app_state.lock:
+        app_state.temp_hide_overlays = False
+
+
 def _on_key_press(sender, app_data, user_data):
     """Handle keyboard shortcuts."""
 
@@ -1505,6 +1553,9 @@ def update_annotation_overlays(app_state: AppState):
         focus_mode = app_state.focus_selected_point
         show_all_labels = app_state.show_all_labels
         show_reprojection_error = app_state.show_reprojection_error
+        show_epipolar_lines = app_state.show_epipolar_lines
+        temp_hide_overlays = app_state.temp_hide_overlays
+
         calibration = app_state.calibration
 
         all_annotations = app_state.annotations[frame_idx]
@@ -1515,7 +1566,7 @@ def update_annotation_overlays(app_state: AppState):
 
     # Selected point data for special overlays
     p_idx = app_state.selected_point_idx
-    best_individual = calibration.best_calibration
+    best_calib = calibration.best_calibration
     f_mats = calibration.F_mats
     selected_annots = app_state.annotations[frame_idx, :, p_idx]
     point_3d = app_state.reconstructed_3d_points[frame_idx, p_idx]
@@ -1535,7 +1586,7 @@ def update_annotation_overlays(app_state: AppState):
         cam_name = camera_names[cam_idx]
 
         # epipolar lines for selected point
-        if best_individual and f_mats:
+        if show_epipolar_lines and not temp_hide_overlays and best_calib and f_mats:
             _draw_epipolar_lines(
                 cam_idx, selected_annots, f_mats, num_videos,
                 video_w, video_h, scale_x, scale_y,
@@ -1543,20 +1594,21 @@ def update_annotation_overlays(app_state: AppState):
             )
 
         # reprojection for selected point
-        if not np.isnan(point_3d).any() and best_individual:
+        if not temp_hide_overlays and not np.isnan(point_3d).any() and best_calib:
             _draw_reprojection(
                 cam_idx, point_3d, selected_annots,
-                best_individual[cam_name],
+                best_calib[cam_name],
                 scale_x, scale_y, layer_tag,
                 show_reprojection_error
             )
 
         # and all annotated points
-        _draw_all_points(
-            cam_idx, all_annotations, all_human_annotated, point_names,
-            p_idx, focus_mode, app_state.num_points, scale_x, scale_y, layer_tag,
-            show_all_labels
-        )
+        if not temp_hide_overlays:
+            _draw_all_points(
+                cam_idx, all_annotations, all_human_annotated, point_names,
+                p_idx, focus_mode, app_state.num_points, scale_x, scale_y, layer_tag,
+                show_all_labels
+            )
 
 
 def _draw_epipolar_lines(

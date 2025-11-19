@@ -270,6 +270,8 @@ class AppState:
         self.drag_state: Dict[str, Any] = {}
         self.show_reprojection_error: bool = True
         self.show_all_labels: bool = False
+        self.show_epipolar_lines: bool = True
+        self.temp_hide_overlays: bool = False
 
         # Feature flags
         self.keypoint_tracking_enabled: bool = False
