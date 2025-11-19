@@ -7,6 +7,7 @@ import cv2
 import multiprocessing
 import numpy as np
 import dearpygui.dearpygui as dpg
+from typing import Dict, Any
 
 import config
 from state import AppState, Queues
@@ -142,16 +143,18 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
 
             if ga_progress.get("status") == "running":
                 new_best_fitness = ga_progress["best_fitness"]
+                current_best_fitness = app_state.calibration_state.best_fitness
 
                 # Check if a better individual was found
-                if new_best_fitness < app_state.best_fitness:
+                if new_best_fitness < current_best_fitness:
                     new_individual = ga_progress["new_best_individual"]
-                    app_state.set_calibration(new_individual)
-                    app_state.best_fitness = new_best_fitness
+                    with app_state.lock:
+                        app_state.calibration_state.set_calibration(new_individual, app_state.camera_names)
+                        app_state.calibration_state.best_fitness = new_best_fitness
 
                 # Update the GUI popup text
                 dpg.set_value("ga_generation_text", f"Generation: {ga_progress['generation']}")
-                dpg.set_value("ga_fitness_text", f"Best Fitness: {app_state.best_fitness:.2f}")
+                dpg.set_value("ga_fitness_text", f"Best Fitness: {app_state.calibration_state.best_fitness:.2f}")
                 dpg.set_value("ga_mean_fitness_text", f"Mean Fitness: {ga_progress['mean_fitness']:.2f}")
 
         except queue.Empty:
@@ -164,11 +167,11 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
 
             if ba_result['status'] == 'success':
                 print("Applying refined calibration from BA.")
-                refined_calib = ba_result['refined_calibration']
+                refined_calib: Dict[str, Dict[str, Any]] = ba_result['refined_calibration']
 
                 with app_state.lock:
                     # Always update the main calibration
-                    app_state.set_calibration(refined_calib)
+                    app_state.set_calibration_state(refined_calib)
 
                     # Conditionally update the 3D points if they were returned
                     refined_3d_points = ba_result.get('refined_3d_points')
@@ -181,7 +184,7 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                         print("BA was run in scaffolding mode; 3D points were not updated.")
 
                     app_state.needs_3d_reconstruction = True
-                    app_state.best_fitness = 0.0
+                    app_state.calibration_state.best_fitness = 0.0
 
             elif ba_result['status'] == 'error':
                 print(f"BA ERROR: {ba_result['message']}")
@@ -202,9 +205,9 @@ def main():
         print(f"Created '{config.DATA_FOLDER}' directory. Please add videos and calibration.")
         sys.exit(0)
 
-    # Load videos and calibration first (with proper matching)
+    # Load videos and calibration first
     print("Loading videos and calibration...")
-    video_paths, video_filenames, camera_names, calibration = load_and_match_videos(
+    video_paths, video_filenames, camera_names, mokap_calibration = load_and_match_videos(
         config.DATA_FOLDER,
         config.VIDEO_FORMAT
     )
@@ -229,6 +232,7 @@ def main():
             cache_reader = VideoCacheReader(cache_dir=str(cache_dir))
             use_cache = True
             print(f"Using video cache: {cache_reader}")
+
         except Exception as e:
             print(f"WARNING: Could not load cache: {e}")
             print("Continuing without cache.")
@@ -262,6 +266,7 @@ def main():
     try:
         bone_stats = bootstrapper.get_initial_stats()
         print(f"Successfully loaded bone stats. Reference bone: {bone_stats['reference_bone']}")
+
     except ValueError as e:
         print(f"\n[ERROR] Could not get bone statistics: {e}")
         print("Please provide a 'bone_stats.json' or a prior file (bone_lengths.csv) in tthe 'data' folder.")
@@ -275,25 +280,10 @@ def main():
             print(f"Created a dummy bone stats file at '{prior_file}'. Please edit it with your measurements.")
         sys.exit(1)
 
-    # Define the 3D volume of interest (same units as the calibration, like mm)
+    # Define 3D volume of interest (same units as the calibration, like mm)
     volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}   # TODO: should be loaded from disk
     scene_centre = np.vstack([b for b in volume_bounds.values()]).mean(axis=1)
     print(f"Using 3D volume bounds: {volume_bounds}")
-
-    # Mokap expects the camera parameters in a certain way
-    mokap_calibration = {}
-    for cam_name, catar_cal in zip(camera_names, calibration):
-        K = np.array([
-            [catar_cal['fx'], 0.0, catar_cal['cx']],
-            [0.0, catar_cal['fy'], catar_cal['cy']],
-            [0.0, 0.0, 1.0]
-        ], dtype=np.float32)
-        mokap_calibration[cam_name] = {
-            'camera_matrix': K,
-            'dist_coeffs': np.array(catar_cal['dist'], dtype=np.float32),
-            'rvec': np.array(catar_cal['rvec'], dtype=np.float32),
-            'tvec': np.array(catar_cal['tvec'], dtype=np.float32)
-        }
 
     # Instantiate the Reconstructor
     print("Initializing 3D Reconstructor...")
@@ -320,7 +310,7 @@ def main():
     app_state = AppState(metadata, config.SKELETON_CONFIG)
     app_state.video_names = video_filenames
     app_state.camera_names = camera_names
-    app_state.set_calibration(calibration)
+    app_state.set_calibration_state(mokap_calibration)
     app_state.load_from_disk(config.DATA_FOLDER)
     app_state.cache_reader = cache_reader
     app_state.scene_centre = scene_centre

@@ -4,12 +4,11 @@ All application state and communication queues are managed here.
 import queue
 import threading
 import multiprocessing
-import tomllib
 import numpy as np
 import pickle
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 from dataclasses import dataclass, field
 
 import config
@@ -17,6 +16,8 @@ from utils import calculate_fundamental_matrices
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from video_cache import VideoCacheReader
+    CameraParameters = Dict[str, Union[float, np.ndarray]]
+    CalibrationDict = Dict[str, CameraParameters]
 
 
 @dataclass
@@ -51,6 +52,28 @@ class Queues:
         self.frames_for_rendering.put({"action": "shutdown"})
         self.ga_command.put({"action": "shutdown"})
         self.ba_command.put({"action": "shutdown"})
+
+
+@dataclass
+class CalibrationState:
+    """Owns all camera calibration and related data."""
+
+    # Calibration frames (frame indices)
+    calibration_frames: List[int] = field(default_factory=list)
+
+    best_individual: Optional['CalibrationDict'] = None
+    best_fitness: float = float('inf')
+    fundamental_matrices: Optional[Dict[Tuple[int, int], np.ndarray]] = None
+
+    def set_calibration(self, individual: 'CalibrationDict', cam_names: List[str]):
+        """Apply camera calibration and update dependent state."""
+
+        self.best_individual = individual
+        self.fundamental_matrices = calculate_fundamental_matrices(individual, cam_names)
+
+        # A newly set calibration has 0 fitness for tracking purposes (= we trust it)
+        self.best_fitness = 0.0
+        print("Successfully applied camera calibration.")
 
 
 class AppState:
@@ -96,8 +119,10 @@ class AppState:
         # Annotation data
         num_frames = video_metadata['num_frames']
         num_videos = video_metadata['num_videos']
+
+        # Enforce (x, y, confidence) storage (shape (F, C, P, 3))
         self.annotations = np.full(
-            (num_frames, num_videos, self.num_points, 2),
+            (num_frames, num_videos, self.num_points, 3),
             np.nan,
             dtype=np.float32
         )
@@ -114,24 +139,17 @@ class AppState:
         # Frame cache for UI zoom
         self.current_video_frames: Optional[List[np.ndarray]] = None
 
-        # Calibration state
-        self.calibration_frames: List[int] = []
-        self.best_individual: Optional[List[Dict[str, Any]]] = None
-        self.best_fitness: float = float('inf')
-        self.fundamental_matrices: Optional[Dict[Tuple[int, int], np.ndarray]] = None
-        self.is_ga_running: bool = False
+        # Camera calibration data lives in this class
+        self.calibration_state = CalibrationState()
 
         self.scene_centre = np.zeros(3)
 
-    def set_calibration(self, individual: List[Dict[str, Any]]):
-        """Apply camera calibration and update dependent state."""
+    def set_calibration_state(self, individual: 'CalibrationDict'):
+        """Helper to call set_calibration on the nested state."""
 
         with self.lock:
-            self.best_individual = individual
-            self.fundamental_matrices = calculate_fundamental_matrices(individual)
-            self.best_fitness = 0.0  # Loaded calibrations have fitness 0
-            self.needs_3d_reconstruction = True
-        print("Successfully applied camera calibration.")
+            self.calibration_state.set_calibration(individual, self.camera_names)
+            self.needs_3d_reconstruction = True # ensure 3D reconstruction is rerun with new calibration
 
     def get_ga_snapshot(self) -> Dict[str, Any]:
         """Create snapshot of state needed by the GA worker."""
@@ -139,10 +157,11 @@ class AppState:
         with self.lock:
             return {
                 "annotations": self.annotations.copy(),
-                "calibration_frames": list(self.calibration_frames),
+                "calibration_frames": list(self.calibration_state.calibration_frames),
                 "video_metadata": self.video_metadata.copy(),
-                "best_fitness": self.best_fitness,
-                "best_individual": self.best_individual,
+                "camera_names": list(self.camera_names),
+                "best_fitness": self.calibration_state.best_fitness,
+                "best_individual": self.calibration_state.best_individual,
                 "generation": 0,
                 "scene_centre": self.scene_centre.copy()
             }
@@ -153,9 +172,10 @@ class AppState:
         with self.lock:
             return {
                 "annotations": self.annotations.copy(),
-                "calibration_frames": list(self.calibration_frames),
+                "calibration_frames": list(self.calibration_state.calibration_frames),
                 "video_metadata": self.video_metadata.copy(),
-                "best_individual": self.best_individual,
+                "camera_names": list(self.camera_names),
+                "best_individual": self.calibration_state.best_individual,
             }
 
     def save_to_disk(self, folder: Path):
@@ -169,11 +189,11 @@ class AppState:
                 np.save(folder / 'reconstructed_3d_points.npy', self.reconstructed_3d_points)
 
                 with open(folder / 'calibration_frames.json', 'w') as f:
-                    json.dump(self.calibration_frames, f)
+                    json.dump(self.calibration_state.calibration_frames, f)
 
-                if self.best_individual is not None:
+                if self.calibration_state.best_individual is not None:
                     with open(folder / 'best_individual.pkl', 'wb') as f:
-                        pickle.dump(self.best_individual, f)
+                        pickle.dump(self.calibration_state.best_individual, f)
 
                 print("State saved successfully.")
             except Exception as e:
@@ -216,40 +236,82 @@ class AppState:
             return
 
         with self.lock:
-            for attr_name, value in loaded_data.items():
-                setattr(self, attr_name, value)
+            # Load simple attributes
+            if 'human_annotated' in loaded_data:
+                self.human_annotated = loaded_data['human_annotated']
+            if 'reconstructed_3d_points' in loaded_data:
+                self.reconstructed_3d_points = loaded_data['reconstructed_3d_points']
+
+            # Load and fix annotations shape if necessary (for legacy saves)
+            if 'annotations' in loaded_data:
+                annots = loaded_data['annotations']
+                if annots.shape[-1] == 2:
+                    # Pad old (x, y) data with a confidence score of 1.0
+                    F, C, P, _ = annots.shape
+                    new_annots = np.full((F, C, P, 3), np.nan, dtype=np.float32)
+                    new_annots[..., :2] = annots
+
+                    # Only fill confidence where x, y are valid
+                    is_valid = ~np.isnan(annots[..., 0])
+                    new_annots[is_valid, 2] = 1.0
+                    self.annotations = new_annots
+                elif annots.shape[-1] == 3:
+                    self.annotations = annots
+                else:
+                    print("  - WARNING: Loaded annotations have unsupported shape.")
+
+            # Load calibration state
+            if 'calibration_frames' in loaded_data:
+                self.calibration_state.calibration_frames = loaded_data['calibration_frames']
+
+            if 'best_individual' in loaded_data:
+                loaded_calib = loaded_data['best_individual']
+
+                # Load legacy CATAR calibration format (List[Dict] with CATAR keys)
+                # TODO: This will be removed
+                if isinstance(loaded_calib, list):
+                    if not self.camera_names:
+                        print(
+                            "  - WARNING: Cannot convert legacy calibration, camera names are not yet defined. Skipping.")
+                        loaded_calib = None
+                    elif len(loaded_calib) == len(self.camera_names):
+                        new_calib_dict: CalibrationDict = {}
+                        for i, cam_name in enumerate(self.camera_names):
+                            old_params = loaded_calib[i]
+
+                            # Create K matrix from fx, fy, cx, cy (legacy keys)
+                            K = np.array([
+                                [old_params['fx'], 0.0, old_params['cx']],
+                                [0.0, old_params['fy'], old_params['cy']],
+                                [0.0, 0.0, 1.0]
+                            ], dtype=np.float32)
+
+                            # Map old keys to mokap keys
+                            new_params = {
+                                'camera_matrix': K,
+                                'dist_coeffs': old_params['dist'],
+                                'rvec': old_params['rvec'],
+                                'tvec': old_params['tvec'],
+                            }
+                            # Ensure all values are numpy arrays
+                            new_calib_dict[cam_name] = {k: np.asarray(v) if isinstance(v, (list, tuple)) else v for k, v
+                                                        in new_params.items()}
+
+                        loaded_calib = new_calib_dict
+                        print("  - Converted legacy calibration format (List[Dict] -> Dict[str, Dict]).")
+                    else:
+                        print(
+                            f"  - WARNING: Loaded calibration list length ({len(loaded_calib)}) mismatch with video count ({len(self.camera_names)}). Skipping calibration load.")
+                        loaded_calib = None
+
+                # loaded_calib is now either the new Dict[str, Dict] (mokap format) or None
+                if loaded_calib is not None:
+                    self.calibration_state.best_individual = loaded_calib
+                    # Recalculate F matrices if camera names are available
+                    if self.camera_names:
+                        self.calibration_state.set_calibration(
+                            self.calibration_state.best_individual,
+                            self.camera_names
+                        )
 
         print("State loading complete.")
-
-    def load_calibration_from_toml(self, file_path: Path):
-        """Load camera calibration from TOML file."""
-
-        print(f"Loading calibration from '{file_path}'")
-        if not file_path.exists():
-            print("  - ERROR: File not found.")
-            return
-
-        try:
-            with file_path.open("rb") as f:
-                calib_data = tomllib.load(f)
-        except Exception as e:
-            print(f"  - ERROR: Could not parse TOML file: {e}")
-            return
-
-        # Assume sorted order matches video order
-        sorted_camera_names = sorted(calib_data.keys())
-
-        individual = []
-        for cam_name in sorted_camera_names:
-            cam = calib_data[cam_name]
-            individual.append({
-                'fx': cam['camera_matrix'][0][0],
-                'fy': cam['camera_matrix'][1][1],
-                'cx': cam['camera_matrix'][0][2],
-                'cy': cam['camera_matrix'][1][2],
-                'dist': np.array(cam['dist_coeffs'], dtype=np.float32),
-                'rvec': np.array(cam['rvec'], dtype=np.float32),
-                'tvec': np.array(cam['tvec'], dtype=np.float32),
-            })
-
-        self.set_calibration(individual)

@@ -744,6 +744,8 @@ def _clear_future_annotations_callback(sender, app_data, user_data):
 
         frame_idx = app_state.frame_idx
         p_idx = app_state.selected_point_idx
+
+        # Clear x, y, and confidence
         app_state.annotations[frame_idx + 1:, :, p_idx] = np.nan
         app_state.human_annotated[frame_idx + 1:, :, p_idx] = False
 
@@ -788,7 +790,7 @@ def _image_mouse_down_callback(sender, app_data, user_data):
     )
 
     # Check if near existing point
-    existing_point = annotations[p_idx]
+    existing_point = annotations[p_idx, :2] # only check x, y
     is_drag_start = False
 
     if not np.isnan(existing_point).any():
@@ -804,32 +806,24 @@ def _image_mouse_down_callback(sender, app_data, user_data):
         if app_data[0] == 0:  # left click
             annotation_pos_for_drag = None
             if is_drag_start:
-                # Use the existing point's position for the drag operation
-                annotation_pos_for_drag = app_state.annotations[frame_idx, cam_idx, p_idx, :2].copy() # :2 to remove confidence (if it's there)
+                # Use existing point's position for the drag operation
+                annotation_pos_for_drag = app_state.annotations[frame_idx, cam_idx, p_idx, :2].copy()
 
             else:
                 # Create a new point
                 snapped_pos = snap_annotation(app_state, cam_idx, p_idx, frame_idx, scaled_pos)
                 final_pos = snapped_pos if snapped_pos is not None else scaled_pos
 
-                # Assign the new annotation
-                if app_state.annotations.shape[3] == 3: # shape (x, y, score)
-                    # If the array stores scores, add a confidence of 1.0 (manual annotation)
-                    app_state.annotations[frame_idx, cam_idx, p_idx] = [*final_pos, 1.0]
-                else: #  shape (x, y)
-                    # Otherwise, just store the (x, y) coordinates
-                    app_state.annotations[frame_idx, cam_idx, p_idx] = final_pos
-
-                    # TODO: The array should always have scores anyway, it's a bit dumb to have it variable sized
+                # Assign the new annotation (x, y, confidence=1.0)
+                app_state.annotations[frame_idx, cam_idx, p_idx] = [*final_pos, 1.0]
 
                 app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
                 app_state.needs_3d_reconstruction = True
                 annotation_pos_for_drag = final_pos
 
-            # Calculate the offset between the mouse and the point to prevent "stickiness"
+            # Offset between the mouse and the point (to prevent 'stickiness')
             drag_offset = scaled_pos - annotation_pos_for_drag
 
-            # Set up the full drag state, including for dynamic slow-down
             app_state.drag_state = {
                 "cam_idx": cam_idx,
                 "p_idx": p_idx,
@@ -845,6 +839,7 @@ def _image_mouse_down_callback(sender, app_data, user_data):
             _image_drag_callback(sender, app_data, user_data)
 
         elif app_data[0] == 1:  # right click = delete
+            # Delete x, y, and confidence
             app_state.annotations[frame_idx, cam_idx, p_idx] = np.nan
             app_state.human_annotated[frame_idx, cam_idx, p_idx] = False
             app_state.needs_3d_reconstruction = True
@@ -868,10 +863,11 @@ def _image_drag_callback(sender, app_data, user_data):
         video_h = app_state.video_metadata['height']
         current_frames = app_state.current_video_frames
         all_annotations = app_state.annotations[frame_idx]
-        best_individual = app_state.best_individual
-        f_mats = app_state.fundamental_matrices
+        best_individual = app_state.calibration_state.best_individual
+        f_mats = app_state.calibration_state.fundamental_matrices
         point_3d_selected = app_state.reconstructed_3d_points[frame_idx, p_idx]
         camera_colors = app_state.camera_colors
+        cam_names = app_state.camera_names
 
     if current_frames is None:
         return
@@ -905,8 +901,8 @@ def _image_drag_callback(sender, app_data, user_data):
             drag_state["is_slowing_down"] = True
             drag_state["slow_down_start_mouse_pos"] = current_scaled_pos.copy()
             with app_state.lock:
-                drag_state["slow_down_start_annotation_pos"] = app_state.annotations[
-                    frame_idx, cam_idx, p_idx, :2].copy() # :2 to only get (x, y) and not the confidence
+                # get (x, y) coordinates
+                drag_state["slow_down_start_annotation_pos"] = app_state.annotations[frame_idx, cam_idx, p_idx, :2].copy()
 
         # Continue slow movement relative to the anchor point
         mouse_delta = current_scaled_pos - drag_state["slow_down_start_mouse_pos"]
@@ -920,17 +916,16 @@ def _image_drag_callback(sender, app_data, user_data):
         # Normal drag: use the initial offset to make movement direct and non-sticky
         final_scaled_pos = current_scaled_pos - drag_state["drag_offset"]
 
-    # Clamp final position to be within video boundaries
+    # Clamp position to be in video boundaries
     final_scaled_pos[0] = np.clip(final_scaled_pos[0], 0, video_w - 1)
     final_scaled_pos[1] = np.clip(final_scaled_pos[1], 0, video_h - 1)
 
     with app_state.lock:
-        if app_state.annotations.shape[3] == 3:
-            app_state.annotations[frame_idx, cam_idx, p_idx] = [*final_scaled_pos, 1.0]
-        else:
-            app_state.annotations[frame_idx, cam_idx, p_idx] = final_scaled_pos
-            app_state.needs_3d_reconstruction = True
-            app_state.drag_state = drag_state  # write updated state back
+        # Update the (x, y) and set confidence to 1.0 (it's a manual annotation)
+        app_state.annotations[frame_idx, cam_idx, p_idx] = [*final_scaled_pos, 1.0]
+        app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
+        app_state.needs_3d_reconstruction = True
+        app_state.drag_state = drag_state  # write updated state back
 
     # Update loupe background texture
     loupe_size = 128
@@ -960,7 +955,7 @@ def _image_drag_callback(sender, app_data, user_data):
     if best_individual and f_mats:
         for from_cam in range(len(current_frames)):
 
-            point_2d = all_annotations[from_cam, p_idx]
+            point_2d = all_annotations[from_cam, p_idx, :2]
             F = f_mats.get((from_cam, cam_idx))
 
             if cam_idx == from_cam or np.isnan(point_2d).any() or F is None:
@@ -977,9 +972,10 @@ def _image_drag_callback(sender, app_data, user_data):
                 color = (*camera_colors[from_cam % len(camera_colors)], 120)    # slightly transparent
                 dpg.draw_line(p1_loupe, p2_loupe, color=color, thickness=1, parent=layer_tag)
 
-    # Draw reprojection for the selected point
+    # Draw reprojection for selected point
     if best_individual and not np.isnan(point_3d_selected).any():
-        reprojected = reproject_points(point_3d_selected, best_individual[cam_idx])
+        cam_name_target = cam_names[cam_idx]
+        reprojected = reproject_points(point_3d_selected, best_individual[cam_name_target])
 
         if reprojected.size > 0:
             reproj_loupe = to_loupe_coords(reprojected[0])
@@ -996,7 +992,7 @@ def _image_drag_callback(sender, app_data, user_data):
     # Draw a small crosshair
     center = loupe_size / 2
     size = 15  # length of the arms from the center
-    gap = 5  # half-size of the empty center gap
+    gap = 5  # half size of the center gap
 
     # Horizontal lines
     dpg.draw_line((center - size, center), (center - gap, center), color=(255, 255, 255), thickness=1,
@@ -1037,13 +1033,14 @@ def _leftclick_release_callback(sender, app_data, user_data):
             cam_idx = app_state.drag_state["cam_idx"]
             p_idx = app_state.drag_state["p_idx"]
 
+            # Note: the annotation (x, y, confidence) was updated in _image_drag_callback
             app_state.human_annotated[frame_idx, cam_idx, p_idx] = True
             app_state.needs_3d_reconstruction = True
             app_state.drag_state = {}
 
-            dpg.hide_item("loupe_window")  # Hide the loupe
+            dpg.hide_item("loupe_window")
 
-        # Check if a seeking operation was active and finalize it
+        # Check if a seeking operation was active and finish it
         if app_state.is_seeking:
             app_state.is_seeking = False
 
@@ -1163,14 +1160,17 @@ def _toggle_calib_frame_callback(sender, app_data, user_data):
     """Add or remove the current frame from the calibration set."""
 
     app_state = user_data["app_state"]
+
     with app_state.lock:
         frame_idx = app_state.frame_idx
-        if frame_idx in app_state.calibration_frames:
-            app_state.calibration_frames.remove(frame_idx)
+
+        if frame_idx in app_state.calibration_state.calibration_frames:
+            app_state.calibration_state.calibration_frames.remove(frame_idx)
             print(f"Frame {frame_idx} removed from calibration set.")
+
         else:
-            app_state.calibration_frames.append(frame_idx)
-            app_state.calibration_frames.sort()  # Keep the list sorted
+            app_state.calibration_state.calibration_frames.append(frame_idx)
+            app_state.calibration_state.calibration_frames.sort()  # why not keep the list sorted
             print(f"Frame {frame_idx} added to calibration set.")
 
 
@@ -1178,8 +1178,9 @@ def _clear_calib_frames_callback(sender, app_data, user_data):
     """Clears the entire calibration set."""
 
     app_state = user_data["app_state"]
+
     with app_state.lock:
-        app_state.calibration_frames.clear()
+        app_state.calibration_state.calibration_frames.clear()
     print("Calibration frame set has been cleared.")
 
 
@@ -1187,10 +1188,10 @@ def _navigate_calib_frame_callback(sender, app_data, user_data):
     """Jump to the next or previous frame in the calibration set."""
 
     app_state = user_data["app_state"]
-    direction = user_data["direction"]  # +1 for next, -1 for previous
+    direction = user_data["direction"]  # +1 for next or -1 for previous
 
     with app_state.lock:
-        calib_frames = sorted(app_state.calibration_frames)
+        calib_frames = sorted(app_state.calibration_state.calibration_frames)
         if not calib_frames:
             print("No calibration frames to navigate.")
             return
@@ -1219,7 +1220,7 @@ def _start_ga_callback(sender, app_data, user_data):
     queues = user_data["queues"]
 
     with app_state.lock:
-        app_state.best_fitness = float('inf')   # this needs to not be 0.0 on start
+        app_state.calibration_state.best_fitness = float('inf')   # this needs to not be 0.0 on start
         app_state.is_ga_running = True
         ga_snapshot = app_state.get_ga_snapshot()
 
@@ -1304,10 +1305,11 @@ def _clear_calibration_callback(sender, app_data, user_data):
     """Clears the current calibration from the app state."""
 
     app_state = user_data["app_state"]
+
     with app_state.lock:
-        app_state.best_individual = None
-        app_state.best_fitness = float('inf')
-        app_state.fundamental_matrices = None  # also clear dependent properties
+        app_state.calibration_state.best_individual = None
+        app_state.calibration_state.best_fitness = float('inf')
+        app_state.calibration_state.fundamental_matrices = None  # also clear dependent properties
 
 
 # ============================================================================
@@ -1397,8 +1399,11 @@ def _update_control_panel(app_state: AppState):
     """Update control panel texts."""
 
     with app_state.lock:
+        calib_state = app_state.calibration_state
+
         dpg.set_value("frame_slider", app_state.frame_idx)
         dpg.set_value("current_frame_line", float(app_state.frame_idx))
+
         dpg.configure_item(
             "play_pause_button",
             label="Play" if app_state.paused else "Pause"
@@ -1409,22 +1414,23 @@ def _update_control_panel(app_state: AppState):
         dpg.set_value("focus_text", f"Focus Mode: {focus_status}")
 
         # Update calibration button text
-        if app_state.frame_idx in app_state.calibration_frames:
+        if app_state.frame_idx in calib_state.calibration_frames:
             dpg.configure_item("toggle_calib_frame_button", label="Remove (C)")
         else:
             dpg.configure_item("toggle_calib_frame_button", label="Add (C)")
 
         dpg.set_value(
             "num_calib_frames_text",
-            f"Calibration Frames: {len(app_state.calibration_frames)}"
+            f"Calibration Frames: {len(calib_state.calibration_frames)}"
         )
-        dpg.set_value("fitness_text", f"Best Fitness: {app_state.best_fitness:.2f}")
+        dpg.set_value("fitness_text", f"Best Fitness: {calib_state.best_fitness:.2f}")
 
 
 def update_annotation_overlays(app_state: AppState):
     """Draw annotation overlays."""
 
     with app_state.lock:
+
         frame_idx = app_state.frame_idx
         num_videos = app_state.video_metadata['num_videos']
         video_w = app_state.video_metadata['width']
@@ -1432,23 +1438,23 @@ def update_annotation_overlays(app_state: AppState):
         focus_mode = app_state.focus_selected_point
         show_all_labels = app_state.show_all_labels
         show_reprojection_error = app_state.show_reprojection_error
+        calib_state = app_state.calibration_state
 
-    # Get data for all points
-    all_annotations = app_state.annotations[frame_idx]
-    all_human_annotated = app_state.human_annotated[frame_idx]
-    point_names = app_state.point_names
-    point_colors = app_state.point_colors
-    camera_colors = app_state.camera_colors
-    camera_names = app_state.camera_names
+        all_annotations = app_state.annotations[frame_idx]
+        all_human_annotated = app_state.human_annotated[frame_idx]
+        point_names = app_state.point_names
+        camera_colors = app_state.camera_colors
+        camera_names = app_state.camera_names
 
     # Selected point data for special overlays
     p_idx = app_state.selected_point_idx
-    best_individual = app_state.best_individual
-    f_mats = app_state.fundamental_matrices
+    best_individual = calib_state.best_individual
+    f_mats = calib_state.fundamental_matrices
     selected_annots = app_state.annotations[frame_idx, :, p_idx]
     point_3d = app_state.reconstructed_3d_points[frame_idx, p_idx]
 
     for cam_idx in range(num_videos):
+
         layer_tag = f"annotation_layer_{cam_idx}"
         drawlist_tag = f"drawlist_{cam_idx}"
         dpg.delete_item(layer_tag, children_only=True)
@@ -1459,6 +1465,7 @@ def update_annotation_overlays(app_state: AppState):
 
         scale_x = widget_size[0] / video_w
         scale_y = widget_size[1] / video_h
+        cam_name = camera_names[cam_idx]
 
         # epipolar lines for selected point
         if best_individual and f_mats:
@@ -1472,8 +1479,8 @@ def update_annotation_overlays(app_state: AppState):
         if not np.isnan(point_3d).any() and best_individual:
             _draw_reprojection(
                 cam_idx, point_3d, selected_annots,
-                best_individual[cam_idx], p_idx,
-                point_colors, scale_x, scale_y, layer_tag,
+                best_individual[cam_name],
+                scale_x, scale_y, layer_tag,
                 show_reprojection_error
             )
 
@@ -1496,7 +1503,8 @@ def _draw_epipolar_lines(
         if cam_idx == from_cam:
             continue
 
-        point_2d = selected_annots[from_cam]
+        # Get only x, y
+        point_2d = selected_annots[from_cam, :2]
         if np.isnan(point_2d).any():
             continue
 
@@ -1546,8 +1554,7 @@ def _draw_epipolar_lines(
 
 def _draw_reprojection(
         cam_idx, point_3d, selected_annots,
-        cam_params, p_idx, point_colors,
-        scale_x, scale_y, layer_tag,
+        cam_params, scale_x, scale_y, layer_tag,
         show_reprojection_error
 ):
     """Draws reproj and error line for reconstructed point."""
@@ -1577,7 +1584,8 @@ def _draw_reprojection(
     )
 
     # Error line and distance label (if annotation exists and is enabled)
-    if show_reprojection_error and not np.isnan(selected_annots[cam_idx]).any():
+    # Check only x, y for existence
+    if show_reprojection_error and not np.isnan(selected_annots[cam_idx, :2]).any():
         annot_scaled = (
             selected_annots[cam_idx, 0] * scale_x,
             selected_annots[cam_idx, 1] * scale_y
@@ -1625,7 +1633,8 @@ def _draw_all_points(
         if focus_mode and i != selected_point_idx:
             continue
 
-        point_2d = annotations[cam_idx, i]
+        # Get only x, y
+        point_2d = annotations[cam_idx, i, :2]
         if np.isnan(point_2d).any():
             continue
 
@@ -1663,15 +1672,19 @@ def update_histogram(app_state: AppState):
         selected_idx = app_state.selected_point_idx
         point_name = app_state.point_names[selected_idx]
         annotations = app_state.annotations.copy()
+        num_cams = app_state.video_metadata['num_videos']
+
+    # Annotation array is (F, C, P, 3), check for nans in x or y
+    is_valid_annotation = np.all(~np.isnan(annotations[..., :2]), axis=-1)
 
     if focus_mode:
-        # Count only selected point
-        counts = np.sum(~np.isnan(annotations[:, :, selected_idx, 0]), axis=1)
+        # Count only selected point (shape F, C)
+        counts = np.sum(is_valid_annotation[:, :, selected_idx], axis=1)
         dpg.configure_item("histogram_y_axis", label=f"'{point_name}' Annots")
-        dpg.set_axis_limits("histogram_y_axis", 0, app_state.video_metadata['num_videos'])
+        dpg.set_axis_limits("histogram_y_axis", 0, num_cams)
     else:
-        # all points
-        counts = np.sum(~np.isnan(annotations[:, :, :, 0]), axis=(1, 2))
+        # all points (shape F)
+        counts = np.sum(is_valid_annotation, axis=(1, 2))
         dpg.configure_item("histogram_y_axis", label="Total Annots")
         if counts.max() > 0:
             dpg.set_axis_limits_auto("histogram_y_axis")
@@ -1680,3 +1693,4 @@ def update_histogram(app_state: AppState):
         "annotation_histogram_series",
         [list(range(len(counts))), counts.tolist()]
     )
+

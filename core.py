@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from mokap.reconstruction.reconstruction import Reconstructor
     from mokap.reconstruction.tracking import MultiObjectTracker
+    from state import AppState
 
 
 # ============================================================================
@@ -37,16 +38,15 @@ def snap_annotation(
 ) -> Optional[np.ndarray]:
     """
     Snaps a new user click to a (maybe) more accurate position based
-    on the consensus of other existing annotations for the same point, weighted
-    by their confidence scores.
+    on the consensus of other existing annotations (weighted by confidence).
     """
 
     with app_state.lock:
         # all annotations for the specific point in the specific frame
         annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
-        best_individual = app_state.best_individual
+        calibration = app_state.calibration_state.best_individual
 
-    if best_individual is None:
+    if calibration is None:
         return None
 
     # Which cameras have a valid annotation for this point (excluding target camera)
@@ -55,9 +55,17 @@ def snap_annotation(
     valid_annotations_2d = []
     valid_scores = []
 
+    cam_names = list(calibration.keys())
+
+
+    # TODO: This loop is stupid, it can just be array manipulation
+
     for i in range(num_cams):
+
         if i == target_cam_idx:
             continue
+
+        # Check if x, y, and score are all valid
         if not np.isnan(annotations_for_point[i]).any():
             valid_cam_indices.append(i)
 
@@ -65,10 +73,7 @@ def snap_annotation(
             valid_annotations_2d.append(annotations_for_point[i, :2])
 
             # Also grab the confidence score for weighting
-            if annotations_for_point.shape[1] == 3:
-                valid_scores.append(annotations_for_point[i, 2])
-            else:
-                valid_scores.append(1.0) # Default to 1.0 if no score exists
+            valid_scores.append(annotations_for_point[i, 2])
 
     # We need at least 2 other views to triangulate
     if len(valid_cam_indices) < 2:
@@ -76,7 +81,8 @@ def snap_annotation(
 
     valid_annotations_2d = np.array(valid_annotations_2d)
 
-    proj_matrices = np.array([get_projection_matrix(best_individual[i]) for i in valid_cam_indices])
+    # Get calibration parameters for valid cameras
+    proj_matrices = np.array([get_projection_matrix(calibration[cam_names[i]]) for i in valid_cam_indices])
 
     # triangulate_points expects shape (num_cams, num_points, 2)
     # Only one point here so reshape
@@ -99,7 +105,7 @@ def snap_annotation(
     point_3d = point_3d_single.flatten()
 
     # Reproject the 3D point back onto the target camera's view
-    target_cam_params = best_individual[target_cam_idx]
+    target_cam_params = calibration[cam_names[target_cam_idx]]
     reprojected_point_2d = reproject_points(point_3d, target_cam_params)
 
     if reprojected_point_2d.size == 0:
@@ -132,37 +138,43 @@ def update_annotations_from_3d(
     print(f"[Frame {frame_idx}] Feedback Loop: Correcting 2D annotations based on the final 3D pose.")
 
     with app_state.lock:
-        if app_state.best_individual is None:
-            return
-
-        calibration = app_state.best_individual
+        calibration = app_state.calibration_state.best_individual
         point_names = app_state.point_names
-        num_cams = len(calibration)
+        num_cams = len(app_state.camera_names)
+        cam_names = app_state.camera_names
 
-        points_to_reproject_3d = []
-        point_indices_in_app_state = []
-        for p_name, pos_3d in final_3d_skeleton_kps.items():
-            if p_name in point_names:
-                points_to_reproject_3d.append(pos_3d)
-                point_indices_in_app_state.append(point_names.index(p_name))
+    if calibration is None:
+        return
 
-        if not points_to_reproject_3d:
-            return
+    points_to_reproject_3d = []
+    point_indices_in_app_state = []
+    for p_name, pos_3d in final_3d_skeleton_kps.items():
+        if p_name in point_names:
+            points_to_reproject_3d.append(pos_3d)
+            point_indices_in_app_state.append(point_names.index(p_name))
 
-        points_to_reproject_3d = np.array(points_to_reproject_3d)
+    if not points_to_reproject_3d:
+        return
 
-        for cam_idx in range(num_cams):
-            # Reproject all points for this camera
-            reprojected_points_2d = reproject_points(points_to_reproject_3d, calibration[cam_idx])
+    points_to_reproject_3d = np.array(points_to_reproject_3d)
 
-            if reprojected_points_2d.size == 0:
-                continue
+    # TODO: Use batched function, no need to loop
+    for cam_idx in range(num_cams):
+        cam_name = cam_names[cam_idx]
+        # Reproject all points for this camera
+        reprojected_points_2d = reproject_points(points_to_reproject_3d, calibration[cam_name])
 
-            # Update the annotations array
-            for i, p_idx in enumerate(point_indices_in_app_state):
+        if reprojected_points_2d.size == 0:
+            continue
+
+        # Update the annotations array
+        for i, p_idx in enumerate(point_indices_in_app_state):
+            with app_state.lock:
                 # only update if the point was not manually annotated
                 if not app_state.human_annotated[frame_idx, cam_idx, p_idx]:
-                    app_state.annotations[frame_idx, cam_idx, p_idx] = reprojected_points_2d[i]
+
+                    # TODO: Urgent: confidence for reprojections SHOULD NOT BE 1.0 here
+                    app_state.annotations[frame_idx, cam_idx, p_idx] = [*reprojected_points_2d[i], 1.0]
                     app_state.human_annotated[frame_idx, cam_idx, p_idx] = False
 
 
@@ -177,6 +189,7 @@ def process_frame(
     """
     Runs one full cycle: LK prediction -> mokap correction -> feedback
     """
+
     with app_state.lock:
         camera_names = app_state.camera_names
         point_names = app_state.point_names
@@ -186,10 +199,11 @@ def process_frame(
         app_state, prev_frames, current_frames, frame_idx
     )
     num_lk_points = np.sum(~np.isnan(annotations_from_lk[..., 0]))
-    print(f"\n--- [Frame {frame_idx}] ---")
+    print(f"\n[Frame {frame_idx}]")
     print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
 
     # Run Mokap reconstruction using the LK results and their confidence score
+    # annotations_from_lk is (C, P, 3) where 3 is (x, y, confidence)
     df_frame = annotations_to_polars(annotations_from_lk, frame_idx, camera_names, point_names)
     points_soup = reconstructor.reconstruct_frame(df_frame=df_frame, keypoint_names=point_names)
     print(f"MOKAP RECON:   Input {len(df_frame)} 2D points -> Produced a soup of {len(points_soup)} 3D candidates.")
@@ -208,20 +222,15 @@ def process_frame(
 
     # feedback loop
     with app_state.lock:
-        if app_state.annotations.shape[3] != 3:
-            old_annotations = app_state.annotations
-            app_state.annotations = np.full(
-                (old_annotations.shape[0], old_annotations.shape[1], old_annotations.shape[2], 3), np.nan,
-                dtype=np.float32)
-
-            app_state.annotations[..., :2] = old_annotations
-            app_state.annotations[..., 2] = 1.0  # default confidence for old data
+        calibration = app_state.calibration_state.best_individual
+        cam_names = app_state.camera_names
+        num_cams = len(cam_names)
 
         # Create base annotation set from the model, rescuing failed multi-view tracks
-        annotations_from_model = np.full_like(app_state.annotations[frame_idx], np.nan)
+        # This will be (C, P, 3)
+        annotations_from_model = np.full_like(annotations_from_lk, np.nan)
         if final_3d_skeleton_kps:
-            calibration = app_state.best_individual
-            num_cams = len(calibration)
+
             points_to_reproject_3d, p_indices = [], []
 
             for p_name, pos_3d in final_3d_skeleton_kps.items():
@@ -230,15 +239,20 @@ def process_frame(
                     p_indices.append(point_names.index(p_name))
 
             points_to_reproject_3d = np.array(points_to_reproject_3d)
-            if points_to_reproject_3d.size > 0:
+            if points_to_reproject_3d.size > 0 and calibration is not None:
                 for cam_idx in range(num_cams):
-                    reprojected_2d = reproject_points(points_to_reproject_3d, calibration[cam_idx])
+                    cam_params = calibration[cam_names[cam_idx]]
+                    reprojected_2d = reproject_points(points_to_reproject_3d, cam_params)
                     if reprojected_2d.size > 0:
                         for i, p_idx in enumerate(p_indices):
                             # Rescued points get a fixed (medium high) confidence score
                             annotations_from_model[cam_idx, p_idx] = [*reprojected_2d[i], 0.75]
 
         # Start with the model-based rescue for failed tracks
+
+        # If LK failed (nan) but model has a projection (not nan), use model
+        # Otherwise use LK
+
         final_annotations = np.where(
             ~np.isnan(annotations_from_lk[..., 0, np.newaxis]),
             annotations_from_lk,
@@ -246,14 +260,15 @@ def process_frame(
         )
 
         # Re-inject single-view tracks
+
         # Find points that were successfully tracked by LK but only in a single view
         # (these were lost by the 3D reconstructor but are still useful)
+
         is_valid_lk_track = ~np.isnan(annotations_from_lk[..., 0])
         num_views_per_point = np.sum(is_valid_lk_track, axis=0)
 
         for p_idx in range(app_state.num_points):
             if num_views_per_point[p_idx] == 1:
-
                 cam_idx = np.where(is_valid_lk_track[:, p_idx])[0][0]
 
                 # Ensure this point is preserved in the final annotation set for next frame
@@ -283,22 +298,27 @@ def track_points(
         frame_idx: int
 ) -> np.ndarray:
     """
-    Tracks points and returns new 2D annotations.
-    (onfidence score based on (sort of) RANSAC-like multi-view consistency)
+    Tracks points and returns new 2D annotations (x, y, confidence)
+    (Confidence score based on (sort of) RANSAC-like multi-view consistency)
     """
+
     with app_state.lock:
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
-        annotations_prev = app_state.annotations[frame_idx - 1][..., :2].copy()
-        calibration = app_state.best_individual
 
+        # Only take x, y from previous frame annotations for LK input
+        annotations_prev = app_state.annotations[frame_idx - 1][..., :2].copy()
+        calibration = app_state.calibration_state.best_individual
+        cam_names = app_state.camera_names
+
+    # Output array is (C, P, 3) where 3 is (x, y, confidence)
     output_annotations = np.full((annotations_prev.shape[0], annotations_prev.shape[1], 3), np.nan, dtype=np.float32)
 
     if calibration is None:
         return output_annotations
 
     num_videos = len(current_frames)
-    proj_matrices = [get_projection_matrix(cam) for cam in calibration]
+    proj_matrices = {name: get_projection_matrix(calibration[name]) for name in cam_names}
     raw_lk_coords = np.full_like(annotations_prev, np.nan)
 
     # Run LK Optic flow
@@ -348,13 +368,21 @@ def track_points(
 
             peer_cam_indices = [i for i, p in enumerate(raw_lk_coords[:, p_idx]) if i != cam_idx_to_check and not np.isnan(p).any()]
             if len(peer_cam_indices) < 2:
+                # TODO: uhhh actually I am not sure about this one
                 confidence = 1.0 if len(peer_cam_indices) < 2 else 0.0
             else:
                 min_drift_error = float('inf')
+                
+                cam_name_to_check = cam_names[cam_idx_to_check]
+
                 for peer_pair_indices in combinations(peer_cam_indices, 2):
                     idx1, idx2 = peer_pair_indices
+                    
+                    cam_name1, cam_name2 = cam_names[idx1], cam_names[idx2]
+                    
                     annots_pair = np.array([raw_lk_coords[idx1, p_idx], raw_lk_coords[idx2, p_idx]])
-                    proj_mats_pair = [proj_matrices[idx1], proj_matrices[idx2]]
+                    
+                    proj_mats_pair = [proj_matrices[cam_name1], proj_matrices[cam_name2]]
 
                     # Triangulate a hypothesis from this pair
                     point_3d_hypothesis = projective.triangulate_points_from_projections(
@@ -367,7 +395,7 @@ def track_points(
                         continue
 
                     # Reproject hypothesis back to the camera we are checking
-                    reprojected = reproject_points(point_3d_hypothesis, calibration[cam_idx_to_check])
+                    reprojected = reproject_points(point_3d_hypothesis, calibration[cam_name_to_check])
                     if reprojected.size == 0:
                         continue
 
@@ -380,6 +408,9 @@ def track_points(
                 # at least one valid consensus is found: use it to calculate confidence
                 if min_drift_error != float('inf'):
                     confidence = max(0.0, 1.0 - (min_drift_error / config.LK_CONFIDENCE_MAX_ERROR))
+                else:
+                    # triangulation failed for all pairs so default to low confidence
+                    confidence = 0.1 
 
             output_annotations[cam_idx_to_check, p_idx] = [*point_to_check, confidence]
 
@@ -450,17 +481,16 @@ def create_camera_visual(
 # ============================================================================
 
 
-def create_individual(video_metadata: Dict, scene_centre: np.ndarray) -> List[Dict]:
-    """Create a random camera calibration individual (camera-to-world convention)."""
+def create_individual(video_metadata: Dict, cam_names: List[str], scene_centre: np.ndarray) -> Dict[str, Dict]:
+    """Create a random camera calibration individual."""
 
     w, h = video_metadata['width'], video_metadata['height']
     num_cameras = video_metadata['num_videos']
 
     radius = np.linalg.norm(scene_centre) if np.linalg.norm(scene_centre) > 1 else 100.0
-    # TODO: A better approach would be to estimate this from initial annotations
 
-    individual = []
-    for i in range(num_cameras):
+    individual: Dict[str, Dict] = {}
+    for i, cam_name in enumerate(cam_names):
         # Position cameras in a circle around the scene centre
         angle = (2 * np.pi / num_cameras) * i
 
@@ -478,20 +508,35 @@ def create_individual(video_metadata: Dict, scene_centre: np.ndarray) -> List[Di
         tvec_c2w = cam_pos_world
         rvec_c2w = transforms.inverse_rodrigues(R_c2w)
 
-        individual.append({
-            'fx': random.uniform(w * 0.8, w * 1.5), 'fy': random.uniform(h * 0.8, h * 1.5),
-            'cx': w / 2 + random.uniform(-w * 0.05, w * 0.05), 'cy': h / 2 + random.uniform(-h * 0.05, h * 0.05),
-            'dist': np.random.normal(0.0, 0.001, size=config.NUM_DIST_COEFFS),
-            'rvec': rvec_c2w.flatten(), 'tvec': tvec_c2w.flatten()
-        })
+        # Randomize K components
+        # TODO: These factors are a bit large...
+        fx = random.uniform(w * 0.8, w * 1.5)
+        fy = random.uniform(h * 0.8, h * 1.5)
+        cx = w / 2 + random.uniform(-w * 0.05, w * 0.05)
+        cy = h / 2 + random.uniform(-h * 0.05, h * 0.05)
+
+        K = np.array([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+
+        individual[cam_name] = {
+            'camera_matrix': K,
+            'dist_coeffs': np.random.normal(0.0, 0.001, size=config.NUM_DIST_COEFFS),
+            'rvec': rvec_c2w.flatten(),
+            'tvec': tvec_c2w.flatten()
+        }
 
     return individual
 
+
 def compute_fitness(
-    individual: List[Dict],
+    individual: Dict[str, Dict],
     annotations: np.ndarray,
     calibration_frames: List[int],
-    video_metadata: Dict
+    video_metadata: Dict,
+    cam_names: List[str]
 ) -> float:
     """Compute reprojection error fitness for a calibration."""
 
@@ -501,21 +546,22 @@ def compute_fitness(
     # Filter to calibration frames with valid data
     calib_mask = np.zeros(annotations.shape[0], dtype=bool)
     calib_mask[calibration_frames] = True
-    valid_mask = np.any(~np.isnan(annotations), axis=(1, 2, 3))
+    valid_mask = np.any(~np.isnan(annotations[..., 0]), axis=(1, 2))
     combined_mask = calib_mask & valid_mask
 
     if not np.any(combined_mask):
         return float('inf')
 
-    valid_annots = annotations[combined_mask]
+    # Get annotations (x, y) for valid frames
+    valid_annots = annotations[combined_mask][..., :2]
     num_cams = video_metadata['num_videos']
 
     # Compute projection matrices
-    proj_matrices = np.array([get_projection_matrix(cam) for cam in individual])
+    proj_matrices = np.array([get_projection_matrix(individual[name]) for name in cam_names])
 
     undistorted_annots = np.full_like(valid_annots, np.nan)
     for c in range(num_cams):
-        undistorted_annots[:, c] = undistort_points(valid_annots[:, c], individual[c])
+        undistorted_annots[:, c] = undistort_points(valid_annots[:, c], individual[cam_names[c]])
 
     # Triangulate for each frame
     points_3d = np.array([
@@ -531,6 +577,7 @@ def compute_fitness(
     total_points = 0
 
     for c in range(num_cams):
+        cam_name = cam_names[c]
         valid_3d = ~np.isnan(points_3d).any(axis=-1)
         valid_2d = ~np.isnan(valid_annots[:, c]).any(axis=-1)
         valid = valid_3d & valid_2d
@@ -538,7 +585,7 @@ def compute_fitness(
         if not np.any(valid):
             continue
 
-        reprojected = reproject_points(points_3d[valid], individual[c])
+        reprojected = reproject_points(points_3d[valid], individual[cam_name])
         errors = np.linalg.norm(reprojected - valid_annots[:, c][valid], axis=1)
 
         total_error += np.sum(errors)
@@ -556,30 +603,42 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
     generation = ga_state.get("generation", 0)
     scene_centre = ga_state.get("scene_centre", np.zeros(3))
     stagnation_counter = ga_state.get("stagnation_counter", 0)
+    cam_names = ga_state["camera_names"]
 
     if population is None:
         if best_individual:
+            # Seed initial population from best individual
             population = [best_individual]
             for _ in range(config.GA_POPULATION_SIZE - 1):
-                mutated_ind = []
-                for cam_params in best_individual:
+                mutated_ind = {}
+
+                for cam_name, cam_params in best_individual.items():
+                    # TODO: Are these copies really necessary?
                     mutated_cam = cam_params.copy()
-                    for key in ['fx', 'fy', 'cx', 'cy']:
-                        mutated_cam[key] += np.random.normal(0,
-                                                             config.GA_MUTATION_STRENGTH_INIT * abs(mutated_cam[key]))
-                    for key in ['tvec', 'dist']:
+
+                    # Mutate K matrix elements (fx, fy, cx, cy)
+                    K = cam_params['camera_matrix'].copy()
+                    K[0, 0] += np.random.normal(0, config.GA_MUTATION_STRENGTH_INIT * abs(K[0, 0]))  # fx
+                    K[1, 1] += np.random.normal(0, config.GA_MUTATION_STRENGTH_INIT * abs(K[1, 1]))  # fy
+                    K[0, 2] += np.random.normal(0, config.GA_MUTATION_STRENGTH_INIT * abs(K[0, 2]))  # cx
+                    K[1, 2] += np.random.normal(0, config.GA_MUTATION_STRENGTH_INIT * abs(K[1, 2]))  # cy
+                    mutated_cam['camera_matrix'] = K
+
+                    # Mutate other parameters
+                    for key in ['tvec', 'dist_coeffs']:
                         mutated_cam[key] = np.asarray(mutated_cam[key]) + np.random.normal(0,
                                                                                            config.GA_MUTATION_STRENGTH_INIT,
                                                                                            size=mutated_cam[key].shape)
-                    # TODO: This needs to be done more cleanly
-                    mutated_cam['rvec'] = np.asarray(mutated_cam['rvec']) + np.random.normal(0,
-                                                                                       config.GA_MUTATION_STRENGTH_INIT * 0.001, # Massively reduce mutation on rvec because radians
-                                                                                       size=mutated_cam['rvec'].shape)
 
-                    mutated_ind.append(mutated_cam)
+                    mutated_cam['rvec'] = np.asarray(mutated_cam['rvec']) + np.random.normal(0,
+                                                                                             config.GA_MUTATION_STRENGTH_INIT * 0.001,
+                                                                                             # Massively reduce mutation on rvec because radians
+                                                                                             size=mutated_cam['rvec'].shape)
+                    mutated_ind[cam_name] = mutated_cam
                 population.append(mutated_ind)
         else:
-            population = [create_individual(ga_state['video_metadata'], scene_centre) for _ in range(config.GA_POPULATION_SIZE)]
+            population = [create_individual(ga_state['video_metadata'], cam_names, scene_centre) for _ in
+                          range(config.GA_POPULATION_SIZE)]
 
     # Evaluate fitness
     fitness_scores = np.array([
@@ -587,72 +646,82 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
             ind,
             ga_state['annotations'],
             ga_state['calibration_frames'],
-            ga_state['video_metadata']
+            ga_state['video_metadata'],
+            cam_names
         )
         for ind in population
     ])
-
     sorted_indices = np.argsort(fitness_scores)
 
-    # Update best individual
     if fitness_scores[sorted_indices[0]] < best_fitness:
         best_fitness = fitness_scores[sorted_indices[0]]
         best_individual = population[sorted_indices[0]]
-        stagnation_counter = 0  # Reset on improvement
+        stagnation_counter = 0
     else:
-        stagnation_counter += 1  # Increment if no improvement
+        stagnation_counter += 1
 
-    # Adaptive mutation strength
     current_mutation_strength = config.GA_MUTATION_STRENGTH
-    if stagnation_counter > 20:  # After 20 generations with no improvement
+    if stagnation_counter > 20:
         print("GA is stagnating, temporarily increasing mutation strength.")
-        current_mutation_strength *= 2.5  # Kick the simulation
+        current_mutation_strength *= 2.5
 
     # Create next generation
     num_elites = int(config.GA_POPULATION_SIZE * config.GA_ELITISM_RATE)
     next_population = [population[i] for i in sorted_indices[:num_elites]]
 
     while len(next_population) < config.GA_POPULATION_SIZE:
+
         # Tournament selection
+        # TODO: This is a bit simple, could be improved
+
         p1_idx, p2_idx = np.random.choice(len(population), 2, replace=False)
         parent1 = population[p1_idx] if fitness_scores[p1_idx] < fitness_scores[p2_idx] else population[p2_idx]
         p3_idx, p4_idx = np.random.choice(len(population), 2, replace=False)
         parent2 = population[p3_idx] if fitness_scores[p3_idx] < fitness_scores[p4_idx] else population[p4_idx]
 
-        child = []
-        for i in range(len(parent1)):
+        child = {}
+        for cam_name in cam_names:
+            p1_cam = parent1[cam_name]
+            p2_cam = parent2[cam_name]
+
             child_cam = {}
 
-            p1_rvec = jnp.asarray(parent1[i]['rvec'])
-            p2_rvec = jnp.asarray(parent2[i]['rvec'])
-
-            q_batch = transforms.axisangle_to_quaternion_batched(jnp.stack([p1_rvec, p2_rvec]))
+            # rvec averaging (quaternion)
+            q_batch = transforms.axisangle_to_quaternion_batched(jnp.stack([p1_cam['rvec'], p2_cam['rvec']]))
             q_avg = quaternion_average(q_batch)
 
             rvec_avg = transforms.quaternion_to_axisangle(q_avg)
             child_cam['rvec'] = np.asarray(rvec_avg)
 
-            # Average other parameters linearly
-            for key in parent1[i]:
+            # Linear Averaging for other parameters
+            for key in p1_cam:
                 if key != 'rvec':
-                    p1_val = np.asarray(parent1[i][key])
-                    p2_val = np.asarray(parent2[i][key])
+                    p1_val = np.asarray(p1_cam[key])
+                    p2_val = np.asarray(p2_cam[key])
                     child_cam[key] = (p1_val + p2_val) / 2.0
 
             # Mutation
             if np.random.rand() < config.GA_MUTATION_RATE:
-                for key in ['fx', 'fy', 'cx', 'cy']:
-                    child_cam[key] = child_cam[key] + np.random.normal(0, current_mutation_strength * abs(
-                        child_cam[key]))
-                for key in ['tvec', 'dist']:
+
+                # Mutate K elements
+                K_mut = child_cam['camera_matrix'].copy()
+                K_mut[0, 0] += np.random.normal(0, current_mutation_strength * abs(K_mut[0, 0]))
+                K_mut[1, 1] += np.random.normal(0, current_mutation_strength * abs(K_mut[1, 1]))
+                K_mut[0, 2] += np.random.normal(0, current_mutation_strength * abs(K_mut[0, 2]))
+                K_mut[1, 2] += np.random.normal(0, current_mutation_strength * abs(K_mut[1, 2]))
+                child_cam['camera_matrix'] = K_mut
+
+                # Mutate tvec and dist_coeffs
+                for key in ['tvec', 'dist_coeffs']:
                     child_cam[key] = child_cam[key] + np.random.normal(0, current_mutation_strength,
                                                                        size=child_cam[key].shape)
-                # TODO: This needs to be done more cleanly
+
+                # Mutate rvec
                 child_cam['rvec'] = child_cam['rvec'] + np.random.normal(0,
-                                                                         current_mutation_strength * 0.001,  # Massively reduce mutation on rvec because radians
+                                                                         current_mutation_strength * 0.001, # Massively reduce mutation on rvec because radians
                                                                          size=child_cam['rvec'].shape)
 
-            child.append(child_cam)
+            child[cam_name] = child_cam
         next_population.append(child)
 
     mean_fitness = np.nanmean(fitness_scores)
@@ -676,12 +745,15 @@ def _prepare_ba_data(snapshot: Dict[str, Any], is_independent: bool) -> Dict[str
     """
 
     all_annots = snapshot["annotations"]
-    initial_calib = snapshot["best_individual"]
+    initial_calib: Dict[str, Dict] = snapshot["best_individual"]
     calib_frames = snapshot["calibration_frames"]
+    cam_names = snapshot["camera_names"]
 
+    # Annotations (x, y) for calibration frames
     annots_in_calib_frames = all_annots[calib_frames, ..., :2]
     P, C, N_potential, _ = annots_in_calib_frames.shape
-    proj_matrices = np.array([get_projection_matrix(cam) for cam in initial_calib])
+
+    proj_matrices = np.array([get_projection_matrix(initial_calib[name]) for name in cam_names])
 
     if not is_independent:
         initial_structure = np.full((P, N_potential, 3), np.nan, dtype=np.float32)
@@ -699,6 +771,7 @@ def _prepare_ba_data(snapshot: Dict[str, Any], is_independent: bool) -> Dict[str
             "object_points_initial": np.nan_to_num(initial_structure.reshape(-1, 3)),
             "initial_structure_for_masking": initial_structure
         }
+
     else:
         # Scaffolding mode
         per_frame_3d = []
@@ -750,12 +823,16 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     print("[BA] Preparing data...")
 
     mode = snapshot.get("mode", "full_ba")
-    initial_calib = snapshot.get("best_individual")
+    initial_calib: Dict[str, Dict] = snapshot.get("best_individual")
     video_meta = snapshot.get("video_metadata")
     calib_frames = snapshot.get("calibration_frames")
+    cam_names = snapshot.get("camera_names")
 
     if not calib_frames or initial_calib is None:
         return {"status": "error", "message": "Missing calibration frames or initial calibration."}
+
+    # Order the calibration list according to cam_names
+    ordered_initial_calib = [initial_calib[name] for name in cam_names]
 
     # Set flags based on mode
     if mode == "refine_cameras_only":
@@ -779,12 +856,17 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     print("[BA] Starting optimization engine...")
     image_sizes_wh = np.array([[video_meta['width'], video_meta['height']]] * video_meta['num_videos'])
 
+    # Extract initial parameters as ordered lists of arrays for mokap/JAX
+    K_init = jnp.asarray(np.array([c['camera_matrix'] for c in ordered_initial_calib]))
+    D_init = jnp.asarray(np.array([c['dist_coeffs'] for c in ordered_initial_calib]))
+    r_init = jnp.asarray(np.array([c['rvec'] for c in ordered_initial_calib]))
+    t_init = jnp.asarray(np.array([c['tvec'] for c in ordered_initial_calib]))
+
     success, results = bundle_adjustment.run_bundle_adjustment(
-        camera_matrices_initial=jnp.asarray(
-            np.array([[[c['fx'], 0, c['cx']], [0, c['fy'], c['cy']], [0, 0, 1]] for c in initial_calib])),
-        distortion_coeffs_initial=jnp.asarray(np.array([c['dist'] for c in initial_calib])),
-        cam_rvecs_initial=jnp.asarray(np.array([c['rvec'] for c in initial_calib])),
-        cam_tvecs_initial=jnp.asarray(np.array([c['tvec'] for c in initial_calib])),
+        camera_matrices_initial=K_init,
+        distortion_coeffs_initial=D_init,
+        cam_rvecs_initial=r_init,
+        cam_tvecs_initial=t_init,
         images_sizes_wh=image_sizes_wh,
 
         image_points=jnp.asarray(ba_data["image_points"]),
@@ -807,13 +889,15 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     print("[BA] Optimization successful!")
     K_opt, D_opt, r_opt, t_opt = results['K_opt'], results['D_opt'], results['cam_r_opt'], results['cam_t_opt']
 
-    refined_calib = []
-    for i in range(video_meta['num_videos']):
-        refined_calib.append({
-            'fx': float(K_opt[i, 0, 0]), 'fy': float(K_opt[i, 1, 1]),
-            'cx': float(K_opt[i, 0, 2]), 'cy': float(K_opt[i, 1, 2]),
-            'dist': np.asarray(D_opt[i]), 'rvec': np.asarray(r_opt[i]), 'tvec': np.asarray(t_opt[i]),
-        })
+    # Convert refined results back to Dict[str, Dict]
+    refined_calib: Dict[str, Dict] = {}
+    for i, cam_name in enumerate(cam_names):
+        refined_calib[cam_name] = {
+            'camera_matrix': np.asarray(K_opt[i]),
+            'dist_coeffs': np.asarray(D_opt[i]),
+            'rvec': np.asarray(r_opt[i]),
+            'tvec': np.asarray(t_opt[i]),
+        }
 
     refined_points_to_return = None
     if not is_independent_mode and not fix_points:

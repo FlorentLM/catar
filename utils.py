@@ -2,7 +2,7 @@ import itertools
 import sys
 import tomllib
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import Levenshtein
 
@@ -15,17 +15,24 @@ from mokap.utils.fileio import probe_video
 from mokap.utils.geometry import projective
 from mokap.utils.geometry import transforms
 
+CameraParameters = Dict[str, Union[float, np.ndarray]]
+CalibrationDict = Dict[str, CameraParameters]
 
-# TODO: These wrappers for mokap should be removed eventually
 
+def annotations_to_polars(annotations_slice: np.ndarray, frame_idx: int,
+                          camera_names: List[str], point_names: List[str]) -> pl.DataFrame:
+    """
+    Converts a numpy slice of annotations (C, P, 3) into a Polars df for mokap.
+    Assumes slice shape is (num_cams, num_points, 3) where 3 is (x, y, score).
+    """
+    # TODO: Mokap should accept arrays and not just polars
 
-def annotations_to_polars(annotations_slice, frame_idx, camera_names, point_names):
-    """Converts a numpy slice of annotations into a Polars df (for mokap)"""
     rows = []
     num_cams, num_points, _ = annotations_slice.shape
 
     for c in range(num_cams):
         for p in range(num_points):
+            # Check if x, y, or score is not nan (we only care if the point exists)
             if not np.isnan(annotations_slice[c, p, 0]):
                 rows.append({
                     "frame": frame_idx,
@@ -36,22 +43,23 @@ def annotations_to_polars(annotations_slice, frame_idx, camera_names, point_name
                     "score": annotations_slice[c, p, 2],
                 })
     if not rows:
-        return pl.DataFrame(schema={'frame': pl.Int64, 'camera': pl.Utf8, 'keypoint': pl.Utf8, 'x': pl.Float64, 'y': pl.Float64, 'score': pl.Float64})
+        return pl.DataFrame(
+            schema={'frame': pl.Int64, 'camera': pl.Utf8, 'keypoint': pl.Utf8, 'x': pl.Float64, 'y': pl.Float64,
+                    'score': pl.Float64})
     return pl.DataFrame(rows)
 
 
 # ============================================================================
 # 3D reconstruction & confidence (wrappers for mokap)
 # ============================================================================
+# TODO: These wrappers will be removed
 
-def get_projection_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
-    """Computes the 3x4 projection matrix."""
 
-    K = np.array([
-        [cam_params['fx'], 0.0, cam_params['cx']],
-        [0.0, cam_params['fy'], cam_params['cy']],
-        [0.0, 0.0, 1.0]
-    ], dtype=np.float32)
+def get_projection_matrix(cam_params: CameraParameters) -> np.ndarray:
+    """
+    Computes the 3x4 projection matrix.
+    """
+    K = cam_params['camera_matrix']
 
     # Mokap expects world-to-camera poses for projection
     rvec_c2w = cam_params['rvec']
@@ -63,17 +71,15 @@ def get_projection_matrix(cam_params: Dict[str, Any]) -> np.ndarray:
     return np.asarray(P)
 
 
-def reproject_points(points_3d: np.ndarray, cam_params: Dict[str, Any]) -> np.ndarray:
-    """Reprojects 3D points to 2D."""
+def reproject_points(points_3d: np.ndarray, cam_params: CameraParameters) -> np.ndarray:
+    """
+    Reprojects 3D points to 2D.
+    """
 
     if points_3d.size == 0:
         return np.array([])
 
-    K = np.array([
-        [cam_params['fx'], 0.0, cam_params['cx']],
-        [0.0, cam_params['fy'], cam_params['cy']],
-        [0.0, 0.0, 1.0]
-    ], dtype=np.float32)
+    K = cam_params['camera_matrix']
 
     # get world-to-camera for projection
     rvec_c2w = cam_params['rvec']
@@ -85,31 +91,29 @@ def reproject_points(points_3d: np.ndarray, cam_params: Dict[str, Any]) -> np.nd
         rvec=rvec_w2c,
         tvec=tvec_w2c,
         camera_matrix=jnp.asarray(K),
-        dist_coeffs=jnp.asarray(cam_params['dist'])
+        dist_coeffs=jnp.asarray(cam_params['dist_coeffs'])
     )
 
     return np.asarray(reprojected).reshape(-1, 2)
 
 
-def undistort_points(points_2d: np.ndarray, cam_params: Dict[str, Any]) -> np.ndarray:
-    """Undistorts 2D points."""
+def undistort_points(points_2d: np.ndarray, cam_params: CameraParameters) -> np.ndarray:
+    """
+    Undistorts 2D points.
+    """
 
     valid_mask = ~np.isnan(points_2d).any(axis=-1)
     if not np.any(valid_mask):
         return np.full_like(points_2d, np.nan)
 
-    K = np.array([
-        [cam_params['fx'], 0.0, cam_params['cx']],
-        [0.0, cam_params['fy'], cam_params['cy']],
-        [0.0, 0.0, 1.0]
-    ], dtype=np.float32)
+    K = cam_params['camera_matrix']
 
     valid_points = points_2d[valid_mask]
 
     undistorted = projective.undistort_points(
         points2d=jnp.asarray(valid_points),
         camera_matrix=jnp.asarray(K),
-        dist_coeffs=jnp.asarray(cam_params['dist'])
+        dist_coeffs=jnp.asarray(cam_params['dist_coeffs'])
     )
 
     result = np.full_like(points_2d, np.nan)
@@ -117,26 +121,39 @@ def undistort_points(points_2d: np.ndarray, cam_params: Dict[str, Any]) -> np.nd
     return result
 
 
-def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, int], np.ndarray]:
-    """Calculates F matrix for each camera pair."""
+def calculate_fundamental_matrices(calibration: CalibrationDict, cam_names: List[str]) -> Dict[
+    Tuple[int, int], np.ndarray]:
+    """
+    Calculates F matrix for each camera pair.
 
-    num_cams = len(calibration)
+    Args:
+        calibration: calibration Dict[cam_name, cam_params].
+        cam_names: Ordered list of camera names (must match video index order).  # TODO: Videos should not be accessed by index, this is error-prone
+
+    Returns:
+        Dict mapping (from_cam_index, to_cam_index) to the F matrix.
+    """
+
+    num_cams = len(cam_names)
     if num_cams < 2:
         return {}
 
     f_mats = {}
-    Ks = jnp.asarray([np.array([[c['fx'], 0, c['cx']], [0, c['fy'], c['cy']], [0, 0, 1]]) for c in calibration])
-    rvecs_c2w = jnp.asarray([c['rvec'] for c in calibration])
-    tvecs_c2w = jnp.asarray([c['tvec'] for c in calibration])
+
+    # Get ordered parameters from the dictionary
+    ordered_params = [calibration[name] for name in cam_names]
+
+    Ks = jnp.asarray([c['camera_matrix'] for c in ordered_params])
+    rvecs_c2w = jnp.asarray([c['rvec'] for c in ordered_params])
+    tvecs_c2w = jnp.asarray([c['tvec'] for c in ordered_params])
 
     # invert poses from camera-to-world to world-to-camera
     rvecs_w2c, tvecs_w2c = transforms.invert_rtvecs(rvecs_c2w, tvecs_c2w)
 
-    # Create (from_cam, to_cam) pairs
+    # Create (from_cam, to_cam) pairs using index
     cam_indices = list(range(num_cams))
     pairs = [p for p in itertools.product(cam_indices, repeat=2) if p[0] != p[1]]
 
-    # Prepare for batched mokap function (num_pairs, 2, ...)
     K_pairs = jnp.asarray([(Ks[i], Ks[j]) for i, j in pairs])
     rvecs_w2c_pairs = jnp.asarray([(rvecs_w2c[i], rvecs_w2c[j]) for i, j in pairs])
     tvecs_w2c_pairs = jnp.asarray([(tvecs_w2c[i], tvecs_w2c[j]) for i, j in pairs])
@@ -149,57 +166,22 @@ def calculate_fundamental_matrices(calibration: List[Dict]) -> Dict[Tuple[int, i
     return f_mats
 
 
-def calculate_reproj_confidence(app_state: 'AppState', frame_idx: int, point_idx: int) -> np.ndarray:
-    """
-    Calculates reprojection error for a point in a frame using leave-one-out approach.
-    """
-
-    with app_state.lock:
-        annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
-        calibration = app_state.best_individual
-
-    num_cams = len(calibration)
-    errors = np.full(num_cams, np.nan, dtype=np.float32)
-
-    if calibration is None:
-        return errors
-
-    valid_cam_indices = np.where(~np.isnan(annotations_for_point).any(axis=1))[0]
-
-    if len(valid_cam_indices) < 3:  # Need at least 2 other views to triangulate
-        return errors
-
-    for cam_to_test in valid_cam_indices:
-        peer_indices = [i for i in valid_cam_indices if i != cam_to_test]
-
-        peer_annots = annotations_for_point[peer_indices].reshape(len(peer_indices), 1, 2)
-        peer_proj_mats = [get_projection_matrix(calibration[i]) for i in peer_indices]
-
-        point_3d = projective.triangulate_points_from_projections(
-            points2d=jnp.asarray(peer_annots),
-            P_mats=jnp.asarray(peer_proj_mats)
-        )
-        point_3d = np.asarray(point_3d).flatten()
-
-        if not np.isnan(point_3d).any():
-            reprojected = reproject_points(point_3d, calibration[cam_to_test])
-            if reprojected.size > 0:
-                original_annot = annotations_for_point[cam_to_test]
-                errors[cam_to_test] = np.linalg.norm(reprojected.flatten() - original_annot)
-
-    return errors
-
-
 # ============================================================================
 # Videos IO
 # ============================================================================
-# TODO: These will be merged with or replaced by mokap implementations
+# TODO: Port this logic to mokap
 
-def load_and_match_videos(data_folder: Path, video_format: str):
+
+def load_and_match_videos(data_folder: Path, video_format: str) -> Tuple[
+    List[str], List[str], List[str], CalibrationDict]:
     """
-    Load videos and calibration with smart names matching
+    Load videos and calibration with smart names matching.
+
+    Returns:
+        Tuple of (video_paths, video_filenames, camera_names, calibration_dict)
+        where calibration_dict is in the mokap-style Dict[CamName, CamParams]
+        with keys: 'camera_matrix', 'dist_coeffs', 'rvec', 'tvec'.
     """
-    # TODO: the smart matching logic should be ported to mokap
 
     # Load calibration TOML
     calib_file = data_folder / 'parameters.toml'
@@ -233,10 +215,10 @@ def load_and_match_videos(data_folder: Path, video_format: str):
 
     toml_indices, video_indices = linear_sum_assignment(cost_matrix)
 
-    # Build ordered lists based on the sorted toml_names order
+    # Build ordered lists based on the sorted toml_names order (which is the canonical order)
     ordered_paths = ["" for _ in range(n)]
     ordered_filenames = ["" for _ in range(n)]
-    ordered_toml_names = toml_names  # Use the alphabetically sorted TOML names as the canonical order
+    ordered_toml_names = toml_names
 
     # Create a map from the toml_index (from the assignment) back to the video_index
     toml_to_video_map = {ti: vi for ti, vi in zip(toml_indices, video_indices)}
@@ -246,22 +228,18 @@ def load_and_match_videos(data_folder: Path, video_format: str):
         ordered_paths[i] = str(video_paths[matched_video_idx])
         ordered_filenames[i] = video_filenames[matched_video_idx]
 
-    # Build calibration list in the same sorted order
-    calibration = []
+    # Build calibration dictionary (format {cam_name: cam_params})
+    calibration_dict: CalibrationDict = {}
     for toml_name in ordered_toml_names:
         cam = calib_data[toml_name]
-        calibration.append({
-            'fx': cam['camera_matrix'][0][0],
-            'fy': cam['camera_matrix'][1][1],
-            'cx': cam['camera_matrix'][0][2],
-            'cy': cam['camera_matrix'][1][2],
-            'dist': np.array(cam['dist_coeffs'], dtype=np.float32),
+        calibration_dict[toml_name] = {
+            'camera_matrix': np.array(cam['camera_matrix'], dtype=np.float32),
+            'dist_coeffs': np.array(cam['dist_coeffs'], dtype=np.float32),
             'rvec': np.array(cam['rvec'], dtype=np.float32),
             'tvec': np.array(cam['tvec'], dtype=np.float32),
-        })
+        }
 
-    # Return the camera names from the TOML as a new list
-    return ordered_paths, ordered_filenames, ordered_toml_names, calibration
+    return ordered_paths, ordered_filenames, ordered_toml_names, calibration_dict
 
 
 # ============================================================================

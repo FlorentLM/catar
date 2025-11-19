@@ -74,6 +74,7 @@ class VideoReaderWorker(threading.Thread):
         Gets frames for a specific index.
         Uses cache reader if available, otherwise falls back to cv2.VideoCapture with on-the-fly caching.
         """
+
         # Fast path: use cache reader if available
         if self.cache_reader is not None:
             try:
@@ -114,6 +115,7 @@ class VideoReaderWorker(threading.Thread):
                 if read_successful:
                     frame = new_frame
                     cache[frame_idx] = frame
+
                     # Enforce the cache size limit
                     if len(cache) > self.onthefly_cache_size:
                         cache.popitem(last=False)  # remove oldest item
@@ -197,7 +199,8 @@ class VideoReaderWorker(threading.Thread):
             q.put(frame_data)
 
     def _cleanup(self):
-        """Release all video captures."""
+        """Release all cv2 video captures."""
+
         if self.cache_reader is None:
             for cap in self.video_captures:
                 cap.release()
@@ -276,11 +279,14 @@ class TrackingWorker(threading.Thread):
         """
 
         with self.app_state.lock:
+            # Get only (x, y) coordinates
             annotations = self.app_state.annotations[frame_idx, ..., :2]
-            calibration = self.app_state.best_individual
+            calibration = self.app_state.calibration_state.best_individual
+            cam_names = self.app_state.camera_names
 
         if calibration is not None:
-            proj_matrices = np.array([get_projection_matrix(cam) for cam in calibration])
+            # Build projection matrices
+            proj_matrices = np.array([get_projection_matrix(calibration[name]) for name in cam_names])
 
             # Triangulate all points for the current frame
             points_3d = projective.triangulate_points_from_projections(
@@ -290,11 +296,13 @@ class TrackingWorker(threading.Thread):
 
             with self.app_state.lock:
                 self.app_state.reconstructed_3d_points[frame_idx] = np.asarray(points_3d)
-                # Reset the flag now that the reconstruction is done
+
+                # Reset the flag now that reconstruction is done
                 self.app_state.needs_3d_reconstruction = False
 
     def _process_frame_for_tracking(self, data: dict):
         """Process a single frame for the automated tracking pipeline."""
+
         frame_idx = data["frame_idx"]
 
         with self.app_state.lock:
@@ -316,7 +324,9 @@ class TrackingWorker(threading.Thread):
         self.prev_frame_idx = data["frame_idx"]
 
     def _run_batch_tracking(self, start_frame: int):
-        """Track points forward using the full feedback loop on every frame."""
+        """Track points forward using the full process loop on every frame."""
+        # TODO: This will be bidirectional
+
         print(f"Starting batch track from frame {start_frame}...")
 
         caps = [cv2.VideoCapture(path) for path in self.video_paths]
@@ -344,8 +354,6 @@ class TrackingWorker(threading.Thread):
             if not all(f is not None for f in current_frames):
                 break
 
-
-            # This single call does LK prediction and mokap correction
             process_frame(
                 frame_idx,
                 self.app_state,
@@ -370,6 +378,7 @@ class TrackingWorker(threading.Thread):
 
     def _read_frames_at(self, caps: List[cv2.VideoCapture], frame_idx: int) -> List[np.ndarray]:
         """Read frames from all captures at specific index."""
+
         frames = []
         for cap in caps:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -381,6 +390,7 @@ class TrackingWorker(threading.Thread):
 
     def _cleanup_captures(self, caps: List[cv2.VideoCapture]):
         """Release video captures."""
+
         for cap in caps:
             cap.release()
 
@@ -456,10 +466,12 @@ class RenderingWorker(threading.Thread):
 
         with self.app_state.lock:
             # Add camera visualisations
-            if self.app_state.show_cameras_in_3d and self.app_state.best_individual:
-                for i, cam_params in enumerate(self.app_state.best_individual):
+            calibration = self.app_state.calibration_state.best_individual
+
+            if self.app_state.show_cameras_in_3d and calibration:
+                for cam_name, cam_params in calibration.items():
                     scene.extend(
-                        create_camera_visual(cam_params, self.app_state.video_names[i], self.app_state.scene_centre)
+                        create_camera_visual(cam_params, cam_name, self.app_state.scene_centre)
                     )
 
             # Add reconstructed points and skeleton
@@ -469,12 +481,13 @@ class RenderingWorker(threading.Thread):
             skeleton = self.app_state.skeleton
 
         # Debug: count valid points
-        valid_points = 0
+        # valid_points = 0
 
         # Draw points
         for i, point in enumerate(points_3d):
             if not np.isnan(point).any():
-                valid_points += 1
+                # valid_points += 1
+
                 color = tuple(point_colors[i])
                 scene.append(SceneObject(
                     type='point',
@@ -598,12 +611,13 @@ class BAWorker(multiprocessing.Process):
                         self.results_queue.put(results)
                     except Exception as e:
                         import traceback
-                        print(f"--- BA WORKER EXCEPTION ---")
+                        print(f"[ BA WORKER EXCEPTION ]")
                         traceback.print_exc()
-                        print(f"--- END EXCEPTION ---")
+                        print(f"[     END EXCEPTION   ]")
                         self.results_queue.put({"status": "error", "message": str(e)})
 
             except queue.Empty:
                 continue
 
         print("BA worker shut down.")
+
