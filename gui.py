@@ -936,7 +936,7 @@ def _image_drag_callback(sender, app_data, user_data):
         app_state.needs_3d_reconstruction = True
         app_state.drag_state = drag_state  # write updated state back
 
-    # Update loupe background texture
+    # Update loupe background texture with subpixel accuracy
     loupe_size = 128
     zoom_factor = 4.0
     src_patch_width = loupe_size / zoom_factor
@@ -944,12 +944,13 @@ def _image_drag_callback(sender, app_data, user_data):
     src_x = final_scaled_pos[0] - src_patch_width / 2
     src_y = final_scaled_pos[1] - src_patch_width / 2
 
-    x1, y1 = max(0, int(src_x)), max(0, int(src_y))
-    x2, y2 = min(video_w, int(src_x + src_patch_width)), min(video_h, int(src_y + src_patch_width))
-    patch = video_frame[y1:y2, x1:x2]
+    center_coords = (final_scaled_pos[0], final_scaled_pos[1])
+    patch_size = (int(src_patch_width), int(src_patch_width))
+    patch = cv2.getRectSubPix(video_frame, patch_size, center_coords)
 
-    if patch.size > 0:
-        zoomed_patch = cv2.resize(patch, (loupe_size, loupe_size), interpolation=cv2.INTER_NEAREST)
+    if patch is not None and patch.size > 0:
+        # Smoother interpolation for a less blocky look
+        zoomed_patch = cv2.resize(patch, (loupe_size, loupe_size), interpolation=cv2.INTER_LINEAR)
         zoomed_patch_rgba = cv2.cvtColor(zoomed_patch, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
         dpg.set_value("loupe_texture", zoomed_patch_rgba.ravel())
 
@@ -987,16 +988,53 @@ def _image_drag_callback(sender, app_data, user_data):
         reprojected = reproject_points(point_3d_selected, best_individual[cam_name_target])
 
         if reprojected.size > 0:
-            reproj_loupe = to_loupe_coords(reprojected[0])
-            if 0 < reproj_loupe[0] < loupe_size and 0 < reproj_loupe[1] < loupe_size:
+            reproj_video_coords = reprojected[0]
+            reproj_loupe_coords = to_loupe_coords(reproj_video_coords)
 
-                dpg.draw_line((reproj_loupe[0] - 5, reproj_loupe[1] - 5),
-                              (reproj_loupe[0] + 5, reproj_loupe[1] + 5),
-                              color=(255, 0, 0), parent=layer_tag)
+            # only draw if the reprojection is visible within the loupe
+            if 0 < reproj_loupe_coords[0] < loupe_size and 0 < reproj_loupe_coords[1] < loupe_size:
 
-                dpg.draw_line((reproj_loupe[0] - 5, reproj_loupe[1] + 5),
-                              (reproj_loupe[0] + 5, reproj_loupe[1] - 5),
-                              color=(255, 0, 0), parent=layer_tag)
+                # Draw red X
+                color_reproj = (255, 0, 0)
+                dpg.draw_line((reproj_loupe_coords[0] - 5, reproj_loupe_coords[1] - 5),
+                              (reproj_loupe_coords[0] + 5, reproj_loupe_coords[1] + 5),
+                              color=color_reproj, parent=layer_tag, thickness=1)
+
+                dpg.draw_line((reproj_loupe_coords[0] - 5, reproj_loupe_coords[1] + 5),
+                              (reproj_loupe_coords[0] + 5, reproj_loupe_coords[1] - 5),
+                              color=color_reproj, parent=layer_tag, thickness=1)
+
+                # Dotted error line from the center of the loupe
+                color_line = (255, 100, 100)
+                p1 = np.array((loupe_size / 2, loupe_size / 2))  # annotation is always at the center
+                p2 = np.array(reproj_loupe_coords)
+                distance = np.linalg.norm(p1 - p2)
+
+                if distance > 0.1:  # only draw if there's a visible error
+                    vec = p2 - p1
+                    vec_norm = vec / (distance + 1e-6)
+                    dash_length = 4
+                    gap_length = 3
+
+                    current_pos = 0
+                    while current_pos < distance:
+                        start_point = p1 + vec_norm * current_pos
+                        end_point = p1 + vec_norm * min(current_pos + dash_length, distance)
+                        dpg.draw_line(tuple(start_point), tuple(end_point), color=color_line, thickness=1,
+                                      parent=layer_tag)
+                        current_pos += dash_length + gap_length
+
+                    # Distance text
+                    distance_px = np.linalg.norm(final_scaled_pos - reproj_video_coords)
+                    mid_point = p1 + vec * 0.5
+                    label_pos = (mid_point[0] + 5, mid_point[1])
+                    dpg.draw_text(
+                        pos=label_pos,
+                        text=f"{distance_px:.1f}px",
+                        color=color_line,
+                        size=12,
+                        parent=layer_tag
+                    )
 
     # Draw a small crosshair
     center = loupe_size / 2
@@ -1014,20 +1052,25 @@ def _image_drag_callback(sender, app_data, user_data):
     dpg.draw_line((center, center + size), (center, center + gap), color=(255, 255, 255), thickness=1,
                   parent=layer_tag)
 
+    # Add subpixel coordinates text
+    coord_text = f"X: {final_scaled_pos[0]:.2f}\nY: {final_scaled_pos[1]:.2f}"
+    dpg.draw_text(pos=(5, 5), text=coord_text, color=(255, 255, 255), size=12, parent=layer_tag)
+
     dpg.draw_rectangle((0, 0), (loupe_size, loupe_size), color=(255, 255, 255), thickness=1, parent=layer_tag)
 
     # Position loupe to avoid window edges
-    # TODO: this is kinda broken
     viewport_width, viewport_height = dpg.get_viewport_client_width(), dpg.get_viewport_client_height()
-    offset_x, offset_y = 20, 20
+    padding = 20
 
-    if mouse_pos[0] + offset_x + loupe_size > viewport_width:
-        offset_x = -loupe_size - 20
-    if mouse_pos[1] + offset_y + loupe_size > viewport_height:
-        offset_y = -loupe_size - 20
+    loupe_x = mouse_pos[0] + padding
+    if loupe_x + loupe_size > viewport_width:
+        loupe_x = mouse_pos[0] - padding - loupe_size
 
-    final_loupe_pos = (mouse_pos[0] + offset_x, mouse_pos[1] + offset_y)
-    dpg.configure_item("loupe_window", pos=final_loupe_pos)
+    loupe_y = mouse_pos[1] + padding
+    if loupe_y + loupe_size > viewport_height:
+        loupe_y = mouse_pos[1] - padding - loupe_size
+
+    dpg.configure_item("loupe_window", pos=(loupe_x, loupe_y))
 
 
 def _leftclick_release_callback(sender, app_data, user_data):
