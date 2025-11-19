@@ -600,6 +600,7 @@ class BAWorker(multiprocessing.Process):
     def run(self):
         print("BA worker started.")
         while True:
+
             try:
                 command = self.command_queue.get()  # Block until a command arrives
 

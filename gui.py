@@ -2,6 +2,7 @@
 GUI implementation using DearPyGUI.
 """
 import queue
+import time
 
 import cv2
 import dearpygui.dearpygui as dpg
@@ -529,7 +530,7 @@ def _create_ba_progress_popup(app_state: AppState, queues: Queues):
 
     with dpg.window(
             label="Refining Calibration", modal=True, show=False, tag="ba_progress_popup",
-            width=400, height=100, no_close=True, no_move=True
+            width=400, height=100, no_close=True, no_move=False
     ):
         dpg.add_text("Running Bundle Adjustment...", tag="ba_status_text")
         dpg.add_text("This may take a few minutes...")
@@ -1314,6 +1315,7 @@ def _start_ba_callback(sender, app_data, user_data):
 
     dpg.set_value("ba_status_text", f"Running Bundle Adjustment ({selected_mode_label})...")
     dpg.hide_item("ba_config_popup")
+    time.sleep(0.1)
     dpg.show_item("ba_progress_popup")
 
 
