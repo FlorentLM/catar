@@ -10,9 +10,9 @@ import dearpygui.dearpygui as dpg
 from typing import Dict, Any
 
 import config
-from state import AppState, Queues
+from state import AppState, Queues, VideoState, CalibrationState
 from gui import create_ui, update_ui, resize_video_widgets
-from utils import load_and_match_videos, probe_video
+from utils import load_and_match_videos
 from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker, BAWorker
 from viz_3d import Open3DVisualizer
 from video_cache import VideoCacheBuilder, VideoCacheReader
@@ -21,7 +21,6 @@ from mokap.reconstruction.config import PipelineConfig
 from mokap.reconstruction.anatomy import StatsBootstrapper
 from mokap.reconstruction.reconstruction import Reconstructor
 from mokap.reconstruction.tracking import SkeletonAssembler, MultiObjectTracker
-from mokap.utils import fileio
 
 
 def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer):
@@ -143,18 +142,18 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
 
             if ga_progress.get("status") == "running":
                 new_best_fitness = ga_progress["best_fitness"]
-                current_best_fitness = app_state.calibration_state.best_fitness
+                current_best_fitness = app_state.calibration.best_fitness
 
                 # Check if a better individual was found
                 if new_best_fitness < current_best_fitness:
                     new_individual = ga_progress["new_best_individual"]
                     with app_state.lock:
-                        app_state.calibration_state.set_calibration(new_individual, app_state.camera_names)
-                        app_state.calibration_state.best_fitness = new_best_fitness
+                        app_state.calibration.update_calibration(new_individual)
+                        app_state.calibration.best_fitness = new_best_fitness
 
                 # Update the GUI popup text
                 dpg.set_value("ga_generation_text", f"Generation: {ga_progress['generation']}")
-                dpg.set_value("ga_fitness_text", f"Best Fitness: {app_state.calibration_state.best_fitness:.2f}")
+                dpg.set_value("ga_fitness_text", f"Best Fitness: {app_state.calibration.best_fitness:.2f}")
                 dpg.set_value("ga_mean_fitness_text", f"Mean Fitness: {ga_progress['mean_fitness']:.2f}")
 
         except queue.Empty:
@@ -171,7 +170,7 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
 
                 with app_state.lock:
                     # Always update the main calibration
-                    app_state.set_calibration_state(refined_calib)
+                    app_state.calibration.update_calibration(refined_calib)
 
                     # Conditionally update the 3D points if they were returned
                     refined_3d_points = ba_result.get('refined_3d_points')
@@ -184,7 +183,6 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                         print("BA was run in scaffolding mode; 3D points were not updated.")
 
                     app_state.needs_3d_reconstruction = True
-                    app_state.calibration_state.best_fitness = 0.0
 
             elif ba_result['status'] == 'error':
                 print(f"BA ERROR: {ba_result['message']}")
@@ -210,17 +208,23 @@ def main():
 
     # Load videos and calibration first
     print("Loading videos and calibration...")
-    video_paths, video_filenames, camera_names, mokap_calibration = load_and_match_videos(
+    video_paths, _, camera_names, mokap_calibration = load_and_match_videos(
         config.DATA_FOLDER,
         config.VIDEO_FORMAT
     )
+
+    # Create dedicated state objects
+    print("Initializing main application state...")
+    video_state = VideoState(camera_names, video_paths)
+    calib_state = CalibrationState(mokap_calibration, camera_names)
+    app_state = AppState(video_state, calib_state, config.SKELETON_CONFIG)
 
     # Check for video cache
     print("Checking for video cache...")
     cache_dir = config.DATA_FOLDER / 'video_cache'
 
     builder = VideoCacheBuilder(
-        video_paths=video_paths,
+        video_paths=app_state.videos.filepaths,
         cache_dir=str(cache_dir),
         ram_budget_gb=2.0
     )
@@ -244,9 +248,8 @@ def main():
         print("No video cache found. Will use direct (slower) video files access.")
         print("You can build cache later via Tools > Build Video Cache...")
 
-    # Get video metadata
-    metadata = probe_video(video_paths[0])
-    metadata['num_videos'] = len(video_paths)
+    # Set the cache reader in the app state (used by VideoReaderWorker)
+    app_state.cache_reader = cache_reader
 
     # Initialise mokap config
     print("Initializing mokap pipeline configuration...")
@@ -291,7 +294,7 @@ def main():
     # Instantiate the Reconstructor
     print("Initializing 3D Reconstructor...")
     reconstructor = Reconstructor(
-        camera_parameters=mokap_calibration,
+        camera_parameters=calib_state.best_calibration,  # TODO: Urgent - this needs to have access to the updated calibration data
         volume_bounds=volume_bounds,
         config=mokap_config.reconstruction
     )
@@ -309,13 +312,8 @@ def main():
         config=mokap_config.tracker
     )
 
-    # Initialise application state
-    app_state = AppState(metadata, config.SKELETON_CONFIG)
-    app_state.video_names = video_filenames
-    app_state.camera_names = camera_names
-    app_state.set_calibration_state(mokap_calibration)
+    # Load any saved annotation/calibration data from disk
     app_state.load_from_disk(config.DATA_FOLDER)
-    app_state.cache_reader = cache_reader
     app_state.scene_centre = scene_centre
 
     # Initialise communication queues
@@ -328,10 +326,9 @@ def main():
     workers = [
         VideoReaderWorker(
             app_state,
-            video_paths,
             queues.command,
             [queues.frames_for_tracking, queues.frames_for_rendering],
-            cache_reader=cache_reader
+            cache_reader=app_state.cache_reader
         ),
         TrackingWorker(
             app_state,
@@ -339,7 +336,6 @@ def main():
             tracker,
             queues.frames_for_tracking,
             queues.tracking_progress,
-            video_paths,
             queues.tracking_command,
             queues.stop_batch_track
         ),

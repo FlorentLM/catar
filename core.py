@@ -2,7 +2,6 @@
 Core algos for tracking and calibration (and some stuff for visualisation)
 """
 import random
-from itertools import combinations
 from typing import List, Dict, Any, Optional
 
 import cv2
@@ -14,15 +13,16 @@ from mokap.utils.geometry import projective
 from mokap.utils.geometry import transforms
 from mokap.utils.geometry.fitting import quaternion_average
 
-from utils import annotations_to_polars, get_projection_matrix, reproject_points, undistort_points
+from utils import annotations_to_polars, reproject_points
 from viz_3d import SceneObject
 import config
+from state import AppState, CalibrationState, VideoState
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from mokap.reconstruction.reconstruction import Reconstructor
     from mokap.reconstruction.tracking import MultiObjectTracker
-    from state import AppState
+
 
 
 # ============================================================================
@@ -43,9 +43,9 @@ def snap_annotation(
 
     with app_state.lock:
         annotations_for_point = app_state.annotations[frame_idx, :, point_idx, :]
-        calibration = app_state.calibration_state.best_individual
+        calibration = app_state.calibration
 
-    if calibration is None:
+    if calibration.best_calibration is None:
         return None
 
     num_cams = annotations_for_point.shape[0]
@@ -67,8 +67,7 @@ def snap_annotation(
     valid_scores = valid_annotations[:, 2]
 
     # Get calibration parameters for valid cameras
-    cam_names = list(calibration.keys())
-    proj_matrices = np.array([get_projection_matrix(calibration[cam_names[i]]) for i in valid_cam_indices])
+    proj_matrices = calibration.P_mats[valid_cam_indices]
 
     # Reshape for triangulation function
     point_to_triangulate = valid_annotations_2d.reshape(len(valid_cam_indices), 1, 2)
@@ -87,7 +86,7 @@ def snap_annotation(
     point_3d = point_3d_single.flatten()
 
     # Reproject the 3D point back onto the target camera's view
-    target_cam_params = calibration[cam_names[target_cam_idx]]
+    target_cam_params = calibration.get(calibration.camera_names[target_cam_idx])
     reprojected_point_2d = reproject_points(point_3d, target_cam_params)
 
     if reprojected_point_2d.size == 0:
@@ -221,8 +220,9 @@ def process_frame(
     """
 
     with app_state.lock:
-        camera_names = app_state.camera_names
+        calibration = app_state.calibration
         point_names = app_state.point_names
+        camera_names = app_state.camera_names
 
     # Get geometric prediction and confidence score from LK tracking
     annotations_from_lk = track_points(
@@ -254,9 +254,10 @@ def process_frame(
         print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
 
     with app_state.lock:
-        calibration = app_state.calibration_state.best_individual
-        cam_names = app_state.camera_names
-        num_cams = len(cam_names)
+        calibration = app_state.calibration
+        point_names = app_state.point_names
+        camera_names = app_state.camera_names
+        num_cams = len(camera_names)
 
         # Get human annotations as a source of evidence
         human_flags_for_frame = app_state.human_annotated[frame_idx].copy()
@@ -265,7 +266,7 @@ def process_frame(
     # Get model-reprojected annotations as a source of evidence
     annotations_from_model = np.full_like(annotations_from_lk, np.nan)
 
-    if final_3d_skeleton_kps and calibration is not None:
+    if final_3d_skeleton_kps and calibration.best_calibration:
         points_to_reproject_3d = []
         p_indices = []
 
@@ -278,14 +279,21 @@ def process_frame(
 
         if points_to_reproject_3d.size > 0:
 
-            for cam_idx in range(num_cams):
-                cam_params = calibration[cam_names[cam_idx]]
-                reprojected_2d = reproject_points(points_to_reproject_3d, cam_params)
+            # Project into all cameras
+            reprojected_all_cams, _ = projective.project_to_multiple_cameras(
+                object_points=jnp.asarray(points_to_reproject_3d),
+                rvec=jnp.asarray(calibration.rvecs_w2c),
+                tvec=jnp.asarray(calibration.tvecs_w2c),
+                camera_matrix=jnp.asarray(calibration.K_mats),
+                dist_coeffs=jnp.asarray(calibration.dist_coeffs)
+            )
+            reprojected_all_cams = np.asarray(reprojected_all_cams)  # shape (C, P_reproj, 2)
 
-                if reprojected_2d.size > 0:
-                    for i, p_idx in enumerate(p_indices):
-                        model_confidence = skeleton_score * 0.75
-                        annotations_from_model[cam_idx, p_idx] = [*reprojected_2d[i], model_confidence]
+            # Fill annotation array
+            model_confidence = skeleton_score * 0.75
+            for i, p_idx in enumerate(p_indices):
+                annotations_from_model[:, p_idx, :2] = reprojected_all_cams[:, i, :]
+                annotations_from_model[:, p_idx, 2] = model_confidence
 
     # Step 1: Get best possible 2D annotations by fusing all evidence
     fused_2d_annotations = _fuse_annotations(
@@ -293,7 +301,7 @@ def process_frame(
         human_flags=human_flags_for_frame,
         lk_annots=annotations_from_lk,
         model_annots=annotations_from_model
-    ) # shape (C, P, 3)
+    )  # shape (C, P, 3)
 
     # Rescue single-view LK tracks that were lost during fusion because they had no other supporting evidence
     is_valid_lk = ~np.isnan(annotations_from_lk[..., 0])
@@ -311,15 +319,14 @@ def process_frame(
 
     # Step 2: Generate (the hopefully high fidelity) 3D data by triangulating these fused 2D points
     triangulated_3d_points = np.full((app_state.num_points, 3), np.nan, dtype=np.float32)
-    if calibration is not None:
-        proj_matrices = np.array([get_projection_matrix(calibration[name]) for name in cam_names])
+    if calibration.best_calibration is not None:
 
         points2d_for_triangulation = fused_2d_annotations[..., :2] # (C, P, 2)
         weights_for_triangulation = fused_2d_annotations[..., 2] # (C, P)
 
         triangulated_3d_points = projective.triangulate_points_from_projections(
             points2d=jnp.asarray(points2d_for_triangulation),
-            P_mats=jnp.asarray(proj_matrices),
+            P_mats=jnp.asarray(calibration.P_mats),
             weights=jnp.asarray(weights_for_triangulation)
         )
         triangulated_3d_points = np.asarray(triangulated_3d_points)
@@ -369,17 +376,16 @@ def track_points(
         # Get previous annotations WITH confidence this time
         annotations_prev_full = app_state.annotations[frame_idx - 1].copy()
         annotations_prev = annotations_prev_full[..., :2]  # this is used for LK input
-        calibration = app_state.calibration_state.best_individual
+        calibration = app_state.calibration
         cam_names = app_state.camera_names
 
     # Output array is (C, P, 3) where 3 is (x, y, confidence)
     output_annotations = np.full((annotations_prev.shape[0], annotations_prev.shape[1], 3), np.nan, dtype=np.float32)
 
-    if calibration is None:
+    if calibration.best_calibration is None:
         return output_annotations
 
     num_videos = len(current_frames)
-    proj_matrices = {name: get_projection_matrix(calibration[name]) for name in cam_names}
 
     # Run LK Optic flow and compute initial confidence
     for cam_idx in range(num_videos):
@@ -450,8 +456,7 @@ def track_points(
 
                 # Prepare data for a single, batched triangulation call.
                 consensus_annots = output_annotations[consensus_peer_indices, p_idx, :2]
-                consensus_cam_names = [cam_names[i] for i in consensus_peer_indices]
-                consensus_proj_mats = np.array([proj_matrices[name] for name in consensus_cam_names])
+                consensus_proj_mats = calibration.P_mats[consensus_peer_indices]
 
                 points_for_triangulation = consensus_annots.reshape(len(consensus_peer_indices), 1, 2)
 
@@ -466,7 +471,7 @@ def track_points(
 
                 # Reproject the 3D hypothesis back to the camera we are checking
                 cam_name_to_check = cam_names[cam_idx_to_check]
-                reprojected = reproject_points(point_3d_hypothesis, calibration[cam_name_to_check])
+                reprojected = reproject_points(point_3d_hypothesis, calibration.get(cam_name_to_check))
                 if reprojected.size == 0:
                     continue
 
@@ -608,7 +613,7 @@ def create_individual(video_metadata: Dict, cam_names: List[str], scene_centre: 
 
 
 def compute_fitness(
-    individual: Dict[str, Dict],
+    individual: Dict[str, Dict],  # This is the candidate from the GA
     annotations: np.ndarray,
     calibration_frames: List[int],
     video_metadata: Dict,
@@ -618,6 +623,9 @@ def compute_fitness(
 
     if not calibration_frames:
         return float('inf')
+
+    # Temporary CalibrationState for candidate individual
+    temp_calib_state = CalibrationState(individual, cam_names)
 
     # Filter to calibration frames with valid data
     calib_mask = np.zeros(annotations.shape[0], dtype=bool)
@@ -632,40 +640,51 @@ def compute_fitness(
     valid_annots = annotations[combined_mask][..., :2]
     num_cams = video_metadata['num_videos']
 
-    # Compute projection matrices
-    proj_matrices = np.array([get_projection_matrix(individual[name]) for name in cam_names])
-
-    undistorted_annots = np.full_like(valid_annots, np.nan)
-    for c in range(num_cams):
-        undistorted_annots[:, c] = undistort_points(valid_annots[:, c], individual[cam_names[c]])
+    annots_for_undistort = np.transpose(valid_annots, (1, 2, 0, 3)).reshape(num_cams, -1, 2)
+    undistorted_flat = projective.undistort_multiple(
+        jnp.asarray(annots_for_undistort),
+        jnp.asarray(temp_calib_state.K_mats),
+        jnp.asarray(temp_calib_state.dist_coeffs)
+    )
+    undistorted_annots = np.asarray(undistorted_flat).reshape(num_cams, -1, valid_annots.shape[2], 2)
+    undistorted_annots = np.transpose(undistorted_annots, (1, 0, 2, 3))
 
     # Triangulate for each frame
-    points_3d = np.array([
+    points_3d_per_frame = [
         np.asarray(projective.triangulate_points_from_projections(
             points2d=jnp.asarray(frame_annots),
-            P_mats=jnp.asarray(proj_matrices)
+            P_mats=jnp.asarray(temp_calib_state.P_mats)
         ))
         for frame_annots in undistorted_annots
-    ])
+    ]
+    points_3d = np.array(points_3d_per_frame)  # shape (F, P, 3)
 
-    # Compute reprojection error
-    total_error = 0.0
-    total_points = 0
+    # Temporary state for candidate calibration
+    temp_calib_state = CalibrationState(individual, cam_names)
 
-    for c in range(num_cams):
-        cam_name = cam_names[c]
-        valid_3d = ~np.isnan(points_3d).any(axis=-1)
-        valid_2d = ~np.isnan(valid_annots[:, c]).any(axis=-1)
-        valid = valid_3d & valid_2d
+    num_frames, num_points, _ = points_3d.shape
+    points_3d_flat = points_3d.reshape(-1, 3)  # shape (F*P, 3)
 
-        if not np.any(valid):
-            continue
+    # Project all points into all cameras
+    reprojected_flat, _ = projective.project_to_multiple_cameras(
+        jnp.asarray(points_3d_flat),
+        rvec=jnp.asarray(temp_calib_state.rvecs_c2w),
+        tvec=jnp.asarray(temp_calib_state.tvecs_c2w),
+        camera_matrix=jnp.asarray(temp_calib_state.K_mats),
+        dist_coeffs=jnp.asarray(temp_calib_state.dist_coeffs)
+    ) # shape (C, F*P, 2)
 
-        reprojected = reproject_points(points_3d[valid], individual[cam_name])
-        errors = np.linalg.norm(reprojected - valid_annots[:, c][valid], axis=1)
+    # Reshape back to match annotation structure
+    reprojected_unflat = np.asarray(reprojected_flat).reshape(num_cams, num_frames, num_points, 2)
+    reprojected_final = np.transpose(reprojected_unflat, (1, 0, 2, 3))  # shape (F, C, P, 2)
 
-        total_error += np.sum(errors)
-        total_points += len(errors)
+    # Calculate error across all points and cameras
+    errors = np.linalg.norm(reprojected_final - undistorted_annots, axis=-1)
+
+    # Mask out invalid points and calculate final fitness score
+    valid_mask = ~np.isnan(undistorted_annots[..., 0])
+    total_error = np.sum(errors[valid_mask])
+    total_points = np.sum(valid_mask)
 
     return total_error / total_points if total_points > 0 else float('inf')
 
@@ -821,15 +840,17 @@ def _prepare_ba_data(snapshot: Dict[str, Any], is_independent: bool) -> Dict[str
     """
 
     all_annots = snapshot["annotations"]
-    initial_calib: Dict[str, Dict] = snapshot["best_individual"]
+    initial_calib_dict: Dict[str, Dict] = snapshot["best_individual"]
     calib_frames = snapshot["calibration_frames"]
     cam_names = snapshot["camera_names"]
+
+    # Temporary state object to access cached properties
+    temp_calib_state = CalibrationState(initial_calib_dict, cam_names)
 
     # Annotations (x, y) for calibration frames
     annots_in_calib_frames = all_annots[calib_frames, ..., :2]
     P, C, N_potential, _ = annots_in_calib_frames.shape
-
-    proj_matrices = np.array([get_projection_matrix(initial_calib[name]) for name in cam_names])
+    proj_matrices = temp_calib_state.P_mats
 
     if not is_independent:
         initial_structure = np.full((P, N_potential, 3), np.nan, dtype=np.float32)
@@ -907,9 +928,6 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     if not calib_frames or initial_calib is None:
         return {"status": "error", "message": "Missing calibration frames or initial calibration."}
 
-    # Order the calibration list according to cam_names
-    ordered_initial_calib = [initial_calib[name] for name in cam_names]
-
     # Set flags based on mode
     if mode == "refine_cameras_only":
         is_independent_mode = True
@@ -932,11 +950,13 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     print("[BA] Starting optimization engine...")
     image_sizes_wh = np.array([[video_meta['width'], video_meta['height']]] * video_meta['num_videos'])
 
+    temp_calib_state = CalibrationState(initial_calib, cam_names)
+
     # Extract initial parameters as ordered lists of arrays for mokap/JAX
-    K_init = jnp.asarray(np.array([c['camera_matrix'] for c in ordered_initial_calib]))
-    D_init = jnp.asarray(np.array([c['dist_coeffs'] for c in ordered_initial_calib]))
-    r_init = jnp.asarray(np.array([c['rvec'] for c in ordered_initial_calib]))
-    t_init = jnp.asarray(np.array([c['tvec'] for c in ordered_initial_calib]))
+    K_init = jnp.asarray(temp_calib_state.K_mats)
+    D_init = jnp.asarray(temp_calib_state.dist_coeffs)
+    r_init = jnp.asarray(temp_calib_state.rvecs_c2w)
+    t_init = jnp.asarray(temp_calib_state.tvecs_c2w)
 
     success, results = bundle_adjustment.run_bundle_adjustment(
         camera_matrices_initial=K_init,

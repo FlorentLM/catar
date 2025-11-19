@@ -872,8 +872,8 @@ def _image_drag_callback(sender, app_data, user_data):
         video_h = app_state.video_metadata['height']
         current_frames = app_state.current_video_frames
         all_annotations = app_state.annotations[frame_idx]
-        best_individual = app_state.calibration_state.best_individual
-        f_mats = app_state.calibration_state.fundamental_matrices
+        best_individual = app_state.calibration.best_calibration
+        f_mats = app_state.calibration.F_mats
         point_3d_selected = app_state.reconstructed_3d_points[frame_idx, p_idx]
         camera_colors = app_state.camera_colors
         cam_names = app_state.camera_names
@@ -1173,13 +1173,13 @@ def _toggle_calib_frame_callback(sender, app_data, user_data):
     with app_state.lock:
         frame_idx = app_state.frame_idx
 
-        if frame_idx in app_state.calibration_state.calibration_frames:
-            app_state.calibration_state.calibration_frames.remove(frame_idx)
+        if frame_idx in app_state.calibration.calibration_frames:
+            app_state.calibration.calibration_frames.remove(frame_idx)
             print(f"Frame {frame_idx} removed from calibration set.")
 
         else:
-            app_state.calibration_state.calibration_frames.append(frame_idx)
-            app_state.calibration_state.calibration_frames.sort()  # why not keep the list sorted
+            app_state.calibration.calibration_frames.append(frame_idx)
+            app_state.calibration.calibration_frames.sort()
             print(f"Frame {frame_idx} added to calibration set.")
 
 
@@ -1189,7 +1189,7 @@ def _clear_calib_frames_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
 
     with app_state.lock:
-        app_state.calibration_state.calibration_frames.clear()
+        app_state.calibration.calibration_frames.clear()
     print("Calibration frame set has been cleared.")
 
 
@@ -1200,7 +1200,7 @@ def _navigate_calib_frame_callback(sender, app_data, user_data):
     direction = user_data["direction"]  # +1 for next or -1 for previous
 
     with app_state.lock:
-        calib_frames = sorted(app_state.calibration_state.calibration_frames)
+        calib_frames = sorted(app_state.calibration.calibration_frames)
         if not calib_frames:
             print("No calibration frames to navigate.")
             return
@@ -1229,8 +1229,7 @@ def _start_ga_callback(sender, app_data, user_data):
     queues = user_data["queues"]
 
     with app_state.lock:
-        app_state.calibration_state.best_fitness = float('inf')   # this needs to not be 0.0 on start
-        app_state.is_ga_running = True
+        app_state.calibration.best_fitness = float('inf')   # this needs to not be 0.0 on start
         ga_snapshot = app_state.get_ga_snapshot()
 
     queues.ga_command.put({
@@ -1246,9 +1245,6 @@ def _stop_ga_callback(sender, app_data, user_data):
 
     app_state = user_data["app_state"]
     queues = user_data["queues"]
-
-    with app_state.lock:
-        app_state.is_ga_running = False
 
     queues.ga_command.put({"action": "stop"})
     dpg.hide_item("ga_popup")
@@ -1334,9 +1330,10 @@ def _clear_calibration_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
 
     with app_state.lock:
-        app_state.calibration_state.best_individual = None
-        app_state.calibration_state.best_fitness = float('inf')
-        app_state.calibration_state.fundamental_matrices = None  # also clear dependent properties
+        # Create a new empty calibration dictionary to clear the state
+        empty_calib = {name: {} for name in app_state.camera_names}
+        app_state.calibration.update_calibration(empty_calib)
+        app_state.calibration.best_fitness = float('inf')
 
 
 # ============================================================================
@@ -1426,7 +1423,7 @@ def _update_control_panel(app_state: AppState):
     """Update control panel texts."""
 
     with app_state.lock:
-        calib_state = app_state.calibration_state
+        calibration = app_state.calibration
 
         dpg.set_value("frame_slider", app_state.frame_idx)
         dpg.set_value("current_frame_line", float(app_state.frame_idx))
@@ -1441,16 +1438,16 @@ def _update_control_panel(app_state: AppState):
         dpg.set_value("focus_text", f"Focus Mode: {focus_status}")
 
         # Update calibration button text
-        if app_state.frame_idx in calib_state.calibration_frames:
+        if app_state.frame_idx in calibration.calibration_frames:
             dpg.configure_item("toggle_calib_frame_button", label="Remove (C)")
         else:
             dpg.configure_item("toggle_calib_frame_button", label="Add (C)")
 
         dpg.set_value(
             "num_calib_frames_text",
-            f"Calibration Frames: {len(calib_state.calibration_frames)}"
+            f"Calibration Frames: {len(calibration.calibration_frames)}"
         )
-        dpg.set_value("fitness_text", f"Best Fitness: {calib_state.best_fitness:.2f}")
+        dpg.set_value("fitness_text", f"Best Fitness: {calibration.best_fitness:.2f}")
 
 
 def update_annotation_overlays(app_state: AppState):
@@ -1465,7 +1462,7 @@ def update_annotation_overlays(app_state: AppState):
         focus_mode = app_state.focus_selected_point
         show_all_labels = app_state.show_all_labels
         show_reprojection_error = app_state.show_reprojection_error
-        calib_state = app_state.calibration_state
+        calibration = app_state.calibration
 
         all_annotations = app_state.annotations[frame_idx]
         all_human_annotated = app_state.human_annotated[frame_idx]
@@ -1475,8 +1472,8 @@ def update_annotation_overlays(app_state: AppState):
 
     # Selected point data for special overlays
     p_idx = app_state.selected_point_idx
-    best_individual = calib_state.best_individual
-    f_mats = calib_state.fundamental_matrices
+    best_individual = calibration.best_calibration
+    f_mats = calibration.F_mats
     selected_annots = app_state.annotations[frame_idx, :, p_idx]
     point_3d = app_state.reconstructed_3d_points[frame_idx, p_idx]
 

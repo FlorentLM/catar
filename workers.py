@@ -28,14 +28,13 @@ class VideoReaderWorker(threading.Thread):
     def __init__(
         self,
         app_state: AppState,
-        video_paths: List[str],
         command_queue: queue.Queue,
         output_queues: List[queue.Queue],
         cache_reader: Optional[VideoCacheReader] = None,
     ):
         super().__init__(daemon=True, name="VideoReaderWorker")
         self.app_state = app_state
-        self.video_paths = video_paths
+        self.video_paths = app_state.videos.filepaths
         self.command_queue = command_queue
         self.output_queues = output_queues
         self.cache_reader = cache_reader
@@ -44,7 +43,7 @@ class VideoReaderWorker(threading.Thread):
 
         # We only need the on-the-fly cache if not using the cached reader
         if self.cache_reader is None:
-            self.onthefly_cache = [collections.OrderedDict() for _ in video_paths]
+            self.onthefly_cache = [collections.OrderedDict() for _ in self.video_paths]
             self.onthefly_cache_size = 300
         else:
             self.onthefly_cache = None
@@ -219,17 +218,17 @@ class TrackingWorker(threading.Thread):
         tracker: MultiObjectTracker,
         frames_in_queue: queue.Queue,
         progress_out_queue: queue.Queue,
-        video_paths: List[str],
         command_queue: queue.Queue,
         stop_batch_track: threading.Event
     ):
         super().__init__(daemon=True, name="TrackingWorker")
+
         self.app_state = app_state
         self.reconstructor = reconstructor
         self.tracker = tracker
         self.frames_in_queue = frames_in_queue
         self.progress_out_queue = progress_out_queue
-        self.video_paths = video_paths
+        self.video_paths = app_state.videos.filepaths
         self.command_queue = command_queue
         self.stop_batch_track_event = stop_batch_track
         self.shutdown_event = threading.Event()     # TODO Events should all be defined at the same place probably...
@@ -283,12 +282,10 @@ class TrackingWorker(threading.Thread):
         with self.app_state.lock:
             # Get only (x, y) coordinates
             annotations = self.app_state.annotations[frame_idx, ..., :2]
-            calibration = self.app_state.calibration_state.best_individual
-            cam_names = self.app_state.camera_names
+            calibration = self.app_state.calibration
 
-        if calibration is not None:
-            # Build projection matrices
-            proj_matrices = np.array([get_projection_matrix(calibration[name]) for name in cam_names])
+        if calibration.best_calibration is not None:
+            proj_matrices = calibration.P_mats
 
             # Triangulate all points for the current frame
             points_3d = projective.triangulate_points_from_projections(
@@ -467,11 +464,11 @@ class RenderingWorker(threading.Thread):
         scene = []
 
         with self.app_state.lock:
-            # Add camera visualisations
-            calibration = self.app_state.calibration_state.best_individual
+            calibration = self.app_state.calibration
 
-            if self.app_state.show_cameras_in_3d and calibration:
-                for cam_name, cam_params in calibration.items():
+            if self.app_state.show_cameras_in_3d and calibration.best_calibration:
+                for cam_name in calibration.camera_names:
+                    cam_params = calibration.get(cam_name)
                     scene.extend(
                         create_camera_visual(cam_params, cam_name, self.app_state.scene_centre)
                     )
