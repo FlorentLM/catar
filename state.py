@@ -219,7 +219,7 @@ class VideoState:
     @property
     def filepaths(self) -> List[str]:
         """Returns the ordered list of video paths."""
-        return [self._videos[name].path.as_posix() for name in self._camera_names]
+        return [str(self._videos[name].path) for name in self._camera_names]
 
     @property
     def filenames(self) -> List[str]:
