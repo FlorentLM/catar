@@ -15,7 +15,7 @@ from gui import create_ui, update_ui, resize_video_widgets
 from utils import load_and_match_videos
 from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker, BAWorker
 from viz_3d import Open3DVisualizer
-from video_cache import VideoCacheBuilder, VideoCacheReader
+from cache_utils import DiskCacheBuilder, DiskCacheReader
 
 from mokap.reconstruction.config import PipelineConfig
 from mokap.reconstruction.anatomy import StatsBootstrapper
@@ -236,7 +236,7 @@ def main():
     print("Checking for video cache...")
     cache_dir = config.DATA_FOLDER / 'video_cache'
 
-    builder = VideoCacheBuilder(
+    builder = DiskCacheBuilder(
         video_paths=app_state.videos.filepaths,
         cache_dir=str(cache_dir),
         ram_budget_gb=2.0
@@ -249,7 +249,7 @@ def main():
     if cache_exists:
         # Cache exists, try to load it immediately
         try:
-            cache_reader = VideoCacheReader(cache_dir=str(cache_dir))
+            cache_reader = DiskCacheReader(cache_dir=str(cache_dir))
             use_cache = True
             print(f"Using video cache: {cache_reader}")
 
@@ -341,7 +341,7 @@ def main():
             app_state,
             queues.command,
             [queues.frames_for_tracking, queues.frames_for_rendering],
-            cache_reader=app_state.cache_reader
+            diskcache_reader=app_state.cache_reader
         ),
         TrackingWorker(
             app_state,

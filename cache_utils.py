@@ -16,7 +16,7 @@ import blosc
 from multiprocessing import Pool, cpu_count, Event
 
 
-class VideoCacheBuilder:
+class DiskCacheBuilder:
     """Builds compressed frame cache for multi-view videos."""
 
     def __init__(
@@ -256,7 +256,7 @@ class VideoCacheBuilder:
             shutil.rmtree(self.cache_dir)
 
 
-class VideoCacheReader:
+class DiskCacheReader:
     """
     Fast random-access reader for cached multi-view video data.
     Thread-safe for concurrent reads.

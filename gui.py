@@ -1224,9 +1224,9 @@ def _show_cache_manager_callback(sender, app_data, user_data):
 
         print(f"Cache built successfully: {cache_dir}")
         try:
-            from video_cache import VideoCacheReader
-            cache_reader = VideoCacheReader(cache_dir=cache_dir)
-            app_state.cache_reader = cache_reader
+            from cache_utils import DiskCacheReader
+            cache_reader = DiskCacheReader(cache_dir=cache_dir)
+            app_state.diskcache_reader = cache_reader
 
             # Update the video reader worker to use the new cache
             queues.command.put({"action": "reload_cache", "cache_reader": cache_reader})

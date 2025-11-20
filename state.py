@@ -17,7 +17,7 @@ from mokap.utils.geometry import transforms
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from video_cache import VideoCacheReader
+    from cache_utils import DiskCacheReader
     CameraParameters = Dict[str, Union[float, np.ndarray]]
     CalibrationDict = Dict[str, CameraParameters]
 
@@ -251,7 +251,7 @@ class AppState:
         # Dedicated state objects
         self.videos: 'VideoState' = video_state
         self.calibration: 'CalibrationState' = calib_state
-        self.cache_reader: Optional['VideoCacheReader'] = None
+        self.cache_reader: Optional['DiskCacheReader'] = None
 
         # Read-only metadata derived from state objects for convenience
         self.video_metadata = self.videos.session_metadata

@@ -12,7 +12,7 @@ import dearpygui.dearpygui as dpg
 
 from state import Queues
 from utils import probe_video
-from video_cache import VideoCacheBuilder, VideoCacheReader
+from cache_utils import DiskCacheBuilder, DiskCacheReader
 
 
 class CacheManagerDialog:
@@ -64,7 +64,7 @@ class CacheManagerDialog:
         else:
             self._render_no_cache_view()
 
-    def _render_cache_exists_view(self, cache_reader: VideoCacheReader):
+    def _render_cache_exists_view(self, cache_reader: DiskCacheReader):
         """Renders the UI for when the cache is present."""
 
         info = cache_reader.get_cache_info()
@@ -150,7 +150,7 @@ class CacheManagerDialog:
             print("Build cache called but no video paths are loaded. Aborting.")
             return
 
-        builder = VideoCacheBuilder(video_paths=self.video_paths, cache_dir=str(self.data_folder / 'video_cache'))
+        builder = DiskCacheBuilder(video_paths=self.video_paths, cache_dir=str(self.data_folder / 'video_cache'))
         cache_exists, _ = builder.check_cache_exists()
 
         if cache_exists:
@@ -239,7 +239,7 @@ class CacheManagerDialog:
         cache_dir = str(self.data_folder / 'video_cache')
 
         try:
-            builder = VideoCacheBuilder(
+            builder = DiskCacheBuilder(
                 video_paths=self.video_paths,
                 cache_dir=cache_dir,
                 ram_budget_gb=0.5
@@ -296,7 +296,7 @@ class CacheManagerDialog:
             if self.manager:
                 self.manager.shutdown()
 
-    def _clear_ram_chunks(self, cache_reader: VideoCacheReader):
+    def _clear_ram_chunks(self, cache_reader: DiskCacheReader):
         """Clears in-memory cache and shows a confirmation."""
 
         cache_reader.clear_cache()

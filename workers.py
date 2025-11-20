@@ -14,8 +14,7 @@ import config
 from core import create_camera_visual, run_genetic_step, process_frame, run_refinement
 from state import AppState
 from viz_3d import Open3DVisualizer, SceneObject
-from video_cache import VideoCacheReader
-from utils import get_projection_matrix
+from cache_utils import DiskCacheReader
 
 from mokap.utils.geometry import projective
 from mokap.reconstruction.reconstruction import Reconstructor
@@ -30,19 +29,19 @@ class VideoReaderWorker(threading.Thread):
         app_state: AppState,
         command_queue: queue.Queue,
         output_queues: List[queue.Queue],
-        cache_reader: Optional[VideoCacheReader] = None,
+        diskcache_reader: Optional[DiskCacheReader] = None,
     ):
         super().__init__(daemon=True, name="VideoReaderWorker")
         self.app_state = app_state
         self.video_paths = app_state.videos.filepaths
         self.command_queue = command_queue
         self.output_queues = output_queues
-        self.cache_reader = cache_reader
+        self.diskcache_reader = diskcache_reader
         self.shutdown_event = threading.Event()
         self.video_captures = []
 
-        # We only need the on-the-fly cache if not using the cached reader
-        if self.cache_reader is None:
+        # We only need the on-the-fly cache if not using the disck cache reader
+        if self.diskcache_reader is None:
             self.onthefly_cache = [collections.OrderedDict() for _ in self.video_paths]
             self.onthefly_cache_size = 300
         else:
@@ -59,7 +58,7 @@ class VideoReaderWorker(threading.Thread):
     def _initialize_captures(self):
         """Open all video files (if not using cache)."""
         
-        if self.cache_reader is not None:
+        if self.diskcache_reader is not None:
             print("Video reader using cached frames.")
             return
 
@@ -74,12 +73,12 @@ class VideoReaderWorker(threading.Thread):
         Uses cache reader if available, otherwise falls back to cv2.VideoCapture with on-the-fly caching.
         """
 
-        # Fast path: use cache reader if available
-        if self.cache_reader is not None:
+        # Fast path: use disk cache reader if available
+        if self.diskcache_reader is not None:
             try:
-                return self.cache_reader.get_frame(frame_idx)
+                return self.diskcache_reader.get_frame(frame_idx)
             except Exception as e:
-                print(f"ERROR reading from cache: {e}")
+                print(f"ERROR reading from disk cache: {e}")
                 return []
 
         # Fallback: use cv2.VideoCapture with on the fly frame caching
@@ -142,7 +141,7 @@ class VideoReaderWorker(threading.Thread):
                     # Hotswap the cache reader
                     new_cache_reader = command.get("cache_reader")
                     if new_cache_reader is not None:
-                        self.cache_reader = new_cache_reader
+                        self.diskcache_reader = new_cache_reader
                         self.onthefly_cache = None  # on the fly cache is not needed in this case
                         print("VideoReaderWorker: Cache reader reloaded successfully")
             except queue.Empty:
@@ -200,7 +199,7 @@ class VideoReaderWorker(threading.Thread):
     def _cleanup(self):
         """Release all cv2 video captures."""
 
-        if self.cache_reader is None:
+        if self.diskcache_reader is None:
             for cap in self.video_captures:
                 cap.release()
         print("Video reader worker shut down.")
