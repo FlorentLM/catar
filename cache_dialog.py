@@ -11,7 +11,7 @@ from typing import Optional, Callable
 import dearpygui.dearpygui as dpg
 
 from state import Queues
-from utils import load_and_match_videos, probe_video
+from utils import probe_video
 from video_cache import VideoCacheBuilder, VideoCacheReader
 
 
@@ -38,7 +38,9 @@ class CacheManagerDialog:
         self.video_paths = []
         self.video_load_error: Optional[str] = None
         try:
-            self.video_paths, _, _ = load_and_match_videos(self.data_folder, self.video_format)
+            self.video_paths = self.app_state.videos.filepaths
+            if not self.video_paths:
+                raise FileNotFoundError("No video paths found in the current application state.")
         except Exception as e:
             self.video_load_error = str(e)
             print(f"CacheManagerDialog Error: {self.video_load_error}")
