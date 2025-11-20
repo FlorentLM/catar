@@ -99,11 +99,12 @@ class CalibrationState:
 
         self._calibrations = new_calibration
 
-        # A new calibration is considered "perfect" until evaluated by the GA
-        # TODO: This is not necessarily true
-        self.best_fitness = 0.0
+        # GA's first evaluation of a new population will set a real fitness baseline
+        self.best_fitness = float('inf')
+
         self._invalidate_cache()
         # TODO: Might be better to only invalidate what's actually changed
+
         print("Successfully applied new camera calibration.")
 
     def get(self, camera_name: str) -> 'CameraParameters':
