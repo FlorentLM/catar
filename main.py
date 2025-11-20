@@ -147,9 +147,16 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                 # Check if a better individual was found
                 if new_best_fitness < current_best_fitness:
                     new_individual = ga_progress["new_best_individual"]
+
                     with app_state.lock:
                         app_state.calibration.update_calibration(new_individual)
                         app_state.calibration.best_fitness = new_best_fitness
+
+                    # Notify the TrackingWorker
+                    queues.tracking_command.put({
+                        "action": "update_calibration",
+                        "calibration": new_individual
+                    })
 
                 # Update the GUI popup text
                 dpg.set_value("ga_generation_text", f"Generation: {ga_progress['generation']}")
@@ -171,6 +178,12 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                 with app_state.lock:
                     # Always update the main calibration
                     app_state.calibration.update_calibration(refined_calib)
+
+                    # Notify the TrackingWorker
+                    queues.tracking_command.put({
+                        "action": "update_calibration",
+                        "calibration": refined_calib
+                    })
 
                     # Conditionally update the 3D points if they were returned
                     refined_3d_points = ba_result.get('refined_3d_points')

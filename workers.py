@@ -237,13 +237,21 @@ class TrackingWorker(threading.Thread):
 
     def run(self):
         print("Tracking worker started.")
+
         while not self.shutdown_event.is_set():
             # Check for special commands (batch tracking)
             try:
                 command = self.command_queue.get_nowait()
+
                 if command.get("action") == "batch_track":
                     self._run_batch_tracking(command["start_frame"])
                     continue
+
+                elif command.get("action") == "update_calibration":
+                    print("TrackingWorker: Received calibration update command.")
+                    self.reconstructor.update_camera_parameters(command["calibration"])
+                    continue
+
             except queue.Empty:
                 pass
 
@@ -266,6 +274,7 @@ class TrackingWorker(threading.Thread):
 
             except queue.Empty:
                 continue
+
             except Exception as e:
                 print(f"ERROR in tracking worker: {e}")
                 import traceback
@@ -610,14 +619,11 @@ class BAWorker(multiprocessing.Process):
 
                     try:
                         results = run_refinement(snapshot)
-                        self.results_queue.put(results)
 
                         if self.stop_event.is_set():
                             print("BA worker finished, but a stop was requested. Discarding results.")
-                            self.results_queue.put(
-                                {"status": "cancelled", "message": "Bundle Adjustment was cancelled by the user."})
                         else:
-                            # if not cancelled, send the results as normal
+                            # if not cancelled send the results
                             self.results_queue.put(results)
 
                     except Exception as e:
