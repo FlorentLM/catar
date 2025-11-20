@@ -7,7 +7,6 @@ from typing import Dict, List, Tuple, Union
 import Levenshtein
 
 import numpy as np
-import polars as pl
 import jax.numpy as jnp
 from scipy.optimize import linear_sum_assignment
 
@@ -17,36 +16,6 @@ from mokap.utils.geometry import transforms
 
 CameraParameters = Dict[str, Union[float, np.ndarray]]
 CalibrationDict = Dict[str, CameraParameters]
-
-
-def annotations_to_polars(annotations_slice: np.ndarray, frame_idx: int,
-                          camera_names: List[str], point_names: List[str]) -> pl.DataFrame:
-    """
-    Converts a numpy slice of annotations (C, P, 3) into a Polars df for mokap.
-    Assumes slice shape is (num_cams, num_points, 3) where 3 is (x, y, score).
-    """
-    # TODO: Mokap should accept arrays and not just polars
-
-    rows = []
-    num_cams, num_points, _ = annotations_slice.shape
-
-    for c in range(num_cams):
-        for p in range(num_points):
-            # Check if x, y, or score is not nan (we only care if the point exists)
-            if not np.isnan(annotations_slice[c, p, 0]):
-                rows.append({
-                    "frame": frame_idx,
-                    "camera": camera_names[c],
-                    "keypoint": point_names[p],
-                    "x": annotations_slice[c, p, 0],
-                    "y": annotations_slice[c, p, 1],
-                    "score": annotations_slice[c, p, 2],
-                })
-    if not rows:
-        return pl.DataFrame(
-            schema={'frame': pl.Int64, 'camera': pl.Utf8, 'keypoint': pl.Utf8, 'x': pl.Float64, 'y': pl.Float64,
-                    'score': pl.Float64})
-    return pl.DataFrame(rows)
 
 
 # ============================================================================

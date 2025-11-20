@@ -13,7 +13,7 @@ from mokap.utils.geometry import projective
 from mokap.utils.geometry import transforms
 from mokap.utils.geometry.fitting import quaternion_average
 
-from utils import annotations_to_polars, reproject_points
+from utils import reproject_points
 from viz_3d import SceneObject
 import config
 from state import AppState, CalibrationState, VideoState
@@ -216,13 +216,12 @@ def process_frame(
         current_frames: List[np.ndarray]
 ):
     """
-    Runs the full pileline on one frame.
+    Runs the full pipeline on one frame.
     """
 
     with app_state.lock:
         calibration = app_state.calibration
         point_names = app_state.point_names
-        camera_names = app_state.camera_names
 
     # Get geometric prediction and confidence score from LK tracking
     annotations_from_lk = track_points(
@@ -234,9 +233,13 @@ def process_frame(
 
     # Run Mokap reconstruction using LK results and their confidence score
     # annotations_from_lk is (C, P, 3) where 3 is (x, y, confidence)
-    df_frame = annotations_to_polars(annotations_from_lk, frame_idx, camera_names, point_names)
-    points_soup = reconstructor.reconstruct_frame(df_frame=df_frame, keypoint_names=point_names)
-    print(f"MOKAP RECON:   Input {len(df_frame)} 2D points -> Produced a soup of {len(points_soup)} 3D candidates.")
+    points_soup = reconstructor.reconstruct_frame_array(
+        array_frame=annotations_from_lk,
+        frame_idx=frame_idx,
+        keypoint_names=point_names
+    )
+    num_input_points = np.sum(~np.isnan(annotations_from_lk[..., 0]))
+    print(f"MOKAP RECON:   Input {num_input_points} 2D points -> Produced a soup of {len(points_soup)} 3D candidates.")
 
     active_tracklets = tracker.update(points_soup, frame_idx)
 
