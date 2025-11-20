@@ -9,6 +9,7 @@ import shutil
 import threading
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import cv2
 import numpy as np
@@ -260,13 +261,18 @@ class DiskCacheBuilder:
 class DiskCacheReader:
     """
     Fast random-access reader for cached multi-view video data.
-    Thread-safe for concurrent reads.
+    Thread-safe for concurrent reads with background prefetching.
     """
 
     def __init__(self, cache_dir: str = 'multiview_chunks_per_video', memory_budget_gb: float = 2.0):
         self.cache_dir = cache_dir
         self.metadata_file = os.path.join(cache_dir, 'cache_metadata.json')
         self._lock = threading.Lock()
+
+        # Background loader
+        # Blosc releases GIL, so thread pool works well for parallel decompression
+        self._executor = ThreadPoolExecutor(max_workers=min(4, cpu_count()))
+        self._loading_futures: Dict[Tuple[int, int], Future] = {}
 
         # Load metadata
         if not os.path.exists(self.metadata_file):
@@ -303,9 +309,8 @@ class DiskCacheReader:
         budget_bytes = memory_budget_gb * (1024 ** 3)
         calculated_limit = int(budget_bytes // chunk_bytes)
 
-        # Ensure we have at least 2 chunks in memory for smooth scrolling,
-        # but respect the hard reality of RAM if the budget is tiny
-        self._cache_size_limit = max(2, calculated_limit)
+        # Ensure we have at least 2 chunks per video in memory for smooth scrolling
+        self._cache_size_limit = max(self.num_views * 2, calculated_limit)
 
         print(f"VideoCacheReader initialized: {self.num_views} views, "
               f"{self.frame_count} frames, {self.width}x{self.height}")
@@ -315,7 +320,6 @@ class DiskCacheReader:
 
         self._cache_access_order: List[Tuple[int, int]] = []
 
-
     def _get_chunk_index(self, frame_idx: int) -> int:
         """Convert frame index to chunk index."""
         return frame_idx // self.frames_per_chunk
@@ -324,21 +328,12 @@ class DiskCacheReader:
         """Get frame position within its chunk."""
         return frame_idx % self.frames_per_chunk
 
-    def _load_chunk(self, video_idx: int, chunk_idx: int) -> np.ndarray:
-        """Load a chunk from disk, using cache if available."""
+    def _load_chunk_from_disk_internal(self, video_idx: int, chunk_idx: int) -> np.ndarray:
+        """Actual disk I/O and decompression logic (stateless)."""
 
         cache_key = (video_idx, chunk_idx)
-
-        with self._lock:
-            # Check cache
-            if cache_key in self._chunk_cache:
-                if cache_key in self._cache_access_order:
-                    self._cache_access_order.remove(cache_key)
-                self._cache_access_order.append(cache_key)
-                return self._chunk_cache[cache_key]
-
-        # Load from disk (outside lock for parallelism)
         chunk_file = self._chunk_index.get(cache_key)
+
         if chunk_file is None:
             raise ValueError(f"Chunk not found: video {video_idx}, chunk {chunk_idx}")
 
@@ -348,6 +343,7 @@ class DiskCacheReader:
         with open(chunk_file, 'rb') as f:
             compressed = f.read()
 
+        # Decompress (expensive operation)
         decompressed = blosc.decompress(compressed)
 
         # Determine chunk size
@@ -359,18 +355,103 @@ class DiskCacheReader:
             dtype=np.uint8
         ).reshape(frames_in_chunk, self.height, self.width, 3)
 
-        # Add to cache
-        with self._lock:
-            self._chunk_cache[cache_key] = chunk_array
-            self._cache_access_order.append(cache_key)
+        return chunk_array
 
-            # Limit cache size
-            while len(self._cache_access_order) > self._cache_size_limit:
-                oldest_key = self._cache_access_order.pop(0)
-                if oldest_key in self._chunk_cache:
-                    del self._chunk_cache[oldest_key]
+    def _load_chunk(self, video_idx: int, chunk_idx: int) -> np.ndarray:
+        """
+        Get a chunk from cache, or load it.
+        If a background load is pending for this chunk, wait for it.
+        """
+        cache_key = (video_idx, chunk_idx)
+
+        # Check existing cache (fast)
+        with self._lock:
+            if cache_key in self._chunk_cache:
+                # Update LRU
+                if cache_key in self._cache_access_order:
+                    self._cache_access_order.remove(cache_key)
+                self._cache_access_order.append(cache_key)
+                return self._chunk_cache[cache_key]
+
+            # Check if currently loading in background
+            future = self._loading_futures.get(cache_key)
+
+        # If loading, wait for it (outside lock)
+        if future:
+            try:
+                chunk_array = future.result()
+                # Cleanup future
+                with self._lock:
+                    if cache_key in self._loading_futures:
+                        del self._loading_futures[cache_key]
+
+                    # Cache the result
+                    self._add_to_cache_safe(cache_key, chunk_array)
+                return chunk_array
+            except Exception as e:
+                print(f"Error in background chunk load: {e}")
+                # Fallthrough to synchronous load on error
+
+        # Synchronous load (slow fallback)
+        chunk_array = self._load_chunk_from_disk_internal(video_idx, chunk_idx)
+
+        with self._lock:
+            self._add_to_cache_safe(cache_key, chunk_array)
 
         return chunk_array
+
+    def _add_to_cache_safe(self, key: Tuple[int, int], data: np.ndarray):
+        """Internal helper to add to cache and enforce limits."""
+        # Assumes lock is held by caller
+        self._chunk_cache[key] = data
+        if key in self._cache_access_order:
+            self._cache_access_order.remove(key)
+        self._cache_access_order.append(key)
+
+        # Enforce size limit
+        while len(self._cache_access_order) > self._cache_size_limit:
+            oldest_key = self._cache_access_order.pop(0)
+            # Don't evict if it's the one we just added (edge case with tiny cache)
+            if oldest_key == key and len(self._cache_access_order) > 0:
+                self._cache_access_order.append(key)
+                oldest_key = self._cache_access_order.pop(0)
+
+            if oldest_key in self._chunk_cache:
+                del self._chunk_cache[oldest_key]
+
+            # Also cancel any pending future for evicted key to save CPU
+            if oldest_key in self._loading_futures:
+                self._loading_futures[oldest_key].cancel()
+                del self._loading_futures[oldest_key]
+
+    def _trigger_prefetch(self, frame_idx: int):
+        """Check if we need to preload the next chunk."""
+
+        chunk_idx = self._get_chunk_index(frame_idx)
+        frame_in_chunk = self._get_frame_in_chunk(frame_idx)
+
+        # If we are past 60% of the chunk, verify next chunk is loading
+        if frame_in_chunk > (self.frames_per_chunk * 0.6):
+            next_chunk_idx = chunk_idx + 1
+
+            # Determine max chunks
+            # We assume all videos have same chunks
+            total_chunks = self.metadata['videos'][0]['num_chunks']
+
+            if next_chunk_idx >= total_chunks:
+                return
+
+            with self._lock:
+                for view_idx in range(self.num_views):
+                    next_key = (view_idx, next_chunk_idx)
+
+                    # Skip if already cached or already loading
+                    if next_key in self._chunk_cache or next_key in self._loading_futures:
+                        continue
+
+                    # Submit to background thread
+                    future = self._executor.submit(self._load_chunk_from_disk_internal, view_idx, next_chunk_idx)
+                    self._loading_futures[next_key] = future
 
     def get_frame(self, frame_idx: int, views: Optional[List[int]] = None) -> List[np.ndarray]:
         """
@@ -381,11 +462,14 @@ class DiskCacheReader:
             views: List of view indices. If None, get all views.
 
         Returns:
-            List of numpy arrays (H, W, 3) BGR format (like cv2.videocapture)
+            List of numpy arrays (H, W, 3) BGR format
         """
 
         if frame_idx < 0 or frame_idx >= self.frame_count:
             raise ValueError(f"Frame index {frame_idx} out of range")
+
+        # Trigger background loading of next chunk if needed
+        self._trigger_prefetch(frame_idx)
 
         if views is None:
             views = list(range(self.num_views))
@@ -396,19 +480,10 @@ class DiskCacheReader:
         frames = []
         for view_idx in views:
             chunk = self._load_chunk(view_idx, chunk_idx)
-            frames.append(chunk[frame_in_chunk].copy())
+            # frames.append(chunk[frame_in_chunk].copy())
+            frames.append(chunk[frame_in_chunk]) # much faster without copy, but consumers should never touch the data
 
         return frames
-
-    def preload_range(self, start_frame: int, end_frame: int):
-        """Preload chunks covering a frame range."""
-
-        start_chunk = self._get_chunk_index(start_frame)
-        end_chunk = self._get_chunk_index(end_frame - 1)
-
-        for chunk_idx in range(start_chunk, end_chunk + 1):
-            for view_idx in range(self.num_views):
-                self._load_chunk(view_idx, chunk_idx)
 
     def clear_cache(self):
         """Clear the chunk cache to free memory."""
@@ -416,6 +491,7 @@ class DiskCacheReader:
         with self._lock:
             self._chunk_cache.clear()
             self._cache_access_order.clear()
+            self._loading_futures.clear()
 
     def get_cache_info(self) -> dict:
         """Get info about the cache."""
@@ -440,9 +516,7 @@ class DiskCacheReader:
     def get_loaded_chunk_ranges(self) -> List[Tuple[int, int]]:
         """
         Get list of frame ranges currently loaded in RAM.
-        Returns list of tuples (start_frame, end_frame)
         """
-
         with self._lock:
             if not self._chunk_cache:
                 return []
@@ -456,7 +530,6 @@ class DiskCacheReader:
             if not chunk_indices:
                 return []
 
-            # Convert to frame ranges
             ranges = []
             for chunk_idx in chunk_indices:
                 start_frame = chunk_idx * self.frames_per_chunk
@@ -467,10 +540,10 @@ class DiskCacheReader:
 
     def delete_cache(self):
         """Delete all cache files from disk."""
-        import shutil
         if Path(self.cache_dir).exists():
             shutil.rmtree(self.cache_dir)
             print(f"Cache deleted: {self.cache_dir}")
+        self._executor.shutdown(wait=False)
 
     def __repr__(self) -> str:
         return (

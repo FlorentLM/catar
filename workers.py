@@ -44,23 +44,20 @@ class VideoReaderWorker(threading.Thread):
         if self.diskcache_reader is None:
             self.onthefly_cache = [collections.OrderedDict() for _ in self.video_paths]
             
-            # Calculate how many frames we can hold in memory comfortably.
             # Target budget: 1.5 GB total for all videos combined in this worker.
             target_budget_bytes = 1.5 * 1024**3
-            
+
             # Frame size = W * H * 3 (bytes)
             meta = self.app_state.video_metadata
             frame_bytes = meta['width'] * meta['height'] * 3
-            
+
             total_capacity_frames = target_budget_bytes // frame_bytes
-            
-            # Divide capacity by number of videos
             num_videos = len(self.video_paths)
             per_video_capacity = int(total_capacity_frames // num_videos)
             
             # Ensure a minimum of 10 frames per video, but cap at the calculated max
             self.onthefly_cache_size = max(10, per_video_capacity)
-            
+
             print(f"VideoReaderWorker: RAM Budget 1.5GB. Frame size: {frame_bytes/1024**2:.2f}MB.")
             print(f"VideoReaderWorker: On-the-fly cache set to {self.onthefly_cache_size} frames per video.")
             
@@ -90,7 +87,7 @@ class VideoReaderWorker(threading.Thread):
     def _get_frames(self, frame_idx: int, is_sequential: bool) -> List[np.ndarray]:
         """
         Gets frames for a specific index.
-        Uses cache reader if available, otherwise falls back to cv2.VideoCapture with on-the-fly caching.
+        Uses cache reader if available, otherwise falls back to cv2.VideoCapture.
         """
 
         # Fast path: use disk cache reader if available
@@ -101,7 +98,7 @@ class VideoReaderWorker(threading.Thread):
                 print(f"ERROR reading from disk cache: {e}")
                 return []
 
-        # Fallback: use cv2.VideoCapture with on the fly frame caching
+        # Fallback: use cv2.VideoCapture
         all_frames = []
         for i, cap in enumerate(self.video_captures):
             cache = self.onthefly_cache[i]
@@ -150,7 +147,14 @@ class VideoReaderWorker(threading.Thread):
 
         prev_frame_idx = -1
 
+        # Get FPS from metadata to limit playback speed
+        fps = self.app_state.video_metadata.get('fps', 30.0)
+        if fps <= 0: fps = 30.0
+        target_frame_duration = 1.0 / fps
+
         while not self.shutdown_event.is_set():
+            loop_start_time = time.perf_counter()
+
             try:
                 command = self.command_queue.get_nowait()
                 action = command.get("action")
@@ -201,7 +205,15 @@ class VideoReaderWorker(threading.Thread):
                         self.app_state.frame_idx += 1
                     else:
                         self.app_state.paused = True
+
+                # Calculate how much time weas spent working, sleep the rest
+                work_duration = time.perf_counter() - loop_start_time
+                sleep_duration = target_frame_duration - work_duration
+
+                if sleep_duration > 0:
+                    time.sleep(sleep_duration)
             else:
+                # If paused, sleep a standard amount to save CPU
                 time.sleep(0.01)
 
     def _distribute_frames(self, frame_data: dict):
