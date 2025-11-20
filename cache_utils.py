@@ -185,6 +185,7 @@ class DiskCacheBuilder:
         fps = video_info[0]['fps']
 
         frame_size_bytes = width * height * 3
+        # Default builder RAM budget is 0.5GB per chunk (uncompressed)
         frames_per_chunk = max(1, int((self.ram_budget_gb * (1024 ** 3)) // frame_size_bytes))
 
         print(f"Frames per chunk: {frames_per_chunk}")
@@ -262,7 +263,7 @@ class DiskCacheReader:
     Thread-safe for concurrent reads.
     """
 
-    def __init__(self, cache_dir: str = 'multiview_chunks_per_video'):
+    def __init__(self, cache_dir: str = 'multiview_chunks_per_video', memory_budget_gb: float = 2.0):
         self.cache_dir = cache_dir
         self.metadata_file = os.path.join(cache_dir, 'cache_metadata.json')
         self._lock = threading.Lock()
@@ -293,11 +294,27 @@ class DiskCacheReader:
 
         # LRU cache for chunks
         self._chunk_cache: Dict[Tuple[int, int], np.ndarray] = {}
-        self._cache_size_limit = 20  # keep last N chunks in memory
-        self._cache_access_order: List[Tuple[int, int]] = []
+
+        # Calculate size of one decompressed chunk in RAM
+        # Frame bytes = W * H * 3
+        chunk_bytes = self.width * self.height * 3 * self.frames_per_chunk
+
+        # Calculate how many chunks fit in the memory budget
+        budget_bytes = memory_budget_gb * (1024 ** 3)
+        calculated_limit = int(budget_bytes // chunk_bytes)
+
+        # Ensure we have at least 2 chunks in memory for smooth scrolling,
+        # but respect the hard reality of RAM if the budget is tiny
+        self._cache_size_limit = max(2, calculated_limit)
 
         print(f"VideoCacheReader initialized: {self.num_views} views, "
               f"{self.frame_count} frames, {self.width}x{self.height}")
+        print(f"Cache RAM Budget: {memory_budget_gb:.1f} GB. "
+              f"Chunk size: {chunk_bytes/1024**2:.1f} MB. "
+              f"Keeping max {self._cache_size_limit} chunks in RAM.")
+
+        self._cache_access_order: List[Tuple[int, int]] = []
+
 
     def _get_chunk_index(self, frame_idx: int) -> int:
         """Convert frame index to chunk index."""
@@ -416,6 +433,7 @@ class DiskCacheReader:
             'frames_per_chunk': self.frames_per_chunk,
             'total_chunks': sum(video['num_chunks'] for video in self.metadata['videos']),
             'chunks_in_ram': len(self._chunk_cache),
+            'ram_limit_chunks': self._cache_size_limit,
             'creation_time': self.metadata.get('creation_time', 'Unknown'),
         }
 

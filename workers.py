@@ -40,10 +40,30 @@ class VideoReaderWorker(threading.Thread):
         self.shutdown_event = threading.Event()
         self.video_captures = []
 
-        # We only need the on-the-fly cache if not using the disck cache reader
+        # We only need the on-the-fly cache if not using the disk cache reader
         if self.diskcache_reader is None:
             self.onthefly_cache = [collections.OrderedDict() for _ in self.video_paths]
-            self.onthefly_cache_size = 300
+            
+            # Calculate how many frames we can hold in memory comfortably.
+            # Target budget: 1.5 GB total for all videos combined in this worker.
+            target_budget_bytes = 1.5 * 1024**3
+            
+            # Frame size = W * H * 3 (bytes)
+            meta = self.app_state.video_metadata
+            frame_bytes = meta['width'] * meta['height'] * 3
+            
+            total_capacity_frames = target_budget_bytes // frame_bytes
+            
+            # Divide capacity by number of videos
+            num_videos = len(self.video_paths)
+            per_video_capacity = int(total_capacity_frames // num_videos)
+            
+            # Ensure a minimum of 10 frames per video, but cap at the calculated max
+            self.onthefly_cache_size = max(10, per_video_capacity)
+            
+            print(f"VideoReaderWorker: RAM Budget 1.5GB. Frame size: {frame_bytes/1024**2:.2f}MB.")
+            print(f"VideoReaderWorker: On-the-fly cache set to {self.onthefly_cache_size} frames per video.")
+            
         else:
             self.onthefly_cache = None
 
