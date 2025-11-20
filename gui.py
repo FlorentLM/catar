@@ -1816,20 +1816,20 @@ def update_histogram(app_state: AppState):
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
         point_name = app_state.point_names[selected_idx]
-        annotations = app_state.annotations.copy()
         num_cams = app_state.video_metadata['num_videos']
 
-    # Annotation array is (F, C, P, 3), check for nans in x or y
-    is_valid_annotation = np.all(~np.isnan(annotations[..., :2]), axis=-1)
+        # Annotation array is (F, C, P, 3), check for nans in x or y
+        if focus_mode:
+            is_valid = np.all(~np.isnan(app_state.annotations[:, :, selected_idx, :2]), axis=-1)
+        else:
+            is_valid = np.all(~np.isnan(app_state.annotations[:, :, :, :2]), axis=-1)
 
     if focus_mode:
-        # Count only selected point (shape F, C)
-        counts = np.sum(is_valid_annotation[:, :, selected_idx], axis=1)
+        counts = np.sum(is_valid, axis=1)
         dpg.configure_item("histogram_y_axis", label=f"'{point_name}' Annots")
         dpg.set_axis_limits("histogram_y_axis", 0, num_cams)
     else:
-        # all points (shape F)
-        counts = np.sum(is_valid_annotation, axis=(1, 2))
+        counts = np.sum(is_valid, axis=(1, 2))
         dpg.configure_item("histogram_y_axis", label="Total Annots")
         if counts.max() > 0:
             dpg.set_axis_limits_auto("histogram_y_axis")
