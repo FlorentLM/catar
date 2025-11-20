@@ -25,15 +25,15 @@ if TYPE_CHECKING:
 @dataclass
 class VideoInfo:
     """Container for a single video's data."""
+
     path: Path
     filename: str
-    metadata: Dict[str, Any]
-
-    # TODO: Extract metadata fields
-    # width: int
-    # height: int
-    # nb_frames: int
-    # fps: float
+    width: int
+    height: int
+    num_frames: int
+    fps: float
+    fourcc: str
+    duration: float
 
 
 @dataclass
@@ -195,14 +195,20 @@ class VideoState:
         # The first video's metadata is used as the reference
         self.session_metadata = probe_video(video_paths[0])
         self.session_metadata['num_videos'] = len(video_paths)
-        # TODO: Maybe store metadata in separate fields in the dataclass and add properties here
 
-        for name, path in zip(camera_names, video_paths):
-            path = Path(path)
+        for name, path_str in zip(camera_names, video_paths):
+            path = Path(path_str)
+            metadata = probe_video(path)
+
             self._videos[name] = VideoInfo(
                 path=path.resolve(),
                 filename=path.name,
-                metadata=probe_video(path)  # could reuse session_metadata if all videos are identical
+                width=metadata['width'],
+                height=metadata['height'],
+                num_frames=metadata['num_frames'],
+                fps=metadata['fps'],
+                fourcc=metadata['fourcc'],
+                duration=metadata['duration']
             )
 
     @property

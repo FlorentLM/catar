@@ -804,8 +804,9 @@ def _image_mouse_down_callback(sender, app_data, user_data):
         frame_idx = app_state.frame_idx
         p_idx = app_state.selected_point_idx
         annotations = app_state.annotations[frame_idx, cam_idx, :, :]
-        video_w = app_state.video_metadata['width']
-        video_h = app_state.video_metadata['height']
+        video_info = app_state.videos.get(app_state.camera_names[cam_idx])
+        video_w = video_info.width
+        video_h = video_info.height
 
     # Get mouse pos (image coordinates)
     container_pos = dpg.get_item_rect_min(drawlist_tag)
@@ -895,9 +896,10 @@ def _image_drag_callback(sender, app_data, user_data):
         p_idx = app_state.drag_state["p_idx"]
         frame_idx = app_state.frame_idx
 
-        # Get all data needed for rendering overlays
-        video_w = app_state.video_metadata['width']
-        video_h = app_state.video_metadata['height']
+        video_info = app_state.videos.get(app_state.camera_names[cam_idx])
+        video_w = video_info.width
+        video_h = video_info.height
+
         current_frames = app_state.current_video_frames
         all_annotations = app_state.annotations[frame_idx]
         best_calib = app_state.calibration.best_calibration
@@ -1567,9 +1569,8 @@ def update_annotation_overlays(app_state: AppState):
     with app_state.lock:
 
         frame_idx = app_state.frame_idx
-        num_videos = app_state.video_metadata['num_videos']
-        video_w = app_state.video_metadata['width']
-        video_h = app_state.video_metadata['height']
+        num_videos = len(app_state.camera_names)
+
         focus_mode = app_state.focus_selected_point
         show_all_labels = app_state.show_all_labels
         show_reprojection_error = app_state.show_reprojection_error
@@ -1598,8 +1599,13 @@ def update_annotation_overlays(app_state: AppState):
         dpg.delete_item(layer_tag, children_only=True)
 
         widget_size = dpg.get_item_rect_size(drawlist_tag)
+
         if widget_size[0] == 0:
             continue
+
+        video_info = app_state.videos.get(camera_names[cam_idx])
+        video_w = video_info.width
+        video_h = video_info.height
 
         scale_x = widget_size[0] / video_w
         scale_y = widget_size[1] / video_h
