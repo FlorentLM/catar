@@ -264,6 +264,7 @@ class AppState:
         self.is_seeking: bool = False
 
         # UI state
+        self.current_grid_cols: int = 0
         self.selected_point_idx: int = 0
         self.focus_selected_point: bool = False
         self.show_cameras_in_3d: bool = True

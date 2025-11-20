@@ -27,10 +27,14 @@ def create_ui(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
 
     dpg.create_context()
 
-    # Calculate window dimensions
-    num_videos = app_state.video_metadata['num_videos']
-    num_items = num_videos + 1  # Videos + 3D view
-    num_rows = (num_items + config.GRID_COLS - 1) // config.GRID_COLS
+    nb_videos = app_state.video_metadata['num_videos']
+    if nb_videos > 0:
+        # Calculate the most 'square' layout
+        n_cols = int(np.ceil(np.sqrt(nb_videos)))
+        n_rows = int(np.ceil(nb_videos / n_cols))
+    else:
+        n_cols = 1
+        n_rows = 1
 
     video_ar = app_state.video_metadata['width'] / app_state.video_metadata['height']
     item_width = 480
@@ -38,11 +42,11 @@ def create_ui(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
 
     window_width = int(
         config.CONTROL_PANEL_WIDTH +
-        (item_width * config.GRID_COLS) +
-        (config.PADDING * (config.GRID_COLS + 2))
+        (item_width * n_cols) +
+        (config.PADDING * (n_cols + 2))
     )
     window_height = int(
-        (item_height * num_rows) +
+        (item_height * n_rows) +
         config.BOTTOM_PANEL_HEIGHT_FULL +
         100
     )
@@ -63,7 +67,7 @@ def create_ui(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                     _create_control_panel(app_state, queues, open3d_viz)
 
                 with dpg.child_window(width=-1, tag="video_grid_window"):
-                    _create_video_grid(app_state)
+                    _create_video_grid(app_state, n_cols, n_rows)
 
         with dpg.child_window(tag="bottom_panel_window", height=config.BOTTOM_PANEL_HEIGHT_FULL, no_scrollbar=True):
             _create_bottom_panel(app_state)
@@ -412,24 +416,21 @@ def _create_bottom_panel(app_state: AppState):
     dpg.bind_item_handler_registry("annotation_plot", "histogram_handler")
 
 
-def _create_video_grid(app_state: AppState):
+def _create_video_grid(app_state: AppState, n_cols: int, n_rows: int):
     """Create grid of videos."""
 
-    num_videos = app_state.video_metadata['num_videos']
-    num_items = num_videos
+    nb_videos = app_state.video_metadata['num_videos']
 
-    with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingStretchProp):
-        for _ in range(config.GRID_COLS):
+    with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingStretchProp, tag="video_table"):
+        for _ in range(n_cols):
             dpg.add_table_column()
 
-        num_rows = (num_items + config.GRID_COLS - 1) // config.GRID_COLS
-
-        for row in range(num_rows):
+        for row in range(n_rows):
             with dpg.table_row():
-                for col in range(config.GRID_COLS):
-                    idx = row * config.GRID_COLS + col
+                for col in range(n_cols):
+                    idx = row * n_cols + col
 
-                    if idx < num_videos:
+                    if idx < nb_videos:
                         _create_video_cell(idx, app_state)
 
 
@@ -1490,26 +1491,36 @@ def resize_video_widgets(sender, app_data, user_data):
 
     app_state = user_data["app_state"]
 
+    if not dpg.does_item_exist("video_table"):
+        return
+
     grid_width = dpg.get_item_rect_size("video_grid_window")[0]
-    item_width = (grid_width / config.GRID_COLS) - 20
-    num_videos = app_state.video_metadata['num_videos']
+
+    n_cols = len(dpg.get_item_children("video_table", slot=0))
+    if n_cols == 0:
+        return
+
+    item_width = (grid_width / n_cols) - 20
+
+    nb_videos = app_state.video_metadata['num_videos']
 
     if item_width <= 0:
         return
 
     aspect_ratio = app_state.video_metadata['width'] / app_state.video_metadata['height']
     item_height = item_width / aspect_ratio
-    frame_thicnkess = 2
+    frame_thickness = 2
 
     # Resize video views
-    for i in range(num_videos):
-        dpg.configure_item(f"drawlist_{i}", width=item_width, height=item_height)
-        dpg.configure_item(
-            f"video_image_{i}",
-            pmin=(frame_thicnkess, frame_thicnkess),
-            pmax=(item_width - frame_thicnkess, item_height - frame_thicnkess)
-        )
-        dpg.configure_item(f"video_border_{i}", pmax=(item_width, item_height))
+    for i in range(nb_videos):
+        if dpg.does_item_exist(f"drawlist_{i}"):
+            dpg.configure_item(f"drawlist_{i}", width=item_width, height=item_height)
+            dpg.configure_item(
+                f"video_image_{i}",
+                pmin=(frame_thickness, frame_thickness),
+                pmax=(item_width - frame_thickness, item_height - frame_thickness)
+            )
+            dpg.configure_item(f"video_border_{i}", pmax=(item_width, item_height))
 
 def update_ui(app_state: AppState):
     """Update all UI elements."""
