@@ -259,8 +259,6 @@ def process_frame(
     with app_state.lock:
         calibration = app_state.calibration
         point_names = app_state.point_names
-        camera_names = app_state.camera_names
-        num_cams = len(camera_names)
 
         # Get human annotations as a source of evidence
         human_flags_for_frame = app_state.human_annotated[frame_idx].copy()
@@ -376,7 +374,7 @@ def track_points(
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
 
-        # Get previous annotations WITH confidence this time
+        # Get previous annotations
         annotations_prev_full = app_state.annotations[frame_idx - 1].copy()
         annotations_prev = annotations_prev_full[..., :2]  # this is used for LK input
         calibration = app_state.calibration
@@ -457,7 +455,6 @@ def track_points(
                 if len(consensus_peer_indices) < 2:
                     continue
 
-                # Prepare data for a single, batched triangulation call.
                 consensus_annots = output_annotations[consensus_peer_indices, p_idx, :2]
                 consensus_proj_mats = calibration.P_mats[consensus_peer_indices]
 
@@ -897,6 +894,10 @@ def _prepare_ba_data(snapshot: Dict[str, Any], is_independent: bool) -> Dict[str
         if sum(num_points_per_frame) == 0:
             raise ValueError("Scaffolding triangulation failed. No valid 3D points could be generated.")
 
+        # Safe padding value (centroid) to prevent numerical instability when projecting invalid points
+        all_valid_3d = np.concatenate(per_frame_3d)
+        safe_point = np.mean(all_valid_3d, axis=0)
+
         N_max = max(num_points_per_frame) if num_points_per_frame else 0
 
         padded_3d = np.full((P, N_max, 3), np.nan, dtype=np.float32)
@@ -911,7 +912,7 @@ def _prepare_ba_data(snapshot: Dict[str, Any], is_independent: bool) -> Dict[str
         return {
             "image_points": np.nan_to_num(padded_2d),
             "visibility_mask": ~np.isnan(padded_2d[:, :, :, 0]),
-            "object_points_initial": np.nan_to_num(padded_3d.reshape(-1, 3), nan=1e6),
+            "object_points_initial": np.nan_to_num(padded_3d.reshape(-1, 3), nan=safe_point),
             "initial_structure_for_masking": None
         }
 
