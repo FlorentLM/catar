@@ -77,7 +77,7 @@ class Queues:
 
 
 class CalibrationState:
-    """Owns all camera calibration and provides efficient, cached access."""
+    """Owns all camera calibration with cached access."""
 
     def __init__(self, initial_calibration: 'CalibrationDict', camera_names: List[str]):
         self._calibrations: 'CalibrationDict' = initial_calibration
@@ -238,10 +238,6 @@ class VideoState:
 class AppState:
     """
     Thread-safe container for application state.
-
-    This refactored version delegates the management of video and calibration
-    data to dedicated state objects (VideoState and CalibrationState) for
-    improved robustness and clarity.
     """
 
     def __init__(self, video_state: 'VideoState', calib_state: 'CalibrationState', skeleton_config: Dict[str, Any]):
