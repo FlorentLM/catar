@@ -208,14 +208,15 @@ def _fuse_annotations(
 
 def process_frame(
         frame_idx: int,
+        source_frame_idx: int,
         app_state: 'AppState',
         reconstructor: 'Reconstructor',
         tracker: 'MultiObjectTracker',
-        prev_frames: List[np.ndarray],
-        current_frames: List[np.ndarray]
+        source_frames: List[np.ndarray],
+        dest_frames: List[np.ndarray]
 ):
     """
-    Runs the full pipeline on one frame.
+    Runs the full pipeline (get the state of 'frame_idx' based on 'source_frame_idx').
     """
 
     with app_state.lock:
@@ -223,9 +224,9 @@ def process_frame(
         point_names = app_state.point_names
 
     # Get geometric prediction and confidence score from LK tracking
-    # annotations_from_lk is (C, P, 3) where 3 is (x, y, confidence)
+    # annotations_from_lk is (C, P, 3) where 3 is (x, y, confidence) for the destination frame
     annotations_from_lk = track_points(
-        app_state, prev_frames, current_frames, frame_idx
+        app_state, source_frames, dest_frames, source_frame_idx, frame_idx
     )
 
     # Prepare input for Mokap Reconstructor
@@ -234,7 +235,10 @@ def process_frame(
     cam_indices, point_indices = np.where(~np.isnan(annotations_from_lk[..., 0]))
 
     num_lk_points = len(cam_indices)
-    print(f"\n[Frame {frame_idx}]")
+
+    # Debug print
+    # TODO: Add toggle for these prints
+    print(f"\n[Frame {frame_idx} (src {source_frame_idx})]")
     print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
 
     if num_lk_points > 0:
@@ -270,7 +274,6 @@ def process_frame(
 
     if active_tracklets:
         # Heuristic: Pick tracklet with most keypoints or highest score
-        # TODO: It will be a different story when tracking multiple animals in CATAR
         best_tracklet = max(active_tracklets, key=lambda t: (len(t.skeleton.keypoints), t.skeleton.score))
         final_3d_skeleton_kps = best_tracklet.skeleton.keypoints
         num_kps = len(final_3d_skeleton_kps)
@@ -285,7 +288,7 @@ def process_frame(
         calibration = app_state.calibration
         point_names = app_state.point_names
 
-        # Get human annotations as a source of evidence
+        # Get human annotations as a source of evidence for the destination frame
         human_flags_for_frame = app_state.human_annotated[frame_idx].copy()
         human_annots_for_frame = app_state.annotations[frame_idx].copy()
 
@@ -378,9 +381,6 @@ def process_frame(
         app_state.annotations[frame_idx] = fused_2d_annotations
         app_state.reconstructed_3d_points[frame_idx] = final_3d_pose
 
-        # Note: This flag only means 'a human has provided a high-weight piece of evidence for this point in this frame'
-        app_state.human_annotated[frame_idx] = human_flags_for_frame
-
 
 # ============================================================================
 # Optic flow tracking
@@ -388,39 +388,47 @@ def process_frame(
 
 def track_points(
         app_state: 'AppState',
-        prev_frames: List[np.ndarray],
-        current_frames: List[np.ndarray],
-        frame_idx: int
+        source_frames: List[np.ndarray],
+        dest_frames: List[np.ndarray],
+        source_frame_idx: int,
+        dest_frame_idx: int
 ) -> np.ndarray:
     """
-    Tracks points and returns new 2D annotations (x, y, confidence)
-    (Confidence score based on (sort of) RANSAC-like multi-view consistency)
+    Tracks points from source_frame to dest_frame and returns new 2D annotations (x, y, confidence)
+    for the destination frame.
+    (Confidence score based on forward-backward error and multi-view consistency)
     """
 
     with app_state.lock:
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
 
-        # Get previous annotations
-        annotations_prev_full = app_state.annotations[frame_idx - 1].copy()
-        annotations_prev = annotations_prev_full[..., :2]  # this is used for LK input
+        # Get annotations from the source frame
+        annotations_source_full = app_state.annotations[source_frame_idx].copy()
+        annotations_source = annotations_source_full[..., :2]
+
         calibration = app_state.calibration
         cam_names = app_state.camera_names
 
     # Output array is (C, P, 3) where 3 is (x, y, confidence)
-    output_annotations = np.full((annotations_prev.shape[0], annotations_prev.shape[1], 3), np.nan, dtype=np.float32)
+    num_cams = annotations_source.shape[0]
+    num_points = annotations_source.shape[1]
+    output_annotations = np.full((num_cams, num_points, 3), np.nan, dtype=np.float32)
 
     if calibration.best_calibration is None:
         return output_annotations
 
-    num_videos = len(current_frames)
+    num_videos = len(dest_frames)
 
     # Run LK Optic flow and compute initial confidence
     for cam_idx in range(num_videos):
-        prev_gray = cv2.cvtColor(prev_frames[cam_idx], cv2.COLOR_BGR2GRAY)
-        curr_gray = cv2.cvtColor(current_frames[cam_idx], cv2.COLOR_BGR2GRAY)
-        p0_2d_prev = annotations_prev[cam_idx]
-        track_mask = ~np.isnan(p0_2d_prev).any(axis=1)
+
+        # Calculate flow from source to dest
+        src_gray = cv2.cvtColor(source_frames[cam_idx], cv2.COLOR_BGR2GRAY)
+        dst_gray = cv2.cvtColor(dest_frames[cam_idx], cv2.COLOR_BGR2GRAY)
+
+        p0_2d_src = annotations_source[cam_idx]
+        track_mask = ~np.isnan(p0_2d_src).any(axis=1)
 
         if focus_mode:
             is_valid = track_mask[selected_idx]
@@ -429,30 +437,33 @@ def track_points(
 
         if not np.any(track_mask):
             continue
-        start_points_for_lk = p0_2d_prev[track_mask].reshape(-1, 1, 2)
+
+        start_points_for_lk = p0_2d_src[track_mask].reshape(-1, 1, 2)
         point_indices_to_track = np.where(track_mask)[0]
 
         if start_points_for_lk.size == 0:
             continue
 
-        # Froward and backward test
-        p1_forward, status_fwd, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, start_points_for_lk, None,
-                                                             **config.LK_PARAMS)
+        # Forward flow: source -> dest
+        p1_forward, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
+            src_gray, dst_gray, start_points_for_lk, None, **config.LK_PARAMS
+        )
 
-        p0_backward, status_bwd, _ = cv2.calcOpticalFlowPyrLK(curr_gray, prev_gray, p1_forward, None,
-                                                              **config.LK_PARAMS)
+        # Backward flow: dest -> source
+        p0_backward, status_bwd, _ = cv2.calcOpticalFlowPyrLK(
+            dst_gray, src_gray, p1_forward, None, **config.LK_PARAMS
+        )
 
         for i, p_idx in enumerate(point_indices_to_track):
             fb_error = np.linalg.norm(start_points_for_lk[i] - p0_backward[i])
 
-            is_lk_successful = status_fwd[i] == 1 and status_bwd[
-                i] == 1 and fb_error < config.FORWARD_BACKWARD_THRESHOLD
+            is_lk_successful = status_fwd[i] == 1 and status_bwd[i] == 1 and fb_error < config.FORWARD_BACKWARD_THRESHOLD
 
             if is_lk_successful:
-                # Get confidence from the previous frame for this point
-                prev_confidence = annotations_prev_full[cam_idx, p_idx, 2]
+                # Get confidence from the source frame for this point
+                prev_confidence = annotations_source_full[cam_idx, p_idx, 2]
 
-                # If the previous annotation didn't exist, default to a starting confidence
+                # If the source annotation didn't exist (shouldn't happen, but it's good to check)
                 if np.isnan(prev_confidence):
                     prev_confidence = config.MAX_SINGLE_VIEW_CONFIDENCE
 
@@ -463,7 +474,7 @@ def track_points(
                 new_confidence = prev_confidence * lk_quality
                 output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), new_confidence]
 
-    # Confidence upgrade via multi-view consensus
+    # Confidence upgrade via multi-view consensus on the destination frame
     for p_idx in range(app_state.num_points):
 
         # Find all cameras that have a valid track for this point
@@ -797,9 +808,9 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
         # TODO: This is a bit simple, could be improved
 
         p1_idx, p2_idx = np.random.choice(len(population), 2, replace=False)
-        parent1 = population[p1_idx] if fitness_scores[p1_idx] < fitness_scores[p2_idx] else population[p2_idx]
+        parent1 = population[p1_idx] if fitness_scores[p1_idx] < fitness_scores[p2_idx] else population[p1_idx]
         p3_idx, p4_idx = np.random.choice(len(population), 2, replace=False)
-        parent2 = population[p3_idx] if fitness_scores[p3_idx] < fitness_scores[p4_idx] else population[p4_idx]
+        parent2 = population[p3_idx] if fitness_scores[p3_idx] < fitness_scores[p4_idx] else population[p3_idx]
 
         child = {}
         for cam_name in cam_names:
