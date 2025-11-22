@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from mokap.reconstruction.tracking import MultiObjectTracker
 
 
-
 # ============================================================================
 # Camera geometry
 # ============================================================================
@@ -224,37 +223,63 @@ def process_frame(
         point_names = app_state.point_names
 
     # Get geometric prediction and confidence score from LK tracking
+    # annotations_from_lk is (C, P, 3) where 3 is (x, y, confidence)
     annotations_from_lk = track_points(
         app_state, prev_frames, current_frames, frame_idx
     )
-    num_lk_points = np.sum(~np.isnan(annotations_from_lk[..., 0]))
+
+    # Prepare input for Mokap Reconstructor
+    # We need to flatten the dense (C, P, 3) array into SoA format
+    # Find indices where we have valid tracking data
+    cam_indices, point_indices = np.where(~np.isnan(annotations_from_lk[..., 0]))
+
+    num_lk_points = len(cam_indices)
     print(f"\n[Frame {frame_idx}]")
     print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
 
-    # Run Mokap reconstruction using LK results and their confidence score
-    # annotations_from_lk is (C, P, 3) where 3 is (x, y, confidence)
-    points_soup = reconstructor.reconstruct_frame_array(
-        array_frame=annotations_from_lk,
-        frame_idx=frame_idx,
-        keypoint_names=point_names
-    )
-    num_input_points = np.sum(~np.isnan(annotations_from_lk[..., 0]))
-    print(f"MOKAP RECON:   Input {num_input_points} 2D points -> Produced a soup of {len(points_soup)} 3D candidates.")
+    if num_lk_points > 0:
+        coords = annotations_from_lk[cam_indices, point_indices, :2]
+        scores = annotations_from_lk[cam_indices, point_indices, 2]
 
-    active_tracklets = tracker.update(points_soup, frame_idx)
+        # Construct inputs dictionary matching mokap.reconstruction.datatypes requirements
+        reconstruction_input = {
+            "frame_indices": np.full(num_lk_points, frame_idx, dtype=np.int32),
+            "kp_type_ids": point_indices.astype(np.int16),
+            "cam_ids": cam_indices.astype(np.int8),
+            "coords": coords.astype(np.float32),
+            "scores": scores.astype(np.float32)
+        }
 
+        # Run Mokap reconstruction
+        soup = reconstructor.reconstruct_batch(
+            inputs=reconstruction_input,
+            keypoint_names=point_names
+        )
+
+        print(f"MOKAP RECON:   Input {num_lk_points} 2D points -> Produced a soup of {soup.num_points} 3D points and {len(soup.ray_origins)} orphan rays.")
+
+        # Run multi-object tracking (skeleton assembly + time association)
+        active_tracklets = tracker.update(soup, frame_idx)
+    else:
+        print("MOKAP RECON:   No input points from LK.")
+        active_tracklets = []
+
+    # Extract best skeleton for feedback loop
     final_3d_skeleton_kps = None
     skeleton_score = 0.0
 
     if active_tracklets:
-        best_tracklet = max(active_tracklets, key=lambda t: len(t.skeleton.keypoints))
+        # Heuristic: Pick tracklet with most keypoints or highest score
+        # TODO: It will be a different story when tracking multiple animals in CATAR
+        best_tracklet = max(active_tracklets, key=lambda t: (len(t.skeleton.keypoints), t.skeleton.score))
         final_3d_skeleton_kps = best_tracklet.skeleton.keypoints
         num_kps = len(final_3d_skeleton_kps)
-        score = best_tracklet.skeleton.score
         skeleton_score = best_tracklet.skeleton.score
-        print(f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints (Score: {score:.2f}).")
+        print(f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints (Score: {skeleton_score:.2f}).")
     else:
         print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
+
+    # Fusion & cleanup
 
     with app_state.lock:
         calibration = app_state.calibration
@@ -342,7 +367,9 @@ def process_frame(
         if not np.isnan(triangulated_3d_points[p_idx, 0]):
             final_3d_pose[p_idx] = triangulated_3d_points[p_idx]
 
-        # Priority 2 (Fallback): If triangulation failed, use mokap skeleton's position
+        # Priority 2 (fallback): If triangulation failed, use mokap skeleton's position
+        # This helps fill gaps where direct triangulation failed but the skeleton assembler
+        # succeeded (via single-view rescue for instance)
         elif final_3d_skeleton_kps and p_name in final_3d_skeleton_kps:
             final_3d_pose[p_idx] = final_3d_skeleton_kps[p_name]
 
