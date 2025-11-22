@@ -182,9 +182,12 @@ class VideoReaderWorker(threading.Thread):
                 continue
 
             if current_frame_idx != prev_frame_idx:
-                is_sequential = (current_frame_idx == prev_frame_idx + 1)
+                # Sequential read is only possible forward
+                is_sequential_forward = (current_frame_idx == prev_frame_idx + 1)
+                # But for tracking we just need to know if we moved by 1 frame
+                is_adjacent = abs(current_frame_idx - prev_frame_idx) == 1
 
-                frames = self._get_frames(current_frame_idx, is_sequential)
+                frames = self._get_frames(current_frame_idx, is_sequential_forward)
 
                 if not frames:
                     with self.app_state.lock:
@@ -194,7 +197,8 @@ class VideoReaderWorker(threading.Thread):
                 frame_data = {
                     "frame_idx": current_frame_idx,
                     "raw_frames": frames,
-                    "was_sequential": is_sequential
+                    "was_sequential": is_sequential_forward,
+                    "is_adjacent": is_adjacent # signal to tracker that we moved 1 step
                 }
                 self._distribute_frames(frame_data)
                 prev_frame_idx = current_frame_idx
@@ -275,7 +279,9 @@ class TrackingWorker(threading.Thread):
                 command = self.command_queue.get_nowait()
 
                 if command.get("action") == "batch_track":
-                    self._run_batch_tracking(command["start_frame"])
+                    start_frame = command["start_frame"]
+                    direction = command.get("direction", 1) # default to forward (1)
+                    self._run_batch_tracking(start_frame, direction)
                     continue
 
                 elif command.get("action") == "update_calibration":
@@ -340,33 +346,43 @@ class TrackingWorker(threading.Thread):
                 self.app_state.needs_3d_reconstruction = False
 
     def _process_frame_for_tracking(self, data: dict):
-        """Process a single frame for the automated tracking pipeline."""
+        """Process a single frame for the automated tracking pipeline (Live Tracking)."""
 
         frame_idx = data["frame_idx"]
 
         with self.app_state.lock:
             is_tracking_enabled = self.app_state.keypoint_tracking_enabled
 
-        # Runs entire LK -> Mokap -> Feedback loop
-        if is_tracking_enabled and data["was_sequential"] and self.prev_frames:
-            print(f"[Frame {frame_idx}] TrackingWorker: Running full processing pipeline.")
+        # We can track if enabled, and if we have adjacent frames (either forward or backward)
+        # ('is_adjacent' is populated by VideoReaderWorker)
+        can_track = is_tracking_enabled and self.prev_frames and data.get("is_adjacent", False)
+        
+        # Double check adjacency manually to be safe
+        if can_track and abs(frame_idx - self.prev_frame_idx) != 1:
+            can_track = False
+
+        if can_track:
+            print(f"[Frame {frame_idx}] TrackingWorker: Live tracking from {self.prev_frame_idx}.")
             process_frame(
-                frame_idx,
-                self.app_state,
-                self.reconstructor,
-                self.tracker,
-                self.prev_frames,
-                data["raw_frames"]
+                frame_idx=frame_idx,
+                source_frame_idx=self.prev_frame_idx,
+                app_state=self.app_state,
+                reconstructor=self.reconstructor,
+                tracker=self.tracker,
+                source_frames=self.prev_frames,
+                dest_frames=data["raw_frames"]
             )
 
         self.prev_frames = data["raw_frames"]
         self.prev_frame_idx = data["frame_idx"]
 
-    def _run_batch_tracking(self, start_frame: int):
-        """Track points forward using the full process loop on every frame."""
-        # TODO: This will be bidirectional
+    def _run_batch_tracking(self, start_frame: int, direction: int = 1):
+        """
+        Track points starting from start_frame in the given direction (1 = forward or -1 = backward).
+        """
 
-        print(f"Starting batch track from frame {start_frame}...")
+        dir_str = "FORWARD" if direction == 1 else "BACKWARD"
+        print(f"Starting batch track {dir_str} from frame {start_frame}...")
 
         caps = [cv2.VideoCapture(path) for path in self.video_paths]
         if not all(cap.isOpened() for cap in caps):
@@ -374,49 +390,76 @@ class TrackingWorker(threading.Thread):
             return
 
         num_frames = self.app_state.video_metadata['num_frames']
-        total_to_process = num_frames - start_frame - 1
+        
+        # Determine the range of frames to process
+        if direction == 1:
+            # Forward: start + 1 -> end
+            frame_range = range(start_frame + 1, num_frames)
+            total_to_process = num_frames - start_frame - 1
+        else:
+            # Backward: start - 1 -> 0
+            frame_range = range(start_frame - 1, -1, -1)
+            total_to_process = start_frame
 
-        # Read initial frame
-        prev_frames = self._read_frames_at(caps, start_frame)
-        if not prev_frames:
+        if total_to_process <= 0:
+            print("Batch track: No frames to process in this direction.")
             self._cleanup_captures(caps)
             return
 
+        # Read the initial source frames
+        source_frames = self._read_frames_at(caps, start_frame)
+        if not source_frames:
+            self._cleanup_captures(caps)
+            return
+            
+        current_source_idx = start_frame
+
         # Track through remaining frames
-        for i, frame_idx in enumerate(range(start_frame + 1, num_frames)):
+        for i, dest_frame_idx in enumerate(frame_range):
             if self.stop_batch_track_event.is_set():
-                print(f"Batch track stopped by user at frame {frame_idx}.")
+                print(f"Batch track stopped by user at frame {dest_frame_idx}.")
                 break
 
-            # Read current frames
-            current_frames = [cap.read()[1] for cap in caps]
-            if not all(f is not None for f in current_frames):
+            # Read destination frames
+            dest_frames = self._read_frames_at(caps, dest_frame_idx)
+            if not dest_frames:
                 break
 
+            # Run the core logic source -> dest
             process_frame(
-                frame_idx,
-                self.app_state,
-                self.reconstructor,
-                self.tracker,
-                prev_frames,
-                current_frames
+                frame_idx=dest_frame_idx,
+                source_frame_idx=current_source_idx,
+                app_state=self.app_state,
+                reconstructor=self.reconstructor,
+                tracker=self.tracker,
+                source_frames=source_frames,
+                dest_frames=dest_frames
             )
 
-            prev_frames = current_frames
+            # Destination becomes source for the next iteration
+            source_frames = dest_frames
+            current_source_idx = dest_frame_idx
 
             # Report progress
             if i % 5 == 0:
                 self.progress_out_queue.put({
-                    "status": "running", "progress": i / total_to_process,
-                    "current_frame": frame_idx, "total_frames": num_frames
+                    "status": "running", 
+                    "progress": i / total_to_process,
+                    "current_frame": dest_frame_idx, 
+                    "total_frames": num_frames
                 })
 
-        self.progress_out_queue.put({"status": "complete", "final_frame": num_frames - 1})
+        # Signal completion with the final frame for the UI to jump to
+        final_frame = frame_range[-1] if len(frame_range) > 0 else start_frame
+        self.progress_out_queue.put({"status": "complete", "final_frame": final_frame})
+        
         self._cleanup_captures(caps)
-        print("Batch track complete.")
+        print(f"Batch track {dir_str} complete.")
 
     def _read_frames_at(self, caps: List[cv2.VideoCapture], frame_idx: int) -> List[np.ndarray]:
         """Read frames from all captures at specific index."""
+
+        # TODO: This needs to use the cache reader
 
         frames = []
         for cap in caps:
