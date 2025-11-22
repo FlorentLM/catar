@@ -43,7 +43,7 @@ class VideoReaderWorker(threading.Thread):
         # We only need the on-the-fly cache if not using the disk cache reader
         if self.diskcache_reader is None:
             self.onthefly_cache = [collections.OrderedDict() for _ in self.video_paths]
-            
+
             # Target budget: 1.5 GB total for all videos combined in this worker.
             target_budget_bytes = 1.5 * 1024**3
 
@@ -54,13 +54,13 @@ class VideoReaderWorker(threading.Thread):
             total_capacity_frames = target_budget_bytes // frame_bytes
             num_videos = len(self.video_paths)
             per_video_capacity = int(total_capacity_frames // num_videos)
-            
+
             # Ensure a minimum of 10 frames per video, but cap at the calculated max
             self.onthefly_cache_size = max(10, per_video_capacity)
 
             print(f"VideoReaderWorker: RAM Budget 1.5GB. Frame size: {frame_bytes/1024**2:.2f}MB.")
             print(f"VideoReaderWorker: On-the-fly cache set to {self.onthefly_cache_size} frames per video.")
-            
+
         else:
             self.onthefly_cache = None
 
@@ -74,7 +74,7 @@ class VideoReaderWorker(threading.Thread):
 
     def _initialize_captures(self):
         """Open all video files (if not using cache)."""
-        
+
         if self.diskcache_reader is not None:
             print("Video reader using cached frames.")
             return
@@ -356,7 +356,7 @@ class TrackingWorker(threading.Thread):
         # We can track if enabled, and if we have adjacent frames (either forward or backward)
         # ('is_adjacent' is populated by VideoReaderWorker)
         can_track = is_tracking_enabled and self.prev_frames and data.get("is_adjacent", False)
-        
+
         # Double check adjacency manually to be safe
         if can_track and abs(frame_idx - self.prev_frame_idx) != 1:
             can_track = False
@@ -380,26 +380,30 @@ class TrackingWorker(threading.Thread):
         """
         Track points starting from start_frame in the given direction (1 = forward or -1 = backward).
         """
+        # TODO: This should use the VideoReaderWorker so we don't have to have separate VideoCaptures, and so we can uptate the UI in real time
 
         dir_str = "FORWARD" if direction == 1 else "BACKWARD"
         print(f"Starting batch track {dir_str} from frame {start_frame}...")
 
-        # Check if we can use the cache reader from AppState
+        # Check cache
         cache_reader = self.app_state.cache_reader
         use_cache = cache_reader is not None
-        
+
         caps = []
+        caps_file_pointer = -1
+
         if use_cache:
-            print("Batch tracking using DiskCacheReader (fast).")
+            print("Batch tracking using DiskCacheReader.")
         else:
-            print("Batch tracking using VideoCapture (slow fallback).")
+            print("Batch tracking using VideoCapture.")
+            # Only initialize caps if we have to
             caps = [cv2.VideoCapture(path) for path in self.video_paths]
             if not all(cap.isOpened() for cap in caps):
                 print("Batch track error: Could not open videos.")
                 return
 
         num_frames = self.app_state.video_metadata['num_frames']
-        
+
         # Determine the range of frames to process
         if direction == 1:
             # Forward: start + 1 -> end
@@ -416,22 +420,75 @@ class TrackingWorker(threading.Thread):
             return
 
         # Read the initial source frames
-        source_frames = self._read_frames_at(caps, start_frame, use_cache, direction)
+        source_frames = []
+
+        if use_cache:
+            # Priority 1: cache
+            try:
+                source_frames = cache_reader.get_frame(start_frame)
+            except Exception as e:
+                print(f"Cache read error: {e}")
+        else:
+            # Priority 2/3: VideoCapture
+            # Since we just opened them we must seek to start_frame
+            for cap in caps:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                ret, frame = cap.read()
+                if ret: source_frames.append(frame)
+
+            # Update pointer (VideoCapture is now at start_frame + 1)
+            if len(source_frames) == len(caps):
+                caps_file_pointer = start_frame + 1
+
         if not source_frames:
+            print("Could not read start frame.")
             self._cleanup_captures(caps)
             return
-            
+
         current_source_idx = start_frame
 
-        # Track through remaining frames
+        # Main tracking loop
         for i, dest_frame_idx in enumerate(frame_range):
             if self.stop_batch_track_event.is_set():
                 print(f"Batch track stopped by user at frame {dest_frame_idx}.")
                 break
 
-            # Read destination frames
-            dest_frames = self._read_frames_at(caps, dest_frame_idx, use_cache, direction)
+            dest_frames = []
+
+            if use_cache:
+                # Always use cache if available
+                try:
+                    dest_frames = cache_reader.get_frame(dest_frame_idx)
+                except Exception as e:
+                    print(f"Cache read error: {e}")
+                    break
+
+            else:
+                # VideoCapture sequential read (forward only)
+                if (direction == 1) and (dest_frame_idx == caps_file_pointer):
+                    for cap in caps:
+                        ret, f = cap.read()
+                        if ret: dest_frames.append(f)
+
+                    if len(dest_frames) == len(caps):
+                        caps_file_pointer += 1
+                    else:
+                        dest_frames = [] # Signal error
+
+                # VideoCapture seek (backward or jump)
+                else:
+                    dest_frames = []
+                    for cap in caps:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, dest_frame_idx)
+                        ret, f = cap.read()
+                        if ret: dest_frames.append(f)
+
+                    if len(dest_frames) == len(caps):
+                        caps_file_pointer = dest_frame_idx + 1 # Update pointer after seek+read
+
+            # Check if read was successful
             if not dest_frames:
+                print(f"Failed to read frames at index {dest_frame_idx}.")
                 break
 
             # Run the core logic source -> dest
@@ -452,44 +509,18 @@ class TrackingWorker(threading.Thread):
             # Report progress
             if i % 5 == 0:
                 self.progress_out_queue.put({
-                    "status": "running", 
+                    "status": "running",
                     "progress": i / total_to_process,
-                    "current_frame": dest_frame_idx, 
+                    "current_frame": dest_frame_idx,
                     "total_frames": num_frames
                 })
 
         # Signal completion with the final frame for the UI to jump to
         final_frame = frame_range[-1] if len(frame_range) > 0 else start_frame
         self.progress_out_queue.put({"status": "complete", "final_frame": final_frame})
-        
+
         self._cleanup_captures(caps)
         print(f"Batch track {dir_str} complete.")
-
-    def _read_frames_at(self, caps: List[cv2.VideoCapture], frame_idx: int, use_cache: bool, direction: int) -> List[np.ndarray]:
-        """Read frames from either the DiskCacheReader or cv2 VideoCaptures."""
-
-        # TODO: Do we want on-the-fly caching here? Probably not
-
-        # Fast path
-        if use_cache:
-            try:
-                return self.app_state.cache_reader.get_frame(frame_idx)
-            except Exception as e:
-                print(f"Batch track cache read error: {e}")
-                return []
-
-        # TODO: forward play with cv2 should not use cap.set
-
-        # Slow path
-        frames = []
-        for cap in caps:
-            if direction == -1:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                return []
-            frames.append(frame)
-        return frames
 
     def _cleanup_captures(self, caps: List[cv2.VideoCapture]):
         """Release video captures if they were created."""
