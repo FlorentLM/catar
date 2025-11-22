@@ -252,9 +252,15 @@ def _create_control_panel(app_state: AppState, queues: Queues, open3d_viz: Open3
         )
         dpg.add_button(
             label="Track Forward",
-            callback=_start_batch_track_callback,
+            callback=_start_batch_track_fwd_callback,
             user_data=user_data,
-            tag="batch_track_button"
+            # tag="batch_track_fwd_button"
+        )
+        dpg.add_button(
+            label="Track Backward",
+            callback=_start_batch_track_bwd_callback,
+            user_data=user_data,
+            # tag="batch_track_bwd_button"
         )
 
         dpg.add_button(
@@ -722,7 +728,7 @@ def _toggle_tracking_callback(sender, app_data, user_data):
         dpg.bind_item_theme("keypoint_tracking_button", 0)
 
 
-def _start_batch_track_callback(sender, app_data, user_data):
+def _start_batch_track_fwd_callback(sender, app_data, user_data):
     """Start forward batch tracking from current frame."""
 
     app_state = user_data["app_state"]
@@ -733,12 +739,30 @@ def _start_batch_track_callback(sender, app_data, user_data):
         queues.stop_batch_track.clear()
         queues.tracking_command.put({
             "action": "batch_track",
-            "start_frame": start_frame
+            "start_frame": start_frame,
+            "direction": 1
         })
 
     dpg.set_value("batch_track_progress", 0.0)
     dpg.show_item("batch_track_popup")
 
+def _start_batch_track_bwd_callback(sender, app_data, user_data):
+    """Start forward batch tracking from current frame."""
+
+    app_state = user_data["app_state"]
+    queues = user_data["queues"]
+
+    with app_state.lock:
+        start_frame = app_state.frame_idx
+        queues.stop_batch_track.clear()
+        queues.tracking_command.put({
+            "action": "batch_track",
+            "start_frame": start_frame,
+            "direction": -1
+        })
+
+    dpg.set_value("batch_track_progress", 0.0)
+    dpg.show_item("batch_track_popup")
 
 def _stop_batch_track_callback(sender, app_data, user_data):
     """Stop batch tracking."""

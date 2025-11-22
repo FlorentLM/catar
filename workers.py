@@ -507,7 +507,8 @@ class TrackingWorker(threading.Thread):
             current_source_idx = dest_frame_idx
 
             # Report progress
-            if i % 5 == 0:
+            # if i % 5 == 0:
+            if i % 1 == 0:
                 self.progress_out_queue.put({
                     "status": "running",
                     "progress": i / total_to_process,
