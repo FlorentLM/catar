@@ -384,10 +384,19 @@ class TrackingWorker(threading.Thread):
         dir_str = "FORWARD" if direction == 1 else "BACKWARD"
         print(f"Starting batch track {dir_str} from frame {start_frame}...")
 
-        caps = [cv2.VideoCapture(path) for path in self.video_paths]
-        if not all(cap.isOpened() for cap in caps):
-            print("Batch track error: Could not open videos.")
-            return
+        # Check if we can use the cache reader from AppState
+        cache_reader = self.app_state.cache_reader
+        use_cache = cache_reader is not None
+        
+        caps = []
+        if use_cache:
+            print("Batch tracking using DiskCacheReader (fast).")
+        else:
+            print("Batch tracking using VideoCapture (slow fallback).")
+            caps = [cv2.VideoCapture(path) for path in self.video_paths]
+            if not all(cap.isOpened() for cap in caps):
+                print("Batch track error: Could not open videos.")
+                return
 
         num_frames = self.app_state.video_metadata['num_frames']
         
@@ -407,7 +416,7 @@ class TrackingWorker(threading.Thread):
             return
 
         # Read the initial source frames
-        source_frames = self._read_frames_at(caps, start_frame)
+        source_frames = self._read_frames_at(caps, start_frame, use_cache, direction)
         if not source_frames:
             self._cleanup_captures(caps)
             return
@@ -421,7 +430,7 @@ class TrackingWorker(threading.Thread):
                 break
 
             # Read destination frames
-            dest_frames = self._read_frames_at(caps, dest_frame_idx)
+            dest_frames = self._read_frames_at(caps, dest_frame_idx, use_cache, direction)
             if not dest_frames:
                 break
 
@@ -456,14 +465,26 @@ class TrackingWorker(threading.Thread):
         self._cleanup_captures(caps)
         print(f"Batch track {dir_str} complete.")
 
-    def _read_frames_at(self, caps: List[cv2.VideoCapture], frame_idx: int) -> List[np.ndarray]:
-        """Read frames from all captures at specific index."""
+    def _read_frames_at(self, caps: List[cv2.VideoCapture], frame_idx: int, use_cache: bool, direction: int) -> List[np.ndarray]:
+        """Read frames from either the DiskCacheReader or cv2 VideoCaptures."""
 
-        # TODO: This needs to use the cache reader
+        # TODO: Do we want on-the-fly caching here? Probably not
 
+        # Fast path
+        if use_cache:
+            try:
+                return self.app_state.cache_reader.get_frame(frame_idx)
+            except Exception as e:
+                print(f"Batch track cache read error: {e}")
+                return []
+
+        # TODO: forward play with cv2 should not use cap.set
+
+        # Slow path
         frames = []
         for cap in caps:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            if direction == -1:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret:
                 return []
@@ -471,10 +492,10 @@ class TrackingWorker(threading.Thread):
         return frames
 
     def _cleanup_captures(self, caps: List[cv2.VideoCapture]):
-        """Release video captures."""
-
-        for cap in caps:
-            cap.release()
+        """Release video captures if they were created."""
+        if caps:
+            for cap in caps:
+                cap.release()
 
 
 class RenderingWorker(threading.Thread):
