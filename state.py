@@ -279,7 +279,6 @@ class AppState:
 
         # Feature flags
         self.keypoint_tracking_enabled: bool = False
-        self.latch_detection_enabled: bool = False
         self.needs_3d_reconstruction: bool = True
 
         #Annotation data
@@ -293,11 +292,6 @@ class AppState:
             dtype=np.float32
         )
         self.human_annotated = np.zeros(
-            (num_frames, num_videos, self.num_points),
-            dtype=bool
-        )
-        # points that seem to be stuck on background
-        self.suspicious_points = np.zeros(
             (num_frames, num_videos, self.num_points),
             dtype=bool
         )
@@ -346,7 +340,6 @@ class AppState:
             try:
                 np.save(folder / 'annotations.npy', self.annotations)
                 np.save(folder / 'human_annotated.npy', self.human_annotated)
-                np.save(folder / 'suspicious_points.npy', self.suspicious_points)
                 np.save(folder / 'reconstructed_3d_points.npy', self.reconstructed_3d_points)
 
                 # Save data from the calibration state object
@@ -368,7 +361,6 @@ class AppState:
         files_to_load = {
             'annotations.npy': ('numpy', 'annotations'),
             'human_annotated.npy': ('numpy', 'human_annotated'),
-            'suspicious_points.npy': ('numpy', 'suspicious_points'),
             'reconstructed_3d_points.npy': ('numpy', 'reconstructed_3d_points'),
             'best_individual.pkl': ('pickle', 'best_individual'),
             'calibration_frames.json': ('json', 'calibration_frames'),
@@ -400,9 +392,6 @@ class AppState:
             # Load simple attributes directly into self
             if 'human_annotated' in loaded_data:
                 self.human_annotated = loaded_data['human_annotated']
-
-            if 'suspicious_points' in loaded_data:
-                self.suspicious_points = loaded_data['suspicious_points']
 
             if 'reconstructed_3d_points' in loaded_data:
                 self.reconstructed_3d_points = loaded_data['reconstructed_3d_points']

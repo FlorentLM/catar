@@ -20,20 +20,22 @@ from state import CalibrationState
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
-    from state import AppState, VideoState
+    from state import AppState
     from mokap.reconstruction.reconstruction import Reconstructor
     from mokap.reconstruction.tracking import MultiObjectTracker
 
 
-# Constants for anti-latch heuristic
-# TODO: Move to config once properly tested
-# TODO: Add slider in UI to control LATCH_NCC_THRESHOLD
-LATCH_PATCH_SIZE = 5            # 11x11 patch
-LATCH_MAX_PIXEL_MOTION = 4.0    # if 2D motion > this, we assume it's moving/active
-LATCH_NCC_THRESHOLD = 0.0       # 0.0: Disabled
-                                # 0.50: Extremely permissive (only kills a point if inverted/glitched)
-                                # 0.80: Standard (Kills if texture changes significantly)
-                                # 0.95: Strict (Kills if lighting changes even slightly)
+# TODO: Move these to config
+
+# NCC Threshold: 0.8 is a safe conservative bet
+# It means "The new patch is at least 80% similar to the old patch"
+NCC_THRESHOLD = 0.8
+NCC_PATCH_SIZE = 11
+
+# Rescue threshold can be lower here because reprojected points
+# might be slightly misaligned compared to perfect LK tracking
+NCC_THRESHOLD_RESCUE = 0.6
+
 
 # ============================================================================
 # Camera geometry
@@ -234,15 +236,17 @@ def process_frame(
         calibration = app_state.calibration
         point_names = app_state.point_names
 
+        # Load source annotations for validation later
+        prev_annotations_for_validation = app_state.annotations[source_frame_idx].copy()
+        human_flags_for_frame = app_state.human_annotated[frame_idx].copy()
+        human_annots_for_frame = app_state.annotations[frame_idx].copy()
+
     # Get geometric prediction and confidence score from LK tracking
-    # annotations_from_lk is (C, P, 3) where 3 is (x, y, confidence) for the destination frame
     annotations_from_lk = track_points(
         app_state, source_frames, dest_frames, source_frame_idx, frame_idx
     )
 
     # Prepare input for Mokap Reconstructor
-    # We need to flatten the dense (C, P, 3) array into SoA format
-    # Find indices where we have valid tracking data
     cam_indices, point_indices = np.where(~np.isnan(annotations_from_lk[..., 0]))
 
     num_lk_points = len(cam_indices)
@@ -294,14 +298,6 @@ def process_frame(
         print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
 
     # Fusion & cleanup
-
-    with app_state.lock:
-        calibration = app_state.calibration
-        point_names = app_state.point_names
-
-        # Get human annotations as a source of evidence for the destination frame
-        human_flags_for_frame = app_state.human_annotated[frame_idx].copy()
-        human_annots_for_frame = app_state.annotations[frame_idx].copy()
 
     # Get model-reprojected annotations as a source of evidence
     annotations_from_model = np.full_like(annotations_from_lk, np.nan)
@@ -357,6 +353,16 @@ def process_frame(
             cam_idx = np.where(is_valid_lk[:, p_idx])[0][0]
             fused_2d_annotations[cam_idx, p_idx] = annotations_from_lk[cam_idx, p_idx]
 
+    # Validate rescued points
+    # Reject SVR/model jumps if appearance changes drastically
+    fused_2d_annotations = validate_rescued_points(
+        fused_annots=fused_2d_annotations,
+        prev_annots=prev_annotations_for_validation,
+        lk_annots=annotations_from_lk,
+        src_frames=source_frames,
+        dst_frames=dest_frames
+    )
+
     # Step 2: Generate (the hopefully high fidelity) 3D data by triangulating these fused 2D points
     triangulated_3d_points = np.full((app_state.num_points, 3), np.nan, dtype=np.float32)
     if calibration.best_calibration is not None:
@@ -392,113 +398,80 @@ def process_frame(
         app_state.annotations[frame_idx] = fused_2d_annotations
         app_state.reconstructed_3d_points[frame_idx] = final_3d_pose
 
-        latch_detection = app_state.latch_detection_enabled
-
-    if latch_detection:
-        # Step 5: Post-hoc analysis (anti-latch heuristic)
-        if app_state.calibration.best_calibration is not None:
-            detect_tracking_failures(
-                app_state,
-                frame_idx,
-                source_frame_idx,
-                source_frames,
-                dest_frames
-            )
-
-            # Step 6: Kill switch
-            with app_state.lock:
-                suspicious_mask = app_state.suspicious_points[frame_idx]
-                is_auto = ~app_state.human_annotated[frame_idx]     # only kill auto tracks
-                kill_mask = suspicious_mask & is_auto
-
-                if np.any(kill_mask):
-                    # Set to nan to stop LK from propagating this error in the current view
-                    app_state.annotations[frame_idx][kill_mask] = np.nan
-                    print(f"  [Anti-latch] Killed {np.sum(kill_mask)} point tracks.")
-
-
 # ============================================================================
 # Optic flow tracking
 # ============================================================================
 
-def detect_tracking_failures(
-        app_state: 'AppState',
-        frame_idx: int,
-        prev_frame_idx: int,
-        source_frames: List[np.ndarray],
-        dest_frames: List[np.ndarray]
-):
+def _compute_patch_ncc(
+        img_prev: np.ndarray,
+        img_curr: np.ndarray,
+        p_prev: np.ndarray,
+        p_curr: np.ndarray,
+        patch_size: int = NCC_PATCH_SIZE
+) -> float:
     """
-    Detects tracking failures using Normalized Cross-Correlation (NCC).
+    Computes Normalized Cross Correlation between two patches.
+    Returns 1.0 if identical, -1.0 if inverted, 0.0 if uncorrelated.
+    Returns -1.0 if patches are out of bounds or invalid.
     """
-    with app_state.lock:
-        annots_curr = app_state.annotations[frame_idx]
-        annots_prev = app_state.annotations[prev_frame_idx]
+    h, w = img_prev.shape
+    pad = patch_size // 2
 
-    num_points = annots_curr.shape[1]
-    num_cams = len(dest_frames)
+    u_p, v_p = p_prev
+    u_c, v_c = p_curr
 
-    # Reset flags for this frame
-    suspicious_flags = np.zeros((num_cams, num_points), dtype=bool)
+    if (u_p < pad or u_p >= w - pad or v_p < pad or v_p >= h - pad or
+            u_c < pad or u_c >= w - pad or v_c < pad or v_c >= h - pad):
+        return -1.0
 
-    src_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in source_frames]
-    dst_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in dest_frames]
+    try:
+        patch_prev = cv2.getRectSubPix(img_prev, (patch_size, patch_size), (float(u_p), float(v_p)))
+        patch_curr = cv2.getRectSubPix(img_curr, (patch_size, patch_size), (float(u_c), float(v_c)))
 
-    for c_idx in range(num_cams):
-        img_src = src_grays[c_idx]
-        img_dst = dst_grays[c_idx]
-        h, w = img_src.shape
+        if np.std(patch_prev) < 1e-5 or np.std(patch_curr) < 1e-5:
+            return 0.0
 
-        for p_idx in range(num_points):
+        res = cv2.matchTemplate(patch_curr.astype(np.float32), patch_prev.astype(np.float32), cv2.TM_CCOEFF_NORMED)
+        return res[0][0]
+    except Exception:
+        return -1.0
 
-            p2d_prev = annots_prev[c_idx, p_idx, :2]
-            p2d_curr = annots_curr[c_idx, p_idx, :2]
 
-            if np.isnan(p2d_prev).any() or np.isnan(p2d_curr).any():
-                continue
+def validate_rescued_points(
+        fused_annots: np.ndarray,
+        prev_annots: np.ndarray,
+        lk_annots: np.ndarray,
+        src_frames: List[np.ndarray],
+        dst_frames: List[np.ndarray]
+) -> np.ndarray:
+    """
+    Checks points that were lost by LK but rescued by fusion.
+    If the rescued point looks too different from the previous frame, reject it.
+    """
+    num_cams, num_points, _ = fused_annots.shape
+    validated_annots = fused_annots.copy()
 
-            # Check geometry: is the point staying still?
-            motion_2d = np.linalg.norm(p2d_curr - p2d_prev)
+    src_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in src_frames]
+    dst_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in dst_frames]
 
-            # If it moved significantly, we assume it's tracking "something"
-            if motion_2d > LATCH_MAX_PIXEL_MOTION:
-                continue
+    for c in range(num_cams):
+        for p in range(num_points):
+            # Condition: LK failed, but fusion returned a value, and we have history
+            if (np.isnan(lk_annots[c, p, 0]) and
+                    not np.isnan(fused_annots[c, p, 0]) and
+                    not np.isnan(prev_annots[c, p, 0])):
 
-            # Check appearance: did image content change?
-            u_prev, v_prev = p2d_prev
-            u_curr, v_curr = p2d_curr
+                ncc = _compute_patch_ncc(
+                    src_grays[c], dst_grays[c],
+                    prev_annots[c, p, :2],
+                    fused_annots[c, p, :2]
+                )
 
-            pad = LATCH_PATCH_SIZE // 2  # half-size for padding calc
+                if ncc < NCC_THRESHOLD_RESCUE:
+                    # Reject rescue
+                    validated_annots[c, p] = np.nan
 
-            if (u_prev < pad or u_prev >= w - pad or v_prev < pad or v_prev >= h - pad or
-                    u_curr < pad or u_curr >= w - pad or v_curr < pad or v_curr >= h - pad):
-                continue
-
-            ix_src, iy_src = int(round(u_prev)), int(round(v_prev))
-            ix_dst, iy_dst = int(round(u_curr)), int(round(v_curr))
-
-            # Extract patches
-            patch_src = img_src[iy_src - pad:iy_src + pad + 1, ix_src - pad:ix_src + pad + 1]
-            patch_dst = img_dst[iy_dst - pad:iy_dst + pad + 1, ix_dst - pad:ix_dst + pad + 1]
-
-            if patch_src.shape != patch_dst.shape or patch_src.size == 0:
-                continue
-
-            # NCC calculation
-            # Result is -1 to 1. Map to 0 to 1 for easier thresholding
-            res = cv2.matchTemplate(patch_dst, patch_src, cv2.TM_CCOEFF_NORMED)
-            ncc_norm = (res[0][0] + 1.0) / 2.0
-
-            # Decide:
-            # If motion is low (= geometrically latched)
-            # but correlation is low (= visually changed)
-            # Then the point is likely stuck on the background while the animal moved away
-            if ncc_norm < LATCH_NCC_THRESHOLD:
-                suspicious_flags[c_idx, p_idx] = True
-
-    with app_state.lock:
-        app_state.suspicious_points[frame_idx] = suspicious_flags
-
+    return validated_annots
 
 
 def track_points(
@@ -509,40 +482,33 @@ def track_points(
         dest_frame_idx: int
 ) -> np.ndarray:
     """
-    Tracks points from source_frame to dest_frame and returns new 2D annotations (x, y, confidence)
-    for the destination frame.
-    (Confidence score based on forward-backward error and multi-view consistency)
+    Tracks points using LK + Forward-Backward Error + NCC Appearance Check.
     """
-
     with app_state.lock:
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
-
-        # Get annotations from the source frame
         annotations_source_full = app_state.annotations[source_frame_idx].copy()
-        annotations_source = annotations_source_full[..., :2]
-
         calibration = app_state.calibration
         cam_names = app_state.camera_names
 
-    # Output array is (C, P, 3) where 3 is (x, y, confidence)
-    num_cams = annotations_source.shape[0]
-    num_points = annotations_source.shape[1]
+    p0_2d_all = annotations_source_full[..., :2]
+    num_cams, num_points, _ = annotations_source_full.shape
     output_annotations = np.full((num_cams, num_points, 3), np.nan, dtype=np.float32)
 
     if calibration.best_calibration is None:
         return output_annotations
 
-    num_videos = len(dest_frames)
+    # Pre-convert to gray to avoid doing it per-point or twice
+    src_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in source_frames]
+    dst_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in dest_frames]
 
-    # Run LK Optic flow and compute initial confidence
-    for cam_idx in range(num_videos):
+    for cam_idx in range(num_cams):
+        src_gray = src_grays[cam_idx]
+        dst_gray = dst_grays[cam_idx]
 
-        # Calculate flow from source to dest
-        src_gray = cv2.cvtColor(source_frames[cam_idx], cv2.COLOR_BGR2GRAY)
-        dst_gray = cv2.cvtColor(dest_frames[cam_idx], cv2.COLOR_BGR2GRAY)
+        p0_2d_src = p0_2d_all[cam_idx]
 
-        p0_2d_src = annotations_source[cam_idx]
+        # Filter valid points
         track_mask = ~np.isnan(p0_2d_src).any(axis=1)
 
         if focus_mode:
@@ -553,15 +519,12 @@ def track_points(
         if not np.any(track_mask):
             continue
 
-        start_points_for_lk = p0_2d_src[track_mask].reshape(-1, 1, 2)
-        point_indices_to_track = np.where(track_mask)[0]
-
-        if start_points_for_lk.size == 0:
-            continue
+        start_points = p0_2d_src[track_mask].reshape(-1, 1, 2)
+        point_indices = np.where(track_mask)[0]
 
         # Forward flow: source -> dest
         p1_forward, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
-            src_gray, dst_gray, start_points_for_lk, None, **config.LK_PARAMS
+            src_gray, dst_gray, start_points, None, **config.LK_PARAMS
         )
 
         # Backward flow: dest -> source
@@ -569,25 +532,35 @@ def track_points(
             dst_gray, src_gray, p1_forward, None, **config.LK_PARAMS
         )
 
-        for i, p_idx in enumerate(point_indices_to_track):
-            fb_error = np.linalg.norm(start_points_for_lk[i] - p0_backward[i])
+        for i, p_idx in enumerate(point_indices):
+            # Geometric check (Forward-Backward Error)
+            fb_error = np.linalg.norm(start_points[i] - p0_backward[i])
+            is_geom_valid = (status_fwd[i] == 1 and status_bwd[i] == 1 and
+                             fb_error < config.FORWARD_BACKWARD_THRESHOLD)
 
-            is_lk_successful = status_fwd[i] == 1 and status_bwd[i] == 1 and fb_error < config.FORWARD_BACKWARD_THRESHOLD
+            if is_geom_valid:
+                # Appearance check (NCC)
+                ncc_score = _compute_patch_ncc(
+                    src_gray, dst_gray,
+                    start_points[i].flatten(),
+                    p1_forward[i].flatten()
+                )
 
-            if is_lk_successful:
-                # Get confidence from the source frame for this point
-                prev_confidence = annotations_source_full[cam_idx, p_idx, 2]
+                if ncc_score < NCC_THRESHOLD:
+                    # Latch detected: The geometry is fine (LK found a match),
+                    # but the pixel content changed (for instance animal moved away, point stayed).
+                    continue
 
-                # If the source annotation didn't exist (shouldn't happen, but it's good to check)
-                if np.isnan(prev_confidence):
-                    prev_confidence = config.MAX_SINGLE_VIEW_CONFIDENCE
+                # Calculate Confidence
+                prev_conf = annotations_source_full[cam_idx, p_idx, 2]
+                if np.isnan(prev_conf): prev_conf = config.MAX_SINGLE_VIEW_CONFIDENCE
 
-                # Quality of this specific LK track (0.0 to 1.0)
-                lk_quality = (1.0 - (fb_error / config.FORWARD_BACKWARD_THRESHOLD))
+                geom_quality = (1.0 - (fb_error / config.FORWARD_BACKWARD_THRESHOLD))
 
-                # New confidence is the previous confidence modulated by the new track quality
-                new_confidence = prev_confidence * lk_quality
-                output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), new_confidence]
+                # We multiply by NCC squared to heavily penalize appearance changes
+                new_conf = prev_conf * geom_quality * (ncc_score ** 2)
+
+                output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), new_conf]
 
     # Confidence upgrade via multi-view consensus on the destination frame
     for p_idx in range(app_state.num_points):

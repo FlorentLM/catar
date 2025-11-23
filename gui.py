@@ -244,14 +244,6 @@ def _create_control_panel(app_state: AppState, queues: Queues, open3d_viz: Open3
             user_data=user_data,
             tag="point_combo"
         )
-        dpg.add_menu_item(
-            label="Point latch detection:",
-            tag="latch_detection_checkbox",
-            check=True,
-            default_value=False,
-            user_data=user_data,
-            callback=_toggle_latch_detection_callback
-        )
         dpg.add_button(
             label="Toggle live tracking",
             callback=_toggle_tracking_callback,
@@ -714,17 +706,6 @@ def _set_frame_callback(sender, app_data, user_data):
 # ============================================================================
 # Callbacks - Point Selection and Tracking
 # ============================================================================
-
-def _toggle_latch_detection_callback(sender, app_data, user_data):
-    """Toggle latch detection heuristic."""
-    app_state = user_data["app_state"]
-
-    with app_state.lock:
-        app_state.latch_detection_enabled = not app_state.latch_detection_enabled
-        is_enabled = app_state.latch_detection_enabled
-    enabled_str = 'ENABLED' if is_enabled else 'DISABLED'
-    print(f'Point latching detection: {enabled_str}')
-
 
 def _set_selected_point_callback(sender, app_data, user_data):
     """Change selected keypoint."""
@@ -1626,7 +1607,6 @@ def update_annotation_overlays(app_state: AppState):
 
         all_annotations = app_state.annotations[frame_idx]
         all_human_annotated = app_state.human_annotated[frame_idx]
-        all_suspicious = app_state.suspicious_points[frame_idx]
 
         point_names = app_state.point_names
         camera_colors = app_state.camera_colors
@@ -1678,11 +1658,10 @@ def update_annotation_overlays(app_state: AppState):
         # and all annotated points
         if not temp_hide_overlays:
             _draw_all_points(
-                cam_idx, all_annotations, all_human_annotated, all_suspicious,
+                cam_idx, all_annotations, all_human_annotated,
                 point_names, p_idx, focus_mode, app_state.num_points, scale_x, scale_y, layer_tag,
                 show_all_labels
             )
-
 
 def _draw_epipolar_lines(
         cam_idx, selected_annots, f_mats, num_videos,
@@ -1813,10 +1792,34 @@ def _draw_reprojection(
             parent=layer_tag
         )
 
+def _get_confidence_color(confidence: float) -> tuple:
+    """
+    Returns a color tuple (r, g, b) based on confidence (0.0 - 1.0).
+    Gradient: Red (0.0) -> Orange (0.5) -> Green (1.0).
+    """
+    if np.isnan(confidence):
+        return (0, 255, 255)
+
+    conf = max(0.0, min(1.0, confidence))
+
+    if conf < 0.5:
+        # red (255, 0, 0) to orange (255, 165, 0) interp
+        t = conf * 2.0  # 0.0 to 1.0
+        r = 255
+        g = int(165 * t)
+        b = 0
+    else:
+        # orange (255, 165, 0) to green (0, 255, 0) interp
+        t = (conf - 0.5) * 2.0  # 0.0 to 1.0
+        r = int(255 * (1.0 - t))
+        g = int(165 + (255 - 165) * t)
+        b = 0
+
+    return r, g, b
 
 def _draw_all_points(
-    cam_idx, annotations, human_annotated, suspicious_points,
-    point_names, selected_point_idx, focus_mode, num_points, scale_x, scale_y, layer_tag, show_all_labels
+    cam_idx, annotations, human_annotated, point_names,
+    selected_point_idx, focus_mode, num_points, scale_x, scale_y, layer_tag, show_all_labels
 ):
     """Draws all annotated keypoints and their labels."""
 
@@ -1825,27 +1828,20 @@ def _draw_all_points(
         if focus_mode and i != selected_point_idx:
             continue
 
-        # Get only x, y
-        point_2d = annotations[cam_idx, i, :2]
-        if np.isnan(point_2d).any():
+        # Check existence (x, y)
+        point_data = annotations[cam_idx, i]
+        if np.isnan(point_data[0]) or np.isnan(point_data[1]):
             continue
 
-        center_x = point_2d[0] * scale_x
-        center_y = point_2d[1] * scale_y
+        center_x = point_data[0] * scale_x
+        center_y = point_data[1] * scale_y
 
-        # Determine color
-        is_suspicious = suspicious_points[cam_idx, i]
-        is_human = human_annotated[cam_idx, i]
-        is_selected = (i == selected_point_idx)
-
-        if is_selected:
+        if i == selected_point_idx:
             color = (255, 255, 0)
-        elif is_suspicious:
-            color = (255, 0, 0)
-        elif is_human:
+        elif human_annotated[cam_idx, i]:
             color = (255, 255, 255)
         else:
-            color = (0, 255, 255)
+            color = _get_confidence_color(point_data[2])
 
         # Draw center dot
         dpg.draw_circle(
@@ -1856,7 +1852,7 @@ def _draw_all_points(
             parent=layer_tag
         )
 
-        # Label (only for current point)
+        # Label
         if show_all_labels or i == selected_point_idx:
             dpg.draw_text(
                 pos=(center_x + 8, center_y - 8),
@@ -1865,7 +1861,6 @@ def _draw_all_points(
                 size=14,
                 parent=layer_tag
             )
-
 
 def update_histogram(app_state: AppState):
     """Update annotation count histogram."""
