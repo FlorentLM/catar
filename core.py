@@ -16,13 +16,24 @@ from mokap.utils.geometry.fitting import quaternion_average
 from utils import reproject_points
 from viz_3d import SceneObject
 import config
-from state import AppState, CalibrationState, VideoState
+from state import CalibrationState
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
+    from state import AppState, VideoState
     from mokap.reconstruction.reconstruction import Reconstructor
     from mokap.reconstruction.tracking import MultiObjectTracker
 
+
+# Constants for anti-latch heuristic
+# TODO: Move to config once properly tested
+# TODO: Add slider in UI to control LATCH_NCC_THRESHOLD
+LATCH_PATCH_SIZE = 5            # 11x11 patch
+LATCH_MAX_PIXEL_MOTION = 4.0    # if 2D motion > this, we assume it's moving/active
+LATCH_NCC_THRESHOLD = 0.0       # 0.0: Disabled
+                                # 0.50: Extremely permissive (only kills a point if inverted/glitched)
+                                # 0.80: Standard (Kills if texture changes significantly)
+                                # 0.95: Strict (Kills if lighting changes even slightly)
 
 # ============================================================================
 # Camera geometry
@@ -238,7 +249,7 @@ def process_frame(
 
     # Debug print
     # TODO: Add toggle for these prints
-    print(f"\n[Frame {frame_idx} (src {source_frame_idx})]")
+    print(f"\n[Frame: {source_frame_idx} -> {frame_idx}]")
     print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
 
     if num_lk_points > 0:
@@ -381,10 +392,114 @@ def process_frame(
         app_state.annotations[frame_idx] = fused_2d_annotations
         app_state.reconstructed_3d_points[frame_idx] = final_3d_pose
 
+        latch_detection = app_state.latch_detection_enabled
+
+    if latch_detection:
+        # Step 5: Post-hoc analysis (anti-latch heuristic)
+        if app_state.calibration.best_calibration is not None:
+            detect_tracking_failures(
+                app_state,
+                frame_idx,
+                source_frame_idx,
+                source_frames,
+                dest_frames
+            )
+
+            # Step 6: Kill switch
+            with app_state.lock:
+                suspicious_mask = app_state.suspicious_points[frame_idx]
+                is_auto = ~app_state.human_annotated[frame_idx]     # only kill auto tracks
+                kill_mask = suspicious_mask & is_auto
+
+                if np.any(kill_mask):
+                    # Set to nan to stop LK from propagating this error in the current view
+                    app_state.annotations[frame_idx][kill_mask] = np.nan
+                    print(f"  [Anti-latch] Killed {np.sum(kill_mask)} point tracks.")
+
 
 # ============================================================================
 # Optic flow tracking
 # ============================================================================
+
+def detect_tracking_failures(
+        app_state: 'AppState',
+        frame_idx: int,
+        prev_frame_idx: int,
+        source_frames: List[np.ndarray],
+        dest_frames: List[np.ndarray]
+):
+    """
+    Detects tracking failures using Normalized Cross-Correlation (NCC).
+    """
+    with app_state.lock:
+        annots_curr = app_state.annotations[frame_idx]
+        annots_prev = app_state.annotations[prev_frame_idx]
+
+    num_points = annots_curr.shape[1]
+    num_cams = len(dest_frames)
+
+    # Reset flags for this frame
+    suspicious_flags = np.zeros((num_cams, num_points), dtype=bool)
+
+    src_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in source_frames]
+    dst_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in dest_frames]
+
+    for c_idx in range(num_cams):
+        img_src = src_grays[c_idx]
+        img_dst = dst_grays[c_idx]
+        h, w = img_src.shape
+
+        for p_idx in range(num_points):
+
+            p2d_prev = annots_prev[c_idx, p_idx, :2]
+            p2d_curr = annots_curr[c_idx, p_idx, :2]
+
+            if np.isnan(p2d_prev).any() or np.isnan(p2d_curr).any():
+                continue
+
+            # Check geometry: is the point staying still?
+            motion_2d = np.linalg.norm(p2d_curr - p2d_prev)
+
+            # If it moved significantly, we assume it's tracking "something"
+            if motion_2d > LATCH_MAX_PIXEL_MOTION:
+                continue
+
+            # Check appearance: did image content change?
+            u_prev, v_prev = p2d_prev
+            u_curr, v_curr = p2d_curr
+
+            pad = LATCH_PATCH_SIZE // 2  # half-size for padding calc
+
+            if (u_prev < pad or u_prev >= w - pad or v_prev < pad or v_prev >= h - pad or
+                    u_curr < pad or u_curr >= w - pad or v_curr < pad or v_curr >= h - pad):
+                continue
+
+            ix_src, iy_src = int(round(u_prev)), int(round(v_prev))
+            ix_dst, iy_dst = int(round(u_curr)), int(round(v_curr))
+
+            # Extract patches
+            patch_src = img_src[iy_src - pad:iy_src + pad + 1, ix_src - pad:ix_src + pad + 1]
+            patch_dst = img_dst[iy_dst - pad:iy_dst + pad + 1, ix_dst - pad:ix_dst + pad + 1]
+
+            if patch_src.shape != patch_dst.shape or patch_src.size == 0:
+                continue
+
+            # NCC calculation
+            # Result is -1 to 1. Map to 0 to 1 for easier thresholding
+            res = cv2.matchTemplate(patch_dst, patch_src, cv2.TM_CCOEFF_NORMED)
+            ncc_norm = (res[0][0] + 1.0) / 2.0
+
+            # Decide:
+            # If motion is low (= geometrically latched)
+            # but correlation is low (= visually changed)
+            # Then the point is likely stuck on the background while the animal moved away
+            if ncc_norm < LATCH_NCC_THRESHOLD:
+                suspicious_flags[c_idx, p_idx] = True
+
+    with app_state.lock:
+        app_state.suspicious_points[frame_idx] = suspicious_flags
+
+
 
 def track_points(
         app_state: 'AppState',

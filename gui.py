@@ -244,24 +244,34 @@ def _create_control_panel(app_state: AppState, queues: Queues, open3d_viz: Open3
             user_data=user_data,
             tag="point_combo"
         )
+        dpg.add_menu_item(
+            label="Point latch detection:",
+            tag="latch_detection_checkbox",
+            check=True,
+            default_value=False,
+            user_data=user_data,
+            callback=_toggle_latch_detection_callback
+        )
         dpg.add_button(
             label="Toggle live tracking",
             callback=_toggle_tracking_callback,
             user_data=user_data,
             tag="keypoint_tracking_button"
         )
-        dpg.add_button(
-            label="Track Forward",
-            callback=_start_batch_track_fwd_callback,
-            user_data=user_data,
-            # tag="batch_track_fwd_button"
-        )
-        dpg.add_button(
-            label="Track Backward",
-            callback=_start_batch_track_bwd_callback,
-            user_data=user_data,
-            # tag="batch_track_bwd_button"
-        )
+
+        with dpg.group(horizontal=True):
+            dpg.add_button(
+                label="< Track Backward",
+                callback=_start_batch_track_bwd_callback,
+                user_data=user_data,
+                width=125
+            )
+            dpg.add_button(
+                label="Track Forward >",
+                callback=_start_batch_track_fwd_callback,
+                user_data=user_data,
+                width=125
+            )
 
         dpg.add_button(
             label="Set as Human annotated (H)",
@@ -704,6 +714,17 @@ def _set_frame_callback(sender, app_data, user_data):
 # ============================================================================
 # Callbacks - Point Selection and Tracking
 # ============================================================================
+
+def _toggle_latch_detection_callback(sender, app_data, user_data):
+    """Toggle latch detection heuristic."""
+    app_state = user_data["app_state"]
+
+    with app_state.lock:
+        app_state.latch_detection_enabled = not app_state.latch_detection_enabled
+        is_enabled = app_state.latch_detection_enabled
+    enabled_str = 'ENABLED' if is_enabled else 'DISABLED'
+    print(f'Point latching detection: {enabled_str}')
+
 
 def _set_selected_point_callback(sender, app_data, user_data):
     """Change selected keypoint."""
@@ -1605,6 +1626,8 @@ def update_annotation_overlays(app_state: AppState):
 
         all_annotations = app_state.annotations[frame_idx]
         all_human_annotated = app_state.human_annotated[frame_idx]
+        all_suspicious = app_state.suspicious_points[frame_idx]
+
         point_names = app_state.point_names
         camera_colors = app_state.camera_colors
         camera_names = app_state.camera_names
@@ -1655,8 +1678,8 @@ def update_annotation_overlays(app_state: AppState):
         # and all annotated points
         if not temp_hide_overlays:
             _draw_all_points(
-                cam_idx, all_annotations, all_human_annotated, point_names,
-                p_idx, focus_mode, app_state.num_points, scale_x, scale_y, layer_tag,
+                cam_idx, all_annotations, all_human_annotated, all_suspicious,
+                point_names, p_idx, focus_mode, app_state.num_points, scale_x, scale_y, layer_tag,
                 show_all_labels
             )
 
@@ -1792,8 +1815,8 @@ def _draw_reprojection(
 
 
 def _draw_all_points(
-    cam_idx, annotations, human_annotated, point_names,
-    selected_point_idx, focus_mode, num_points, scale_x, scale_y, layer_tag, show_all_labels
+    cam_idx, annotations, human_annotated, suspicious_points,
+    point_names, selected_point_idx, focus_mode, num_points, scale_x, scale_y, layer_tag, show_all_labels
 ):
     """Draws all annotated keypoints and their labels."""
 
@@ -1810,8 +1833,19 @@ def _draw_all_points(
         center_x = point_2d[0] * scale_x
         center_y = point_2d[1] * scale_y
 
-        non_selected_colour = (255, 255, 255) if human_annotated[cam_idx, i] else (0, 255, 255)
-        color = (255, 255, 0) if i == selected_point_idx else non_selected_colour
+        # Determine color
+        is_suspicious = suspicious_points[cam_idx, i]
+        is_human = human_annotated[cam_idx, i]
+        is_selected = (i == selected_point_idx)
+
+        if is_selected:
+            color = (255, 255, 0)
+        elif is_suspicious:
+            color = (255, 0, 0)
+        elif is_human:
+            color = (255, 255, 255)
+        else:
+            color = (0, 255, 255)
 
         # Draw center dot
         dpg.draw_circle(
