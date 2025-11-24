@@ -29,6 +29,9 @@ LK_PARAMS = dict(
 
 # Tracking parameters
 
+# Decaying confidence with time from last human-annotated frame
+CONFIDENCE_TIME_DECAY = 0.96
+
 # The maximum distance for two sources to be considered in agreement.
 # This defines the tolerance for consensus and the boundary for the confidence bonus falloff.
 FUSION_AGREEMENT_RADIUS = 5.0  # in pixels

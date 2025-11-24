@@ -29,12 +29,12 @@ if TYPE_CHECKING:
 
 # NCC Threshold: 0.8 is a safe conservative bet
 # It means "The new patch is at least 80% similar to the old patch"
-NCC_THRESHOLD = 0.8
+NCC_THRESHOLD = 0.75
 NCC_PATCH_SIZE = 11
 
 # Rescue threshold can be lower here because reprojected points
 # might be slightly misaligned compared to perfect LK tracking
-NCC_THRESHOLD_RESCUE = 0.6
+NCC_THRESHOLD_RESCUE = 0.5
 
 
 # ============================================================================
@@ -235,6 +235,7 @@ def process_frame(
     with app_state.lock:
         calibration = app_state.calibration
         point_names = app_state.point_names
+        cam_names = app_state.camera_names
 
         # Load source annotations for validation later
         prev_annotations_for_validation = app_state.annotations[source_frame_idx].copy()
@@ -360,7 +361,9 @@ def process_frame(
         prev_annots=prev_annotations_for_validation,
         lk_annots=annotations_from_lk,
         src_frames=source_frames,
-        dst_frames=dest_frames
+        dst_frames=dest_frames,
+        cam_names=cam_names,
+        point_names=point_names
     )
 
     # Step 2: Generate (the hopefully high fidelity) 3D data by triangulating these fused 2D points
@@ -392,6 +395,29 @@ def process_frame(
         # succeeded (via single-view rescue for instance)
         elif final_3d_skeleton_kps and p_name in final_3d_skeleton_kps:
             final_3d_pose[p_idx] = final_3d_skeleton_kps[p_name]
+
+    # Structural feedback
+    # If the skeleton assembler rejected a point we penalize the 2D track for this frame.
+    # (otherwise the next frame could continue tracking this zombie points)
+    if final_3d_skeleton_kps:
+        assembled_names = set(final_3d_skeleton_kps.keys())
+
+        for p_idx in range(app_state.num_points):
+            p_name = app_state.point_names[p_idx]
+
+            if p_name not in assembled_names:
+                # don't necessarily delete it (might be a valid point that was just occluded once or whatever),
+                # but drop confidence significantly so it dies quickly if it keeps failing
+                valid_mask = ~np.isnan(fused_2d_annotations[:, p_idx, 0])
+                if np.any(valid_mask):
+                    print(f"ZOMBIE POINT: '{point_names[p_idx]}' was rejected by Mokap")
+
+                    fused_2d_annotations[valid_mask, p_idx, 2] *= 0.5   # slash conf by half
+
+                    # # if confidence drops too low, kill it entirely
+                    # # TODO: test if that's useful
+                    # kill_mask = fused_2d_annotations[:, p_idx, 2] < 0.1
+                    # fused_2d_annotations[kill_mask, p_idx, :] = np.nan
 
     # Step 4: Update app state with the final data for this frame
     with app_state.lock:
@@ -433,6 +459,7 @@ def _compute_patch_ncc(
 
         res = cv2.matchTemplate(patch_curr.astype(np.float32), patch_prev.astype(np.float32), cv2.TM_CCOEFF_NORMED)
         return res[0][0]
+
     except Exception:
         return -1.0
 
@@ -442,7 +469,9 @@ def validate_rescued_points(
         prev_annots: np.ndarray,
         lk_annots: np.ndarray,
         src_frames: List[np.ndarray],
-        dst_frames: List[np.ndarray]
+        dst_frames: List[np.ndarray],
+        cam_names: List[str],
+        point_names: List[str],
 ) -> np.ndarray:
     """
     Checks points that were lost by LK but rescued by fusion.
@@ -470,6 +499,7 @@ def validate_rescued_points(
                 if ncc < NCC_THRESHOLD_RESCUE:
                     # Reject rescue
                     validated_annots[c, p] = np.nan
+                    print(f"SVR REJECT: Camera '{cam_names[c]}': '{point_names[p]}' looks like a wrong rescue.")
 
     return validated_annots
 
@@ -558,7 +588,7 @@ def track_points(
                 geom_quality = (1.0 - (fb_error / config.FORWARD_BACKWARD_THRESHOLD))
 
                 # We multiply by NCC squared to heavily penalize appearance changes
-                new_conf = prev_conf * geom_quality * (ncc_score ** 2)
+                new_conf = prev_conf * geom_quality * (ncc_score ** 2) * config.CONFIDENCE_TIME_DECAY
 
                 output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), new_conf]
 
