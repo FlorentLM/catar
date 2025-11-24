@@ -25,17 +25,11 @@ if TYPE_CHECKING:
     from mokap.reconstruction.tracking import MultiObjectTracker
 
 
+# NCC settings
 # TODO: Move these to config
-
-# NCC Threshold: 0.8 is a safe conservative bet
-# It means "The new patch is at least 80% similar to the old patch"
 NCC_THRESHOLD_WARNING = 0.6
 NCC_THRESHOLD_KILL = 0.3
 NCC_PATCH_SIZE = 11
-
-# Rescue threshold can be lower here because reprojected points
-# might be slightly misaligned compared to perfect LK tracking
-NCC_THRESHOLD_RESCUE = 0.5
 
 
 # ============================================================================
@@ -233,10 +227,12 @@ def process_frame(
     Runs the full pipeline (get the state of 'frame_idx' based on 'source_frame_idx').
     """
 
+    print(f"\n[Frame: {source_frame_idx} -> {frame_idx}]")
+
     with app_state.lock:
         calibration = app_state.calibration
         point_names = app_state.point_names
-        cam_names = app_state.camera_names
+        # cam_names = app_state.camera_names
 
         # Load source annotations for validation later
         prev_annotations_for_validation = app_state.annotations[source_frame_idx].copy()
@@ -253,12 +249,10 @@ def process_frame(
 
     # Prepare input for Mokap Reconstructor
     cam_indices, point_indices = np.where(~np.isnan(annotations_from_lk[..., 0]))
-
     num_lk_points = len(cam_indices)
 
     # Debug print
     # TODO: Add toggle for these prints
-    print(f"\n[Frame: {source_frame_idx} -> {frame_idx}]")
     print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
 
     if num_lk_points > 0:
@@ -331,7 +325,10 @@ def process_frame(
             reprojected_all_cams = np.asarray(reprojected_all_cams)  # shape (C, P_reproj, 2)
 
             # Fill annotation array
-            model_confidence = skeleton_score * 0.75
+            MAX_MOKAP_SCORE = 1600.0    # TODO: Should get mokap to normalise its scores internally
+
+            model_confidence = np.clip(skeleton_score / MAX_MOKAP_SCORE, 0.0, 1.0)
+
             for i, p_idx in enumerate(p_indices):
                 annotations_from_model[:, p_idx, :2] = reprojected_all_cams[:, i, :]
                 annotations_from_model[:, p_idx, 2] = model_confidence
@@ -357,18 +354,6 @@ def process_frame(
             # ...find the camera that had the single track and re-insert it
             cam_idx = np.where(is_valid_lk[:, p_idx])[0][0]
             fused_2d_annotations[cam_idx, p_idx] = annotations_from_lk[cam_idx, p_idx]
-
-    # Validate rescued points
-    # Reject SVR/model jumps if appearance changes drastically
-    fused_2d_annotations = validate_rescued_points(
-        fused_annots=fused_2d_annotations,
-        prev_annots=prev_annotations_for_validation,
-        lk_annots=annotations_from_lk,
-        src_frames_gray=src_gray,
-        dst_frames_gray=dst_gray,
-        cam_names=cam_names,
-        point_names=point_names
-    )
 
     # Step 2: Generate (the hopefully high fidelity) 3D data by triangulating these fused 2D points
     triangulated_3d_points = np.full((app_state.num_points, 3), np.nan, dtype=np.float32)
@@ -403,13 +388,16 @@ def process_frame(
     # Structural feedback
     # If the skeleton assembler rejected a point we penalize the 2D track for this frame.
     # (otherwise the next frame could continue tracking this zombie points)
+
+    non_skeleton_points = ['s_small', 's_large']    # TODO: This needs to be in appstate and configurable from the GUI
+
     if final_3d_skeleton_kps:
         assembled_names = set(final_3d_skeleton_kps.keys())
 
         for p_idx in range(app_state.num_points):
             p_name = app_state.point_names[p_idx]
 
-            if p_name not in assembled_names:
+            if p_name not in assembled_names and p_name not in non_skeleton_points:
                 # don't necessarily delete it (might be a valid point that was just occluded once or whatever),
                 # but drop confidence significantly so it dies quickly if it keeps failing
                 valid_mask = ~np.isnan(fused_2d_annotations[:, p_idx, 0])
@@ -418,10 +406,10 @@ def process_frame(
 
                     fused_2d_annotations[valid_mask, p_idx, 2] *= 0.5   # slash conf by half
 
-                    # # if confidence drops too low, kill it entirely
-                    # # TODO: test if that's useful
-                    # kill_mask = fused_2d_annotations[:, p_idx, 2] < 0.1
-                    # fused_2d_annotations[kill_mask, p_idx, :] = np.nan
+                    # if confidence drops too low, kill it entirely
+                    # TODO: test if that's useful
+                    kill_mask = fused_2d_annotations[:, p_idx, 2] < 0.1
+                    fused_2d_annotations[kill_mask, p_idx, :] = np.nan
 
     # Step 4: Update app state with the final data for this frame
     with app_state.lock:
@@ -467,44 +455,6 @@ def _compute_patch_ncc(
     except Exception:
         return -1.0
 
-
-def validate_rescued_points(
-        fused_annots: np.ndarray,
-        prev_annots: np.ndarray,
-        lk_annots: np.ndarray,
-        src_frames_gray: List[np.ndarray],
-        dst_frames_gray: List[np.ndarray],
-        cam_names: List[str],
-        point_names: List[str],
-) -> np.ndarray:
-    """
-    Checks points that were lost by LK but rescued by fusion.
-    If the rescued point looks too different from the previous frame, reject it.
-    """
-    num_cams, num_points, _ = fused_annots.shape
-    validated_annots = fused_annots.copy()
-
-    for c in range(num_cams):
-        for p in range(num_points):
-            # Condition: LK failed, but fusion returned a value, and we have history
-            if (np.isnan(lk_annots[c, p, 0]) and
-                    not np.isnan(fused_annots[c, p, 0]) and
-                    not np.isnan(prev_annots[c, p, 0])):
-
-                ncc = _compute_patch_ncc(
-                    src_frames_gray[c], dst_frames_gray[c],
-                    prev_annots[c, p, :2],
-                    fused_annots[c, p, :2]
-                )
-
-                if ncc < NCC_THRESHOLD_RESCUE:
-                    # Reject rescue
-                    validated_annots[c, p] = np.nan
-                    print(f"APPEARENCE REJECT: Camera '{cam_names[c]}': '{point_names[p]}' looks too different from previous frame.")
-
-    return validated_annots
-
-
 def track_points(
         app_state: 'AppState',
         source_frames_gray: List[np.ndarray],
@@ -521,6 +471,7 @@ def track_points(
         annotations_source_full = app_state.annotations[source_frame_idx].copy()
         calibration = app_state.calibration
         cam_names = app_state.camera_names
+        point_names = app_state.point_names
 
     p0_2d_all = annotations_source_full[..., :2]
     num_cams, num_points, _ = annotations_source_full.shape
@@ -560,7 +511,7 @@ def track_points(
         )
 
         for i, p_idx in enumerate(point_indices):
-            # Geometric check (Forward-Backward Error)
+            # Geometric check (forward-backward error)
             fb_error = np.linalg.norm(start_points[i] - p0_backward[i])
             is_geom_valid = (status_fwd[i] == 1 and status_bwd[i] == 1 and
                              fb_error < config.FORWARD_BACKWARD_THRESHOLD)
@@ -575,6 +526,7 @@ def track_points(
 
                 # If it's terrible, kill it
                 if ncc_score < NCC_THRESHOLD_KILL:
+                    print(f"NCC CHECK: Killed point '{point_names[p_idx]}' in camera '{cam_names[cam_idx]}' (NCC score = {ncc_score:.2f})")
                     continue
 
                 # Confidence
@@ -586,6 +538,8 @@ def track_points(
                 # Apply soft penalty for lower NCC scores
                 ncc_factor = 1.0
                 if ncc_score < NCC_THRESHOLD_WARNING:
+                    print(f"NCC CHECK: Penalty applied to '{point_names[p_idx]}' in camera '{cam_names[cam_idx]}' (NCC score = {ncc_score:.2f})")
+
                     # Linearly scale down: 0.6 -> 1.0, 0.3 -> 0.0
                     ncc_factor = max(0.0, (ncc_score - NCC_THRESHOLD_KILL) / (
                                 NCC_THRESHOLD_WARNING - NCC_THRESHOLD_KILL))

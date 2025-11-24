@@ -1856,9 +1856,9 @@ def _draw_all_points(
         if show_all_labels or i == selected_point_idx:
             dpg.draw_text(
                 pos=(center_x + 8, center_y - 8),
-                text=point_names[i],
+                text=f"{point_names[i]} ({point_data[2]:.2f})",
                 color=color,
-                size=14,
+                size=12,
                 parent=layer_tag
             )
 
