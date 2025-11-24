@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 # NCC settings
 # TODO: Move these to config
-NCC_THRESHOLD_WARNING = 0.6
+NCC_THRESHOLD_WARNING = 0.65
 NCC_THRESHOLD_KILL = 0.3
 NCC_PATCH_SIZE = 11
 
@@ -234,8 +234,6 @@ def process_frame(
         point_names = app_state.point_names
         # cam_names = app_state.camera_names
 
-        # Load source annotations for validation later
-        prev_annotations_for_validation = app_state.annotations[source_frame_idx].copy()
         human_flags_for_frame = app_state.human_annotated[frame_idx].copy()
         human_annots_for_frame = app_state.annotations[frame_idx].copy()
 
@@ -284,15 +282,22 @@ def process_frame(
 
     # Extract best skeleton for feedback loop
     final_3d_skeleton_kps = None
-    skeleton_score = 0.0
+    normalised_skeleton_score = 0.0
 
     if active_tracklets:
         # Heuristic: Pick tracklet with most keypoints or highest score
         best_tracklet = max(active_tracklets, key=lambda t: (len(t.skeleton.keypoints), t.skeleton.score))
         final_3d_skeleton_kps = best_tracklet.skeleton.keypoints
         num_kps = len(final_3d_skeleton_kps)
-        skeleton_score = best_tracklet.skeleton.score
-        print(f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints (Score: {skeleton_score:.2f}).")
+
+        max_score = reconstructor.max_point_score
+        avg_score = best_tracklet.skeleton.score / max(1, num_kps)
+
+        # Clip at 1.0 to handle eventual score bonuses gracefully
+        normalised_skeleton_score = np.clip(avg_score / max_score, 0.0, 1.0)
+
+        print(
+            f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints (score: {best_tracklet.skeleton.score:.2f} or {normalised_skeleton_score:.2f}).")
     else:
         print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
 
@@ -324,14 +329,10 @@ def process_frame(
             )
             reprojected_all_cams = np.asarray(reprojected_all_cams)  # shape (C, P_reproj, 2)
 
-            # Fill annotation array
-            MAX_MOKAP_SCORE = 1600.0    # TODO: Should get mokap to normalise its scores internally
-
-            model_confidence = np.clip(skeleton_score / MAX_MOKAP_SCORE, 0.0, 1.0)
-
+            # Fill annotation array using normalised score
             for i, p_idx in enumerate(p_indices):
                 annotations_from_model[:, p_idx, :2] = reprojected_all_cams[:, i, :]
-                annotations_from_model[:, p_idx, 2] = model_confidence
+                annotations_from_model[:, p_idx, 2] = normalised_skeleton_score
 
     # Step 1: Get best possible 2D annotations by fusing all evidence
     fused_2d_annotations = _fuse_annotations(
@@ -356,11 +357,12 @@ def process_frame(
             fused_2d_annotations[cam_idx, p_idx] = annotations_from_lk[cam_idx, p_idx]
 
     # Step 2: Generate (the hopefully high fidelity) 3D data by triangulating these fused 2D points
-    triangulated_3d_points = np.full((app_state.num_points, 3), np.nan, dtype=np.float32)
-    if calibration.best_calibration is not None:
+    # We store (x, y, z, score) where score is 1 / (1 + error)
+    final_3d_pose = np.full((app_state.num_points, 4), np.nan, dtype=np.float32)
 
-        points2d_for_triangulation = fused_2d_annotations[..., :2] # (C, P, 2)
-        weights_for_triangulation = fused_2d_annotations[..., 2] # (C, P)
+    if calibration.best_calibration is not None:
+        points2d_for_triangulation = fused_2d_annotations[..., :2]  # (C, P, 2)
+        weights_for_triangulation = fused_2d_annotations[..., 2]  # (C, P)
 
         triangulated_3d_points = projective.triangulate_points_from_projections(
             points2d=jnp.asarray(points2d_for_triangulation),
@@ -369,27 +371,43 @@ def process_frame(
         )
         triangulated_3d_points = np.asarray(triangulated_3d_points)
 
-    # Step 3: Create the final 3D pose for this frame (priority on triangulation)
-    final_3d_pose = np.full((app_state.num_points, 3), np.nan, dtype=np.float32)
+        # Compute 3D confidence (Reprojection Error)
+        reprojected, _ = projective.project_to_multiple_cameras(
+            object_points=triangulated_3d_points,
+            rvec=jnp.asarray(calibration.rvecs_w2c),
+            tvec=jnp.asarray(calibration.tvecs_w2c),
+            camera_matrix=jnp.asarray(calibration.K_mats),
+            dist_coeffs=jnp.asarray(calibration.dist_coeffs)
+        )
 
+        diffs = reprojected - jnp.asarray(points2d_for_triangulation)
+        errors = jnp.sqrt(jnp.sum(diffs ** 2, axis=-1))  # (C, P)
+
+        # Mean error over valid views
+        valid_mask = (jnp.asarray(weights_for_triangulation) > 0)
+        mean_errors = jnp.sum(jnp.where(valid_mask, errors, 0.0), axis=0) / jnp.maximum(jnp.sum(valid_mask, axis=0),
+                                                                                        1.0)
+
+        points_3d_scores = np.asarray(1.0 / (1.0 + mean_errors))
+
+    # Step 3: Create the final 3D pose for this frame (priority on triangulation)
     for p_idx in range(app_state.num_points):
         p_name = app_state.point_names[p_idx]
 
         # Priority 1: Use the triangulation result if it's valid
-        if not np.isnan(triangulated_3d_points[p_idx, 0]):
-            final_3d_pose[p_idx] = triangulated_3d_points[p_idx]
+        if calibration.best_calibration is not None and not np.isnan(triangulated_3d_points[p_idx, 0]):
+            final_3d_pose[p_idx, :3] = triangulated_3d_points[p_idx]
+            final_3d_pose[p_idx, 3] = points_3d_scores[p_idx]
 
         # Priority 2 (fallback): If triangulation failed, use mokap skeleton's position
-        # This helps fill gaps where direct triangulation failed but the skeleton assembler
-        # succeeded (via single-view rescue for instance)
         elif final_3d_skeleton_kps and p_name in final_3d_skeleton_kps:
-            final_3d_pose[p_idx] = final_3d_skeleton_kps[p_name]
+            final_3d_pose[p_idx, :3] = final_3d_skeleton_kps[p_name]
+            # Use normalised skeleton score as proxy for 3D confidence, slightly penalized
+            final_3d_pose[p_idx, 3] = normalised_skeleton_score * 0.8
 
     # Structural feedback
-    # If the skeleton assembler rejected a point we penalize the 2D track for this frame.
-    # (otherwise the next frame could continue tracking this zombie points)
-
-    non_skeleton_points = ['s_small', 's_large']    # TODO: This needs to be in appstate and configurable from the GUI
+    # If the skeleton assembler rejected a point we penalize the 2D track for this frame
+    non_skeleton_points = ['s_small', 's_large']  # TODO: This needs to be in appstate and configurable from the GUI
 
     if final_3d_skeleton_kps:
         assembled_names = set(final_3d_skeleton_kps.keys())
@@ -404,7 +422,7 @@ def process_frame(
                 if np.any(valid_mask):
                     print(f"ZOMBIE POINT: '{point_names[p_idx]}' was rejected by Mokap")
 
-                    fused_2d_annotations[valid_mask, p_idx, 2] *= 0.5   # slash conf by half
+                    fused_2d_annotations[valid_mask, p_idx, 2] *= 0.5  # slash conf by half
 
                     # if confidence drops too low, kill it entirely
                     # TODO: test if that's useful
@@ -414,7 +432,8 @@ def process_frame(
     # Step 4: Update app state with the final data for this frame
     with app_state.lock:
         app_state.annotations[frame_idx] = fused_2d_annotations
-        app_state.reconstructed_3d_points[frame_idx] = final_3d_pose
+        app_state.reconstructed_3d_points[frame_idx] = final_3d_pose[
+            :, :3]  # TODO: slicing to 3 to keep state compatible for now, SHOULD UPDATE THE REST
 
 # ============================================================================
 # Optic flow tracking
@@ -428,7 +447,7 @@ def _compute_patch_ncc(
         patch_size: int = NCC_PATCH_SIZE
 ) -> float:
     """
-    Computes Normalized Cross Correlation between two patches.
+    Computes Normalised Cross Correlation between two patches.
     Returns 1.0 if identical, -1.0 if inverted, 0.0 if uncorrelated.
     Returns -1.0 if patches are out of bounds or invalid.
     """
@@ -593,12 +612,8 @@ def track_points(
                 # Convert error into a confidence score
                 multi_view_confidence = max(0.0, 1.0 - (error / config.LK_CONFIDENCE_MAX_ERROR))
 
-                # We only update the confidence if the multi-view check provides a better score
-                # (This prevents a stable single-view track from being punished by noisy triangulation)
-                output_annotations[cam_idx_to_check, p_idx, 2] = max(
-                    output_annotations[cam_idx_to_check, p_idx, 2],
-                    multi_view_confidence
-                )
+                if multi_view_confidence < output_annotations[cam_idx_to_check, p_idx, 2]:
+                    output_annotations[cam_idx_to_check, p_idx, 2] = multi_view_confidence
 
     # Ensure that no automated track's confidence exceeds the maximum allowed value
     is_valid = ~np.isnan(output_annotations[..., 2])
