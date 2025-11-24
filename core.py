@@ -29,7 +29,8 @@ if TYPE_CHECKING:
 
 # NCC Threshold: 0.8 is a safe conservative bet
 # It means "The new patch is at least 80% similar to the old patch"
-NCC_THRESHOLD = 0.75
+NCC_THRESHOLD_WARNING = 0.6
+NCC_THRESHOLD_KILL = 0.3
 NCC_PATCH_SIZE = 11
 
 # Rescue threshold can be lower here because reprojected points
@@ -242,9 +243,12 @@ def process_frame(
         human_flags_for_frame = app_state.human_annotated[frame_idx].copy()
         human_annots_for_frame = app_state.annotations[frame_idx].copy()
 
+    src_gray = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in source_frames]
+    dst_gray = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in dest_frames]
+
     # Get geometric prediction and confidence score from LK tracking
     annotations_from_lk = track_points(
-        app_state, source_frames, dest_frames, source_frame_idx, frame_idx
+        app_state, src_gray, dst_gray, source_frame_idx, frame_idx
     )
 
     # Prepare input for Mokap Reconstructor
@@ -360,8 +364,8 @@ def process_frame(
         fused_annots=fused_2d_annotations,
         prev_annots=prev_annotations_for_validation,
         lk_annots=annotations_from_lk,
-        src_frames=source_frames,
-        dst_frames=dest_frames,
+        src_frames_gray=src_gray,
+        dst_frames_gray=dst_gray,
         cam_names=cam_names,
         point_names=point_names
     )
@@ -468,8 +472,8 @@ def validate_rescued_points(
         fused_annots: np.ndarray,
         prev_annots: np.ndarray,
         lk_annots: np.ndarray,
-        src_frames: List[np.ndarray],
-        dst_frames: List[np.ndarray],
+        src_frames_gray: List[np.ndarray],
+        dst_frames_gray: List[np.ndarray],
         cam_names: List[str],
         point_names: List[str],
 ) -> np.ndarray:
@@ -480,9 +484,6 @@ def validate_rescued_points(
     num_cams, num_points, _ = fused_annots.shape
     validated_annots = fused_annots.copy()
 
-    src_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in src_frames]
-    dst_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in dst_frames]
-
     for c in range(num_cams):
         for p in range(num_points):
             # Condition: LK failed, but fusion returned a value, and we have history
@@ -491,7 +492,7 @@ def validate_rescued_points(
                     not np.isnan(prev_annots[c, p, 0])):
 
                 ncc = _compute_patch_ncc(
-                    src_grays[c], dst_grays[c],
+                    src_frames_gray[c], dst_frames_gray[c],
                     prev_annots[c, p, :2],
                     fused_annots[c, p, :2]
                 )
@@ -499,15 +500,15 @@ def validate_rescued_points(
                 if ncc < NCC_THRESHOLD_RESCUE:
                     # Reject rescue
                     validated_annots[c, p] = np.nan
-                    print(f"SVR REJECT: Camera '{cam_names[c]}': '{point_names[p]}' looks like a wrong rescue.")
+                    print(f"APPEARENCE REJECT: Camera '{cam_names[c]}': '{point_names[p]}' looks too different from previous frame.")
 
     return validated_annots
 
 
 def track_points(
         app_state: 'AppState',
-        source_frames: List[np.ndarray],
-        dest_frames: List[np.ndarray],
+        source_frames_gray: List[np.ndarray],
+        dest_frames_gray: List[np.ndarray],
         source_frame_idx: int,
         dest_frame_idx: int
 ) -> np.ndarray:
@@ -528,13 +529,9 @@ def track_points(
     if calibration.best_calibration is None:
         return output_annotations
 
-    # Pre-convert to gray to avoid doing it per-point or twice
-    src_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in source_frames]
-    dst_grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in dest_frames]
-
     for cam_idx in range(num_cams):
-        src_gray = src_grays[cam_idx]
-        dst_gray = dst_grays[cam_idx]
+        src_gray = source_frames_gray[cam_idx]
+        dst_gray = dest_frames_gray[cam_idx]
 
         p0_2d_src = p0_2d_all[cam_idx]
 
@@ -576,19 +573,24 @@ def track_points(
                     p1_forward[i].flatten()
                 )
 
-                if ncc_score < NCC_THRESHOLD:
-                    # Latch detected: The geometry is fine (LK found a match),
-                    # but the pixel content changed (for instance animal moved away, point stayed).
+                # If it's terrible, kill it
+                if ncc_score < NCC_THRESHOLD_KILL:
                     continue
 
-                # Calculate Confidence
+                # Confidence
                 prev_conf = annotations_source_full[cam_idx, p_idx, 2]
                 if np.isnan(prev_conf): prev_conf = config.MAX_SINGLE_VIEW_CONFIDENCE
 
                 geom_quality = (1.0 - (fb_error / config.FORWARD_BACKWARD_THRESHOLD))
 
-                # We multiply by NCC squared to heavily penalize appearance changes
-                new_conf = prev_conf * geom_quality * (ncc_score ** 2) * config.CONFIDENCE_TIME_DECAY
+                # Apply soft penalty for lower NCC scores
+                ncc_factor = 1.0
+                if ncc_score < NCC_THRESHOLD_WARNING:
+                    # Linearly scale down: 0.6 -> 1.0, 0.3 -> 0.0
+                    ncc_factor = max(0.0, (ncc_score - NCC_THRESHOLD_KILL) / (
+                                NCC_THRESHOLD_WARNING - NCC_THRESHOLD_KILL))
+
+                new_conf = prev_conf * geom_quality * ncc_factor * config.CONFIDENCE_TIME_DECAY
 
                 output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), new_conf]
 
