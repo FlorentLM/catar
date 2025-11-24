@@ -188,10 +188,26 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                     # Conditionally update the 3D points if they were returned
                     refined_3d_points = ba_result.get('refined_3d_points')
                     if refined_3d_points is not None:
-                        print("Applying refined 3D points for calibration frames.")
+                        from core import compute_3d_scores
+
                         calib_indices = ba_result['calibration_frame_indices']
+
+                        # Get annotations for these frames to score against
+                        with app_state.lock:
+                            ba_annotations = app_state.annotations[calib_indices]
+
                         for i, frame_idx in enumerate(calib_indices):
-                            app_state.reconstructed_3d_points[frame_idx] = refined_3d_points[i]
+                            pts_3d = refined_3d_points[i]
+                            frame_annots = ba_annotations[i]
+
+                            # Calculate valid scores for the refined points
+                            scores = compute_3d_scores(pts_3d, frame_annots, app_state.calibration)
+
+                            pts_4d = np.full((pts_3d.shape[0], 4), np.nan, dtype=np.float32)
+                            pts_4d[:, :3] = pts_3d
+                            pts_4d[:, 3] = scores
+
+                            app_state.reconstructed_3d_points[frame_idx] = pts_4d
                     else:
                         print("BA was run in scaffolding mode; 3D points were not updated.")
 

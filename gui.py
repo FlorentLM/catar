@@ -989,6 +989,7 @@ def _image_drag_callback(sender, app_data, user_data):
     final_scaled_pos[0] = np.clip(final_scaled_pos[0], 0, video_w - 1)
     final_scaled_pos[1] = np.clip(final_scaled_pos[1], 0, video_h - 1)
 
+
     with app_state.lock:
         # Update the (x, y) and set confidence to 1.0 (it's a manual annotation)
         app_state.annotations[frame_idx, cam_idx, p_idx] = [*final_scaled_pos, 1.0]
@@ -1043,9 +1044,9 @@ def _image_drag_callback(sender, app_data, user_data):
                 dpg.draw_line(p1_loupe, p2_loupe, color=color, thickness=1, parent=layer_tag)
 
     # Draw reprojection for selected point
-    if not temp_hide_overlays and best_calib and not np.isnan(point_3d_selected).any():
+    if not temp_hide_overlays and best_calib and not np.isnan(point_3d_selected[:3]).any():
         cam_name_target = cam_names[cam_idx]
-        reprojected = reproject_points(point_3d_selected, best_calib[cam_name_target])
+        reprojected = reproject_points(point_3d_selected[:3], best_calib[cam_name_target])
 
         if reprojected.size > 0:
             reproj_video_coords = reprojected[0]
@@ -1730,7 +1731,7 @@ def _draw_reprojection(
 ):
     """Draws reproj and error line for reconstructed point."""
 
-    reprojected = reproject_points(point_3d, cam_params)
+    reprojected = reproject_points(point_3d[:3], cam_params)
 
     if reprojected.size == 0:
         return

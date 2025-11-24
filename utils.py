@@ -48,6 +48,10 @@ def reproject_points(points_3d: np.ndarray, cam_params: CameraParameters) -> np.
     if points_3d.size == 0:
         return np.array([])
 
+    # Slice off the confidence/score channel if present
+    if points_3d.shape[-1] == 4:
+        points_3d = points_3d[..., :3]
+
     K = cam_params['camera_matrix']
 
     # get world-to-camera for projection

@@ -11,7 +11,7 @@ import numpy as np
 from typing import List, Optional
 
 import config
-from core import create_camera_visual, run_genetic_step, process_frame, run_refinement
+from core import create_camera_visual, run_genetic_step, process_frame, run_refinement, triangulate_and_score
 from state import AppState
 from viz_3d import Open3DVisualizer, SceneObject
 from cache_utils import DiskCacheReader
@@ -320,29 +320,16 @@ class TrackingWorker(threading.Thread):
         print("Tracking worker shut down.")
 
     def _reconstruct_for_display(self, frame_idx: int):
-        """
-        Triangulates points from manual annotations for immediate UI feedback.
-        This is called when the user clicks or modifies a point.
-        """
 
         with self.app_state.lock:
-            # Get only (x, y) coordinates
-            annotations = self.app_state.annotations[frame_idx, ..., :2]
+            annotations = self.app_state.annotations[frame_idx]
             calibration = self.app_state.calibration
 
         if calibration.best_calibration is not None:
-            proj_matrices = calibration.P_mats
-
-            # Triangulate all points for the current frame
-            points_3d = projective.triangulate_points_from_projections(
-                points2d=annotations,
-                P_mats=proj_matrices
-            )
+            points_4d = triangulate_and_score(annotations, calibration)
 
             with self.app_state.lock:
-                self.app_state.reconstructed_3d_points[frame_idx] = np.asarray(points_3d)
-
-                # Reset the flag now that reconstruction is done
+                self.app_state.reconstructed_3d_points[frame_idx] = points_4d
                 self.app_state.needs_3d_reconstruction = False
 
     def _process_frame_for_tracking(self, data: dict):
@@ -620,13 +607,13 @@ class RenderingWorker(threading.Thread):
 
         # Draw points
         for i, point in enumerate(points_3d):
-            if not np.isnan(point).any():
+            if not np.isnan(point[:3]).any():
                 # valid_points += 1
 
                 color = tuple(point_colors[i])
                 scene.append(SceneObject(
                     type='point',
-                    coords=point,
+                    coords=point[:3],
                     color=color,
                     label=point_names[i]
                 ))
@@ -639,10 +626,10 @@ class RenderingWorker(threading.Thread):
                 for connected_name in skeleton.get(point_names[i], []):
                     try:
                         j = point_names.index(connected_name)
-                        if not np.isnan(points_3d[j]).any():
+                        if not np.isnan(points_3d[j][:3]).any():
                             scene.append(SceneObject(
                                 type='line',
-                                coords=np.array([point, points_3d[j]]),
+                                coords=np.array([point, points_3d[j, :3]]),
                                 color=(128, 128, 128),
                                 label=None
                             ))

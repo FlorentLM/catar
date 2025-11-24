@@ -296,7 +296,7 @@ class AppState:
             dtype=bool
         )
         self.reconstructed_3d_points = np.full(
-            (num_frames, self.num_points, 3),
+            (num_frames, self.num_points, 4),
             np.nan,
             dtype=np.float32
         )
@@ -394,7 +394,18 @@ class AppState:
                 self.human_annotated = loaded_data['human_annotated']
 
             if 'reconstructed_3d_points' in loaded_data:
-                self.reconstructed_3d_points = loaded_data['reconstructed_3d_points']
+                loaded_pts = loaded_data['reconstructed_3d_points']
+
+                # Handle legacy 3-channel data
+                if loaded_pts.shape[-1] == 3:
+                    print("  - Converting legacy 3D points (N, 3) to (N, 4)...")
+                    F, P, _ = loaded_pts.shape
+                    new_pts = np.full((F, P, 4), np.nan, dtype=np.float32)
+                    new_pts[..., :3] = loaded_pts
+                    new_pts[..., 3] = np.nan
+                    self.reconstructed_3d_points = new_pts
+                else:
+                    self.reconstructed_3d_points = loaded_pts
 
             if 'annotations' in loaded_data:
                 annots = loaded_data['annotations']

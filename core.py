@@ -33,6 +33,103 @@ NCC_PATCH_SIZE = 11
 
 
 # ============================================================================
+# Triangulation and scoring
+# ============================================================================
+
+def compute_3d_scores(
+        points_3d: np.ndarray,      # shape (P, 3)
+        annotations: np.ndarray,    # shape (C, P, 3) or (C, P, 2)
+        calibration: 'CalibrationState'
+) -> np.ndarray:
+    """
+    Computes confidence scores (0.0 to 1.0) for 3D points based on reprojection error.
+    """
+    if calibration.best_calibration is None:
+        return np.zeros(points_3d.shape[0], dtype=np.float32)
+
+    valid_3d = ~np.isnan(points_3d).any(axis=1)
+    if not np.any(valid_3d):
+        return np.zeros(points_3d.shape[0], dtype=np.float32)
+
+    # Project 3D points to all cameras
+    reprojected, _ = projective.project_to_multiple_cameras(
+        object_points=jnp.asarray(points_3d),
+        rvec=jnp.asarray(calibration.rvecs_w2c),
+        tvec=jnp.asarray(calibration.tvecs_w2c),
+        camera_matrix=jnp.asarray(calibration.K_mats),
+        dist_coeffs=jnp.asarray(calibration.dist_coeffs)
+    )
+    # reprojected is (C, P, 2)
+
+    # Calculate errors against observations
+    obs_2d = annotations[..., :2] # annotations is (C, P, ...)
+
+    diffs = np.asarray(reprojected) - obs_2d
+    errors_sq = np.sum(diffs ** 2, axis=-1)  # (C, P)
+    errors = np.sqrt(errors_sq)
+
+    # We only care about errors where the 2D annotation actually exists
+    # Use the confidence channel if available, or just NaN check on coords
+    if annotations.shape[-1] >= 3:
+        # If we have confidence, use it as a weight?
+        # For now, just check if it's > 0 to determine visibility
+        valid_obs = (annotations[..., 2] > 0) & (~np.isnan(obs_2d[..., 0]))
+    else:
+        valid_obs = ~np.isnan(obs_2d[..., 0])
+
+    # Compute mean error per point (handling points seen by 0 cameras gracefully)
+    sum_errors = np.sum(np.where(valid_obs, errors, 0.0), axis=0)
+    count_obs = np.sum(valid_obs, axis=0)
+
+    mean_errors = np.divide(
+        sum_errors,
+        count_obs,
+        out=np.full_like(sum_errors, np.inf),
+        where=count_obs > 0
+    )
+
+    # Convert to score: 1.0 / (1.0 + error)
+    scores = 1.0 / (1.0 + mean_errors)
+
+    # If a point had no 2D observations, score is 0
+    scores[count_obs == 0] = 0.0
+
+    return scores.astype(np.float32)
+
+
+def triangulate_and_score(
+        annotations: np.ndarray,  # Shape (C, P, 3)
+        calibration: 'CalibrationState'
+) -> np.ndarray:
+    """
+    Triangulates points and computes their scores.
+    """
+    if calibration.best_calibration is None:
+        return np.full((annotations.shape[1], 4), np.nan, dtype=np.float32)
+
+    points2d = annotations[..., :2]
+    weights = annotations[..., 2]
+
+    # Triangulate
+    points_3d = projective.triangulate_points_from_projections(
+        points2d=jnp.asarray(points2d),
+        P_mats=jnp.asarray(calibration.P_mats),
+        weights=jnp.asarray(weights)
+    )
+    points_3d = np.asarray(points_3d)  # (P, 3)
+
+    # Compute scores
+    scores = compute_3d_scores(points_3d, annotations, calibration)
+
+    # Combine
+    points_4d = np.full((points_3d.shape[0], 4), np.nan, dtype=np.float32)
+    points_4d[:, :3] = points_3d
+    points_4d[:, 3] = scores
+
+    return points_4d
+
+
+# ============================================================================
 # Camera geometry
 # ============================================================================
 
@@ -360,44 +457,19 @@ def process_frame(
     # We store (x, y, z, score) where score is 1 / (1 + error)
     final_3d_pose = np.full((app_state.num_points, 4), np.nan, dtype=np.float32)
 
+    # Temporary holding for triangulated results from this step
+    triangulated_4d = np.full((app_state.num_points, 4), np.nan, dtype=np.float32)
+
     if calibration.best_calibration is not None:
-        points2d_for_triangulation = fused_2d_annotations[..., :2]  # (C, P, 2)
-        weights_for_triangulation = fused_2d_annotations[..., 2]  # (C, P)
-
-        triangulated_3d_points = projective.triangulate_points_from_projections(
-            points2d=jnp.asarray(points2d_for_triangulation),
-            P_mats=jnp.asarray(calibration.P_mats),
-            weights=jnp.asarray(weights_for_triangulation)
-        )
-        triangulated_3d_points = np.asarray(triangulated_3d_points)
-
-        # Compute 3D confidence (Reprojection Error)
-        reprojected, _ = projective.project_to_multiple_cameras(
-            object_points=triangulated_3d_points,
-            rvec=jnp.asarray(calibration.rvecs_w2c),
-            tvec=jnp.asarray(calibration.tvecs_w2c),
-            camera_matrix=jnp.asarray(calibration.K_mats),
-            dist_coeffs=jnp.asarray(calibration.dist_coeffs)
-        )
-
-        diffs = reprojected - jnp.asarray(points2d_for_triangulation)
-        errors = jnp.sqrt(jnp.sum(diffs ** 2, axis=-1))  # (C, P)
-
-        # Mean error over valid views
-        valid_mask = (jnp.asarray(weights_for_triangulation) > 0)
-        mean_errors = jnp.sum(jnp.where(valid_mask, errors, 0.0), axis=0) / jnp.maximum(jnp.sum(valid_mask, axis=0),
-                                                                                        1.0)
-
-        points_3d_scores = np.asarray(1.0 / (1.0 + mean_errors))
+        triangulated_4d = triangulate_and_score(fused_2d_annotations, calibration)
 
     # Step 3: Create the final 3D pose for this frame (priority on triangulation)
     for p_idx in range(app_state.num_points):
         p_name = app_state.point_names[p_idx]
 
         # Priority 1: Use the triangulation result if it's valid
-        if calibration.best_calibration is not None and not np.isnan(triangulated_3d_points[p_idx, 0]):
-            final_3d_pose[p_idx, :3] = triangulated_3d_points[p_idx]
-            final_3d_pose[p_idx, 3] = points_3d_scores[p_idx]
+        if not np.isnan(triangulated_4d[p_idx, 0]):
+            final_3d_pose[p_idx] = triangulated_4d[p_idx]
 
         # Priority 2 (fallback): If triangulation failed, use mokap skeleton's position
         elif final_3d_skeleton_kps and p_name in final_3d_skeleton_kps:
@@ -432,8 +504,8 @@ def process_frame(
     # Step 4: Update app state with the final data for this frame
     with app_state.lock:
         app_state.annotations[frame_idx] = fused_2d_annotations
-        app_state.reconstructed_3d_points[frame_idx] = final_3d_pose[
-            :, :3]  # TODO: slicing to 3 to keep state compatible for now, SHOULD UPDATE THE REST
+        app_state.reconstructed_3d_points[frame_idx] = final_3d_pose
+
 
 # ============================================================================
 # Optic flow tracking
