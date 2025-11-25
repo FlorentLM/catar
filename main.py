@@ -30,7 +30,7 @@ from mokap.reconstruction.reconstruction import Reconstructor
 from mokap.reconstruction.tracking import SkeletonAssembler, MultiObjectTracker
 
 
-def main_loop(app_state: AppState, queues: Queues, open3d_viz: Viewer3D):
+def main_loop(app_state: 'AppState', queues: 'Queues', viewer_3d: 'Viewer3D'):
     """Main GUI update loop."""
 
     initial_resize_counter = 5
@@ -43,7 +43,7 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Viewer3D):
             initial_resize_counter -= 1
 
         # 3D visualisation updates (this has to be done from main thread)
-        open3d_viz.process_updates()
+        viewer_3d.process_updates()
 
         # Process rendered frames from rendering worker
         try:
