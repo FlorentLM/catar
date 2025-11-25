@@ -1,7 +1,3 @@
-"""
-3D visualization using Open3D.
-Opens in a separate window for hardware-accelerated rendering.
-"""
 import open3d as o3d
 import numpy as np
 from dataclasses import dataclass
@@ -11,7 +7,7 @@ import queue
 
 
 @dataclass
-class SceneObject:
+class Object3D:
     """Represents a 3D object to render."""
     type: str                       # 'point' or 'line'
     coords: np.ndarray              # (3,) for point or (2, 3) for line
@@ -19,7 +15,7 @@ class SceneObject:
     label: Optional[str] = None
 
 
-class Open3DVisualizer:
+class Viewer3D:
     """
     Hardware-accelerated 3D visualization with Open3D.
     Runs in separate window with non-blocking updates.
@@ -103,7 +99,7 @@ class Open3DVisualizer:
                     pass
                 self.vis = None
 
-    def queue_update(self, scene_objects: List[SceneObject]):
+    def queue_update(self, scene_objects: List[Object3D]):
         """Queue a scene update to be processed from main thread."""
         try:
             # clear old updates and add new one
@@ -152,7 +148,7 @@ class Open3DVisualizer:
             self.is_initialized = False
             return False
 
-    def _update_scene_internal(self, scene_objects: List[SceneObject]):
+    def _update_scene_internal(self, scene_objects: List[Object3D]):
         """Internal method to update the scene (called from main thread)."""
 
         # Clear old geometries if needed

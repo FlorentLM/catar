@@ -10,11 +10,18 @@ import dearpygui.dearpygui as dpg
 from typing import Dict, Any
 
 import config
-from state import AppState, Queues, VideoState, CalibrationState
-from gui import create_ui, update_ui, resize_video_widgets
-from utils import load_and_match_videos
-from workers import VideoReaderWorker, TrackingWorker, RenderingWorker, GAWorker, BAWorker
-from viz_3d import Open3DVisualizer
+from state.app_state import AppState, Queues
+from state.calibration_state import CalibrationState
+from gui.rendering import resize_video_widgets, update_ui
+from gui.layout import create_ui
+from utils import load_and_match_videos, compute_3d_scores
+
+from workers.video_readers import VideoReaderWorker
+from workers.calibration_workers import GAWorker, BAWorker
+from workers.rendering_workers import RenderingWorker
+from workers.tracking_workers import TrackingWorker
+
+from gui.viewer_3d import Viewer3D
 from cache_utils import DiskCacheBuilder, DiskCacheReader
 
 from mokap.reconstruction.config import PipelineConfig
@@ -23,7 +30,7 @@ from mokap.reconstruction.reconstruction import Reconstructor
 from mokap.reconstruction.tracking import SkeletonAssembler, MultiObjectTracker
 
 
-def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer):
+def main_loop(app_state: AppState, queues: Queues, open3d_viz: Viewer3D):
     """Main GUI update loop."""
 
     initial_resize_counter = 5
@@ -188,13 +195,12 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                     # Conditionally update the 3D points if they were returned
                     refined_3d_points = ba_result.get('refined_3d_points')
                     if refined_3d_points is not None:
-                        from core import compute_3d_scores
 
                         calib_indices = ba_result['calibration_frame_indices']
 
                         # Get annotations for these frames to score against
-                        with app_state.lock:
-                            ba_annotations = app_state.annotations[calib_indices]
+                        with app_state.data.bulk_lock():
+                            ba_annotations = app_state.data.annotations[calib_indices]
 
                         for i, frame_idx in enumerate(calib_indices):
                             pts_3d = refined_3d_points[i]
@@ -207,7 +213,7 @@ def main_loop(app_state: AppState, queues: Queues, open3d_viz: Open3DVisualizer)
                             pts_4d[:, :3] = pts_3d
                             pts_4d[:, 3] = scores
 
-                            app_state.reconstructed_3d_points[frame_idx] = pts_4d
+                            app_state.data.set_frame_points3d(frame_idx, pts_4d)
                     else:
                         print("BA was run in scaffolding mode; 3D points were not updated.")
 
@@ -244,16 +250,15 @@ def main():
 
     # Create dedicated state objects
     print("Initializing main application state...")
-    video_state = VideoState(camera_names, video_paths)
     calib_state = CalibrationState(mokap_calibration, camera_names)
-    app_state = AppState(video_state, calib_state, config.SKELETON_CONFIG)
+    app_state = AppState(camera_names, video_paths, calib_state, config.SKELETON_CONFIG)
 
     # Check for video cache
     print("Checking for video cache...")
     cache_dir = config.DATA_FOLDER / 'video_cache'
 
     builder = DiskCacheBuilder(
-        video_paths=app_state.videos.filepaths,
+        video_paths=app_state.video_paths,
         cache_dir=str(cache_dir),
         ram_budget_gb=2.0
     )
@@ -323,7 +328,7 @@ def main():
     # Instantiate the Reconstructor
     print("Initializing 3D Reconstructor...")
     reconstructor = Reconstructor(
-        camera_parameters=calib_state.best_calibration,  # TODO: Urgent - this needs to have access to the updated calibration data
+        camera_parameters=calib_state.best_calibration,
         volume_bounds=volume_bounds,
         config=mokap_config.reconstruction
     )
@@ -349,7 +354,7 @@ def main():
     queues = Queues()
 
     # Initialise 3D scene visualiser
-    open3d_viz = Open3DVisualizer()
+    open3d_viz = Viewer3D()
 
     # Create worker threads/processes
     workers = [

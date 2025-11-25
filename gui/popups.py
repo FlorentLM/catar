@@ -1,29 +1,200 @@
-"""
-Cache management UI dialogs for DearPyGUI.
-"""
 import multiprocessing
 import shutil
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Callable
+from typing import TYPE_CHECKING, Optional, Callable
 
-import dearpygui.dearpygui as dpg
+from dearpygui import dearpygui as dpg
 
-from state import Queues
-from utils import probe_video
-from cache_utils import DiskCacheBuilder, DiskCacheReader
+import config
+from cache_utils import DiskCacheReader, DiskCacheBuilder
+from gui import calibration_callbacks, tracking_callbacks
+
+from mokap.utils.fileio import probe_video
+
+if TYPE_CHECKING:
+    from state import AppState, Queues
+
+
+def create_ga_popup(app_state: 'AppState', queues: 'Queues'):
+    """Create genetic algorithm progress popup."""
+
+    user_data = {"app_state": app_state, "queues": queues}
+
+    with dpg.window(
+        label="Calibration Progress",
+        modal=True,
+        show=False,
+        tag="ga_popup",
+        width=400,
+        height=150,
+        no_close=True
+    ):
+        dpg.add_text("Running Genetic Algorithm...", tag="ga_status_text")
+        dpg.add_text("Generation: 0", tag="ga_generation_text")
+        dpg.add_text("Best Fitness: inf", tag="ga_fitness_text")
+        dpg.add_text("Mean Fitness: inf", tag="ga_mean_fitness_text")
+        dpg.add_button(
+            label="Stop Calibration",
+            callback=calibration_callbacks.stop_ga_callback,
+            user_data=user_data,
+            width=-1
+        )
+
+
+def create_ba_config_popup(app_state: 'AppState', queues: 'Queues'):
+    """Creates the popup for configuring the BA run before starting."""
+
+    user_data = {"app_state": app_state, "queues": queues}
+
+    with app_state.lock:
+        nb_views = app_state.video_metadata['num_videos']
+
+    with dpg.window(label="Bundle Adjustment Settings", modal=True, show=False, tag="ba_config_popup",
+                    width=450, height=270, no_close=False):
+
+        dpg.add_text("Workflow selection:")
+        dpg.add_radio_button(
+            tag="ba_mode_radio",
+            items=[
+                "Refine Cameras",
+                "Refine Cameras and 3D Points",
+                "Refine 3D Points only"
+            ],
+            default_value="Refine Cameras",
+            callback=calibration_callbacks.ba_mode_change_callback
+        )
+
+        dpg.add_separator()
+        with dpg.group():
+            dpg.add_text("", tag="ba_help_text", wrap=410)
+
+        dpg.add_separator()
+
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Start Refinement", callback=calibration_callbacks.start_ba_callback, user_data=user_data, width=-1)
+            dpg.add_button(label="Cancel", callback=lambda: dpg.hide_item("ba_config_popup"), width=80)
+
+    calibration_callbacks.ba_mode_change_callback(None, dpg.get_value("ba_mode_radio"), None)
+
+
+def create_ba_progress_popup(app_state: 'AppState', queues: 'Queues'):
+    """Create bundle adjustment progress popup."""
+
+    user_data = {"app_state": app_state, "queues": queues}
+
+    with dpg.window(
+            label="Refining Calibration", modal=True, show=False, tag="ba_progress_popup",
+            width=400, height=100, no_close=True, no_move=False
+    ):
+        dpg.add_text("Running Bundle Adjustment...", tag="ba_status_text")
+        dpg.add_text("This may take a few minutes...")
+        dpg.add_separator()
+        dpg.add_button(
+            label="Cancel Refinement",
+            callback=calibration_callbacks.stop_ba_callback,
+            user_data=user_data,
+            width=-1
+        )
+
+
+def create_batch_tracking_popup(app_state: 'AppState', queues: 'Queues'):
+    """Create batch tracking progress popup."""
+
+    user_data = {"app_state": app_state, "queues": queues}
+
+    with dpg.window(
+        label="Tracking Progress",
+        modal=True,
+        show=False,
+        tag="batch_track_popup",
+        width=400,
+        no_close=True
+    ):
+        dpg.add_text("Processing frames...", tag="batch_track_status_text")
+        dpg.add_progress_bar(tag="batch_track_progress", width=-1)
+        dpg.add_button(
+            label="Stop",
+            callback=tracking_callbacks.stop_batch_tracking_callback,
+            user_data=user_data,
+            width=-1
+        )
+
+
+def create_loupe():
+    """Creates the floating, borderless window for the loupe."""
+    loupe_size = 128
+
+    with dpg.window(
+            tag="loupe_window",
+            show=False,
+            no_title_bar=True,
+            no_resize=True,
+            no_move=True,
+            width=loupe_size,
+            height=loupe_size,
+            no_scrollbar=True,
+    ):
+        with dpg.drawlist(
+                width=loupe_size,
+                height=loupe_size,
+                tag="loupe_drawlist"
+        ):
+            # Layer for the zoomed video image
+            dpg.draw_image(
+                "loupe_texture",
+                pmin=(0, 0),
+                pmax=(loupe_size, loupe_size),
+                tag="loupe_image"
+            )
+            # Layer for drawing annotations and lines on top
+            dpg.add_draw_layer(tag="loupe_overlay_layer")
+
+    dpg.bind_item_theme("loupe_window", "loupe_theme")
+
+
+def cache_manager_callback(sender, app_data, user_data):
+    """Show the cache manager dialog."""
+
+    app_state = user_data["app_state"]
+    queues = user_data["queues"]
+
+    def on_cache_complete(metadata, cache_dir):
+        """Called when cache build completes."""
+
+        print(f"Cache built successfully: {cache_dir}")
+        try:
+            from cache_utils import DiskCacheReader
+            cache_reader = DiskCacheReader(cache_dir=cache_dir)
+            app_state.diskcache_reader = cache_reader
+
+            # Update the video reader worker to use the new cache
+            queues.command.put({"action": "reload_cache", "cache_reader": cache_reader})
+            print("Cache loaded and VideoReaderWorker notified.")
+        except Exception as e:
+            print(f"ERROR loading cache after build: {e}")
+
+    # Instantiate and show the dialog
+    dialog = CacheManagerDialog(
+        app_state=app_state,
+        queues=queues,
+        data_folder=config.DATA_FOLDER,
+        video_format=config.VIDEO_FORMAT,
+        on_complete=on_cache_complete
+    )
+    dialog.show()
 
 
 class CacheManagerDialog:
     """Manages the video cache management dialog and the build process."""
 
     def __init__(self,
-    app_state,
-    queues: Queues,
-    data_folder: Path,
-    video_format: str,
-    on_complete: Optional[Callable]
+        app_state,
+        queues: 'Queues',
+        data_folder: Path,
+        video_format: str,
+        on_complete: Optional[Callable]
     ):
         self.app_state = app_state
         self.queues = queues
@@ -37,6 +208,7 @@ class CacheManagerDialog:
 
         self.video_paths = []
         self.video_load_error: Optional[str] = None
+
         try:
             self.video_paths = self.app_state.videos.filepaths
             if not self.video_paths:

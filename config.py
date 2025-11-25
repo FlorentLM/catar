@@ -61,6 +61,12 @@ LK_CONFIDENCE_MAX_ERROR = 7.5  # in pixels
 FORWARD_BACKWARD_THRESHOLD = 5.0  # in pixels
 
 
+# NCC settings for visual consistency checks
+NCC_THRESHOLD_WARNING = 0.55
+NCC_THRESHOLD_KILL = 0.3
+NCC_PATCH_SIZE = 11
+
+
 # Camera calibration
 NUM_DIST_COEFFS = 14
 

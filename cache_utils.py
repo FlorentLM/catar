@@ -9,12 +9,14 @@ import shutil
 import threading
 from pathlib import Path
 from typing import List, Optional, Dict, Tuple
-from concurrent.futures import ThreadPoolExecutor, Future
-
 import cv2
 import numpy as np
 import blosc
 from multiprocessing import Pool, cpu_count, Event
+from concurrent.futures import ThreadPoolExecutor, Future
+
+
+# TODO: The cache and video reader backends need reorganisation
 
 
 class DiskCacheBuilder:
