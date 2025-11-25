@@ -147,6 +147,8 @@ def line_box_intersection(a: float, b: float, c: float, box_x: float, box_y: flo
     return unique_points
 
 
+# TODO: Maybe these two functions could be methods of the CalibrationState class
+
 def compute_3d_scores(
         points_3d: np.ndarray,      # shape (P, 3)
         annotations: np.ndarray,    # shape (C, P, 3) or (C, P, 2)

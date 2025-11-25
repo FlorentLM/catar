@@ -199,10 +199,9 @@ def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
 def main_loop(app_state: 'AppState', queues: 'Queues', viewer_3d: 'Viewer3D'):
     """Main GUI update loop."""
 
-    initial_resize_counter = 5  # TODO: get rid of this awful thing
+    initial_resize_counter = 3  # TODO: why 3 lol
 
     while dpg.is_dearpygui_running():
-        # Initial resize
         if initial_resize_counter > 0:
             resize_video_widgets(None, None, {"app_state": app_state})
             initial_resize_counter -= 1
