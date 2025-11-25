@@ -512,8 +512,7 @@ def draw_reprojection_errors(
     if reprojected.size == 0:
         return
 
-    reproj_2d = reprojected[0]
-    reproj_scaled = (reproj_2d[0] * scale_x, reproj_2d[1] * scale_y)
+    reproj_scaled = (reprojected[0] * scale_x, reprojected[1] * scale_y)
     color_reproj = (255, 0, 0)
     color_line = (255, 100, 100)
 

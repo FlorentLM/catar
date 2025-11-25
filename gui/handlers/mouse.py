@@ -244,8 +244,7 @@ def image_mousedrag_callback(sender, app_data, user_data):
         ).flatten()
 
         if reprojected.size > 0:
-            reproj_video_coords = reprojected[0]
-            reproj_loupe_coords = to_loupe_coords(reproj_video_coords)
+            reproj_loupe_coords = to_loupe_coords(reprojected)
 
             # only draw if the reprojection is visible within the loupe
             if 0 < reproj_loupe_coords[0] < loupe_size and 0 < reproj_loupe_coords[1] < loupe_size:
@@ -281,7 +280,7 @@ def image_mousedrag_callback(sender, app_data, user_data):
                         current_pos += dash_length + gap_length
 
                     # Distance text
-                    distance_px = np.linalg.norm(final_scaled_pos - reproj_video_coords)
+                    distance_px = np.linalg.norm(final_scaled_pos - reprojected)
                     mid_point = p1 + vec * 0.5
                     label_pos = (mid_point[0] + 5, mid_point[1])
                     dpg.draw_text(
