@@ -53,6 +53,7 @@ TRACKER_HALF_LIFE_CONFIDENCE_DECAY = 0.5  # in seconds
 # Example (assuming fresh track confidence ~1.0):
 # 2.0 = discard old tracks decayed below 50% (1 half-life)
 # 4.0 = discard old tracks decayed below 25% (2 half-lives)
+# inf = precedence ratio disabled
 FUSION_PRECEDENCE_RATIO = 2.0
 
 # The maximum distance for two sources to be considered in agreement.
