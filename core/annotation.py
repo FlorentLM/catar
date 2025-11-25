@@ -74,10 +74,10 @@ def snap_annotation(
 
 
 def fuse_annotations(
-        human_annots: np.ndarray,
+        existing_annots: np.ndarray,
         human_flags: np.ndarray,
         lk_annots: np.ndarray,
-        model_annots: np.ndarray
+        model_annots: np.ndarray,
 ) -> np.ndarray:
     """
     Fuses annotations from multiple sources with confidence-based weighting.
@@ -85,7 +85,7 @@ def fuse_annotations(
     Finds the best source and boosts confidence if other sources agree.
 
     Args:
-        human_annots: Manual annotations (C, P, 3)
+        existing_annots: Current state of annotations (C, P, 3). Used as 'Human' source if flag is set, or 'Prior' source otherwise.
         human_flags: Boolean flags for human annotations (C, P)
         lk_annots: Annotations from LK tracker (C, P, 3)
         model_annots: Annotations from 3D skeleton reprojection (C, P, 3)
@@ -93,22 +93,31 @@ def fuse_annotations(
     Returns:
         Fused annotations (C, P, 3) with (x, y, confidence)
     """
-    num_cams, num_points, _ = human_annots.shape
+    num_cams, num_points, _ = existing_annots.shape
     final_annotations = np.full((num_cams, num_points, 3), np.nan, dtype=np.float32)
 
     for c in range(num_cams):
         for p in range(num_points):
             sources = []
 
-            # Source 1: Human Annotation (highest priority)
-            if human_flags[c, p] and not np.isnan(human_annots[c, p, 0]):
-                sources.append({
-                    'pos': human_annots[c, p, :2],
-                    'conf': human_annots[c, p, 2],
-                    'type': 'human'
-                })
+            # Check existing data (Source 1: Human or Source 2: prior auto track)
+            if not np.isnan(existing_annots[c, p, 0]):
+                if human_flags[c, p]:
+                    # Human Annotation (highest priority)
+                    sources.append({
+                        'pos': existing_annots[c, p, :2],
+                        'conf': existing_annots[c, p, 2],
+                        'type': 'human'
+                    })
+                else:
+                    # Prior auto track
+                    sources.append({
+                        'pos': existing_annots[c, p, :2],
+                        'conf': existing_annots[c, p, 2],
+                        'type': 'prior'
+                    })
 
-            # Source 2: LK tracker
+            # Source 3: LK tracker
             if not np.isnan(lk_annots[c, p, 0]):
                 sources.append({
                     'pos': lk_annots[c, p, :2],
@@ -116,7 +125,7 @@ def fuse_annotations(
                     'type': 'lk'
                 })
 
-            # Source 3: 3D Model reprojection
+            # Source 4: 3D Model reprojection
             if not np.isnan(model_annots[c, p, 0]):
                 sources.append({
                     'pos': model_annots[c, p, :2],
@@ -148,6 +157,8 @@ def fuse_annotations(
             for other in other_sources:
                 distance = np.linalg.norm(best_source['pos'] - other['pos'])
 
+                # If sources agree spatially, we average them
+                # (this allows a strong 3D model to slightly shift a Human / Prior annotation)
                 if distance < config.FUSION_AGREEMENT_RADIUS:
                     # Agreement found: add to average
                     weighted_sum_pos += other['pos'] * other['conf']
@@ -166,6 +177,7 @@ def fuse_annotations(
             )
 
             # Apply confidence ceiling
+            # Humans can go up to 1.0 (or whatever config says), automated tracks capped lower
             if best_source['type'] == 'human':
                 max_conf = config.FUSION_HUMAN_CONFIDENCE
             else:

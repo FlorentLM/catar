@@ -63,30 +63,30 @@ def process_frame(
         calibration = app_state.calibration
         point_names = app_state.point_names
 
-    human_flags_for_frame = app_state.data.get_human_annotated_flags(frame_idx, copy=True)
-    human_annots_for_frame = app_state.data.get_frame_annotations(frame_idx, copy=True)
+    existing_annots = app_state.data.get_frame_annotations(frame_idx, copy=True)
+    is_human_flags = app_state.data.get_human_annotated_flags(frame_idx, copy=True)
 
     src_gray = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in source_frames]
     dst_gray = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in dest_frames]
 
     # Get geometric prediction from LK tracking
-    annotations_from_lk = track_points(
+    predictions_LK = track_points(
         app_state, src_gray, dst_gray, source_frame_idx, frame_idx
     )
 
     # Prepare input for Mokap Reconstructor
-    cam_indices, point_indices = np.where(~np.isnan(annotations_from_lk[..., 0]))
-    num_lk_points = len(cam_indices)
+    cam_indices, point_indices = np.where(~np.isnan(predictions_LK[..., 0]))
+    n_points_LK = len(point_indices)
 
     if config.VERBOSE:
-        print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
+        print(f"LK PREDICT:    Started with {n_points_LK} raw 2D keypoints from Optical Flow.")
 
-    if num_lk_points > 0:
-        coords = annotations_from_lk[cam_indices, point_indices, :2]
-        scores = annotations_from_lk[cam_indices, point_indices, 2]
+    if n_points_LK > 0:
+        coords = predictions_LK[cam_indices, point_indices, :2]
+        scores = predictions_LK[cam_indices, point_indices, 2]
 
         reconstruction_input = {
-            "frame_indices": np.full(num_lk_points, frame_idx, dtype=np.int32),
+            "frame_indices": np.full(n_points_LK, frame_idx, dtype=np.int32),
             "kp_type_ids": point_indices.astype(np.int16),
             "cam_ids": cam_indices.astype(np.int8),
             "coords": coords.astype(np.float32),
@@ -100,7 +100,7 @@ def process_frame(
         )
 
         if config.VERBOSE:
-            print(f"MOKAP RECON:   Input {num_lk_points} 2D points -> Produced soup "
+            print(f"MOKAP RECON:   Input {n_points_LK} 2D points -> Produced soup "
                   f"of {soup.num_points} 3D points and {len(soup.ray_origins)} orphan rays.")
 
         # Run multi-object tracking (skeleton assembly + time association)
@@ -111,114 +111,117 @@ def process_frame(
         active_tracklets = []
 
     # Extract best skeleton for feedback loop
-    final_3d_skeleton_kps = None
-    normalised_skeleton_score = 0.0
+    final_skeleton_kps = None
+    norm_skeleton_score = 0.0
 
     if active_tracklets:
         # Heuristic: Pick tracklet with most keypoints or highest score
+        # TODO: maybe this should be smarter
         best_tracklet = max(active_tracklets, key=lambda t: (len(t.skeleton.keypoints), t.skeleton.score))
-        final_3d_skeleton_kps = best_tracklet.skeleton.keypoints
-        num_kps = len(final_3d_skeleton_kps)
+        final_skeleton_kps = best_tracklet.skeleton.keypoints
+        num_kps = len(final_skeleton_kps)
 
         max_score = reconstructor.max_point_score
         avg_score = best_tracklet.skeleton.score / max(1, num_kps)
-        normalised_skeleton_score = np.clip(avg_score / max_score, 0.0, 1.0)
+        norm_skeleton_score = np.clip(avg_score / max_score, 0.0, 1.0)
 
         if config.VERBOSE:
             print(f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints "
-                  f"(score: {best_tracklet.skeleton.score:.2f} or {normalised_skeleton_score:.2f}).")
+                  f"(score: {best_tracklet.skeleton.score:.2f}, or {norm_skeleton_score:.2f} normalised).")
     else:
         if config.VERBOSE:
             print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
 
     # Get model-reprojected annotations
-    annotations_from_model = np.full_like(annotations_from_lk, np.nan)
+    predictions_model = np.full_like(predictions_LK, np.nan)
 
-    if final_3d_skeleton_kps and calibration.best_calibration:
-        points_to_reproject_3d = []
+    if final_skeleton_kps and calibration.best_calibration:
+        points3d = []
         p_indices = []
 
-        for p_name, pos_3d in final_3d_skeleton_kps.items():
+        for p_name, pos_3d in final_skeleton_kps.items():
             if p_name in point_names:
-                points_to_reproject_3d.append(pos_3d)
+                points3d.append(pos_3d)
                 p_indices.append(point_names.index(p_name))
 
-        points_to_reproject_3d = np.array(points_to_reproject_3d)
+        points3d = np.array(points3d)
 
-        if points_to_reproject_3d.size > 0:
-            reprojected_all_cams = calibration.reproject_to_all(points_to_reproject_3d)  # (C, P, 2)
+        if points3d.size > 0:
+            reprojected_all_cams = calibration.reproject_to_all(points3d)  # (C, P, 2)
 
             # Fill annotation array
             for i, p_idx in enumerate(p_indices):
-                annotations_from_model[:, p_idx, :2] = reprojected_all_cams[:, i, :]
-                annotations_from_model[:, p_idx, 2] = normalised_skeleton_score
+                predictions_model[:, p_idx, :2] = reprojected_all_cams[:, i, :]
+                predictions_model[:, p_idx, 2] = norm_skeleton_score
 
     # Step 1: Fuse all evidence to get best 2D annotations
-    fused_2d_annotations = fuse_annotations(
-        human_annots=human_annots_for_frame,
-        human_flags=human_flags_for_frame,
-        lk_annots=annotations_from_lk,
-        model_annots=annotations_from_model
+    annotations_fused = fuse_annotations(
+        existing_annots=existing_annots,
+        human_flags=is_human_flags,
+        lk_annots=predictions_LK,
+        model_annots=predictions_model,
     )
 
     # Rescue single-view LK tracks that were lost during fusion
-    is_valid_lk = ~np.isnan(annotations_from_lk[..., 0])
-    num_views_per_lk_point = np.sum(is_valid_lk, axis=0)
+    valid_mask_LK = ~np.isnan(predictions_LK[..., 0])
+    n_views_per_LK_point = np.sum(valid_mask_LK, axis=0)
 
-    is_valid_fused = ~np.isnan(fused_2d_annotations[..., 0])
-    is_fused_point_lost = ~np.any(is_valid_fused, axis=0)
+    valid_mask_fused = ~np.isnan(annotations_fused[..., 0])
+    is_fused_point_lost = ~np.any(valid_mask_fused, axis=0)
 
     for p_idx in range(app_state.num_points):
-        # if LK had exactly one view AND the point was lost in fusion...
-        if num_views_per_lk_point[p_idx] == 1 and is_fused_point_lost[p_idx]:
-            # ...find the camera that had the single track and re-insert it
-            cam_idx = np.where(is_valid_lk[:, p_idx])[0][0]
-            fused_2d_annotations[cam_idx, p_idx] = annotations_from_lk[cam_idx, p_idx]
+        #   LK had exactly one view         AND  the point was lost in fusion
+        if n_views_per_LK_point[p_idx] == 1 and is_fused_point_lost[p_idx]:
 
-    # Step 2: Triangulate fused 2D points to get 3D
-    final_3d_pose = np.full((app_state.num_points, 4), np.nan, dtype=np.float32)
-    triangulated_4d = np.full((app_state.num_points, 4), np.nan, dtype=np.float32)
+            # find the camera that had the single track and re-insert it
+            cam_idx = np.where(valid_mask_LK[:, p_idx])[0][0]
+            annotations_fused[cam_idx, p_idx] = predictions_LK[cam_idx, p_idx]
 
+    # Step 2: Triangulate fused 2D points
     if calibration.best_calibration is not None:
-        triangulated_4d = triangulate_and_score(fused_2d_annotations, calibration)
+        final_points3d = triangulate_and_score(annotations_fused, calibration)
+    else:
+        final_points3d = np.full((app_state.num_points, 4), np.nan, dtype=np.float32)
 
-    # Step 3: Create final 3D pose (priority on triangulation)
-    for p_idx in range(app_state.num_points):
-        p_name = app_state.point_names[p_idx]
+    # Step 3: Create final 3D pose (with priority on triangulation)
+    if final_skeleton_kps:
 
-        # Priority 1: Triangulation result
-        if not np.isnan(triangulated_4d[p_idx, 0]):
-            final_3d_pose[p_idx] = triangulated_4d[p_idx]
+        # Calculate mask of points where triangulation failed
+        missing_mask = np.isnan(final_points3d[:, 0])
 
-        # Priority 2: Mokap skeleton position (fallback)
-        elif final_3d_skeleton_kps and p_name in final_3d_skeleton_kps:
-            final_3d_pose[p_idx, :3] = final_3d_skeleton_kps[p_name]
-            final_3d_pose[p_idx, 3] = normalised_skeleton_score * 0.8
+        # Fill where triangulation failed with mokap skeleton
+        for name, coords in final_skeleton_kps.items():
+            idx = app_state.point_nti.get(name)
+            if idx is not None and missing_mask[idx]:
+                final_points3d[idx, :3] = coords
+                final_points3d[idx, 3] = norm_skeleton_score * 0.8
 
-    # Structural feedback: penalize points rejected by skeleton assembler
-    non_skeleton_points = ['s_small', 's_large'] # TODO: This needs to be in appstate and configurable from the GUI
+    # Step 4: Structural feedback (penalize points rejected by skeleton assembler)
+    if final_skeleton_kps:
+        assembled_kps = set(final_skeleton_kps.keys())
 
-    if final_3d_skeleton_kps:
-        assembled_names = set(final_3d_skeleton_kps.keys())
+        # Rejected points: all - (assembled + non skeleton)
+        rejected_kps = app_state.all_points_set - (assembled_kps | app_state.non_skeleton_points_set)
 
-        for p_idx in range(app_state.num_points):
-            p_name = app_state.point_names[p_idx]
+        for p_name in rejected_kps:
+            p_idx = app_state.point_nti[p_name]
 
-            if p_name not in assembled_names and p_name not in non_skeleton_points:
-                valid_mask = ~np.isnan(fused_2d_annotations[:, p_idx, 0])
-                if np.any(valid_mask):
-                    print(f"ZOMBIE POINT: '{point_names[p_idx]}' was rejected by Mokap")
+            valid_mask = ~np.isnan(annotations_fused[:, p_idx, 0])
 
-                    # Slash confidence by half
-                    fused_2d_annotations[valid_mask, p_idx, 2] *= 0.5
+            if np.any(valid_mask):
+                if config.VERBOSE:
+                    print(f"ZOMBIE POINT: '{p_name}' was rejected by Mokap")
 
-                    # Kill if confidence too low
-                    kill_mask = fused_2d_annotations[:, p_idx, 2] < 0.1
-                    fused_2d_annotations[kill_mask, p_idx, :] = np.nan
+                # Slash confidence by half
+                annotations_fused[valid_mask, p_idx, 2] *= 0.5
+
+                # Kill if confidence drops too low
+                kill_mask = annotations_fused[:, p_idx, 2] < 0.1
+                annotations_fused[kill_mask, p_idx, :] = np.nan
 
     # Step 4: Update app state with final data
-    app_state.data.set_frame_annotations(frame_idx, fused_2d_annotations)
-    app_state.data.set_frame_points3d(frame_idx, final_3d_pose)
+    app_state.data.set_frame_annotations(frame_idx, annotations_fused)
+    app_state.data.set_frame_points3d(frame_idx, final_points3d)
 
 
 def track_points(

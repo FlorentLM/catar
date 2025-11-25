@@ -8,7 +8,7 @@ import numpy as np
 import pickle
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Dict, Any, Optional, Union
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, Union, Tuple
 from dataclasses import dataclass, field
 
 import config
@@ -89,8 +89,13 @@ class AppState:
         # (DataManager has its own lock for data arrays)
         self.lock = threading.RLock()
 
+        # Cameras order and lookup accessors
+        self.camera_names = tuple(camera_names)
+        self.camera_nti = {name: i for i, name in enumerate(self.camera_names)}
+        self.camera_itn = {i: name for name, i in self.camera_nti.items()}
+        # TODO: Use these accessors everywhere possible
+
         # Video information (constant during runtime)
-        self.camera_names: List[str] = camera_names
         self.video_paths: List[Path] = [Path(p).resolve() for p in video_paths]
         self.video_filenames: List[str] = [Path(p).name for p in video_paths]
 
@@ -115,9 +120,21 @@ class AppState:
         self.calibration: 'CalibrationState' = calib_state
         self.cache_reader: Optional['DiskCacheReader'] = None
 
-        # Skeleton configuration (read-only after init)
-        self.point_names = skeleton_config['point_names']
+        # Keypoints order and lookup accessors (read-only after init)
+        self.point_names = tuple(skeleton_config['point_names'])
+        self.point_nti = {name: i for i, name in enumerate(self.point_names)}
+        self.point_itn = {i: name for name, i in self.point_nti.items()}
+        # TODO: Use these accessors everywhere possible
+
         self.skeleton = skeleton_config['skeleton']
+
+        # TODO: Use these sets everywhere possible
+        self.all_points_set = set(self.point_names)
+        self.skeleton_points_set = {'s_small', 's_large'}
+        # Points that are tracked but NOT part of the skeleton graph (objects, props, etc)
+        # TODO: Move this to config, and add a GUI way to edit them
+        self.non_skeleton_points_set = {'s_small', 's_large'}
+
         self.point_colors = skeleton_config['point_colors']
         self.camera_colors = config.CAMERA_COLORS
         self.num_points = len(self.point_names)
