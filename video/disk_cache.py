@@ -8,15 +8,14 @@ import hashlib
 import shutil
 import threading
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Union
 import cv2
 import numpy as np
 import blosc
 from multiprocessing import Pool, cpu_count, Event
 from concurrent.futures import ThreadPoolExecutor, Future
 
-
-# TODO: The cache and video reader backends need reorganisation
+import config
 
 
 class DiskCacheBuilder:
@@ -24,15 +23,24 @@ class DiskCacheBuilder:
 
     def __init__(
         self,
-        video_paths: List[str],
-        cache_dir: str = 'multiview_chunks_per_video',
+        video_paths: List[Union[Path, str]],
+        cache_dir: Optional[Union[Path, str]] = None,
         ram_budget_gb: float = 0.5
     ):
         # Preserve order!!! order must match calibration
-        self.video_paths = video_paths
-        self.cache_dir = cache_dir
+        self.video_paths = tuple([Path(v) for v in video_paths])
+
+        if cache_dir is None:
+            if hasattr(config, 'VIDEO_CACHE_FOLDER'):
+                self.cache_dir = Path(config.VIDEO_CACHE_FOLDER)
+            elif hasattr(config, 'DATA_FOLDER'):
+                self.cache_dir = Path(config.DATA_FOLDER) / 'video_cache'
+            else:
+                self.cache_dir = Path.cwd() / 'data' / 'video_cache'
+        else:
+            self.cache_dir = Path(cache_dir)
         self.ram_budget_gb = ram_budget_gb
-        self.metadata_file = os.path.join(cache_dir, 'cache_metadata.json')
+        self.metadata_file = self.cache_dir / 'cache_metadata.json'
 
     def compute_video_set_hash(self) -> str:
         """Create a hash from video paths and their modification times."""
@@ -45,14 +53,14 @@ class DiskCacheBuilder:
         hash_str = "|".join(hash_input)
         return hashlib.md5(hash_str.encode()).hexdigest()
 
-    def check_cache_exists(self) -> Tuple[bool, Optional[dict]]:
+    def check_cache_exists(self) -> Tuple[bool, Optional[Dict]]:
         """Check if valid cache exists for the given video set."""
 
-        if not os.path.exists(self.metadata_file):
+        if not self.metadata_file.is_file():
             return False, None
 
         try:
-            with open(self.metadata_file, 'r') as f:
+            with self.metadata_file.open(mode='r') as f:
                 metadata = json.load(f)
 
             if not self.video_paths:
@@ -65,21 +73,22 @@ class DiskCacheBuilder:
             # Verify all chunk files exist
             for video in metadata['videos']:
                 for chunk_file in video['chunk_files']:
-                    if not os.path.exists(chunk_file):
+                    if not Path(chunk_file).is_file():
                         return False, None
 
             return True, metadata
+
         except Exception as e:
             print(f"Error checking cache existence: {e}")
             return False, None
 
-    def gather_video_info(self) -> List[dict]:
+    def gather_video_info(self) -> List[Dict]:
         """Extract metadata from all videos."""
 
         video_info = []
 
         for video_path in self.video_paths:
-            cap = cv2.VideoCapture(video_path)
+            cap = cv2.VideoCapture(video_path.as_posix())
             info = {
                 'path': video_path,
                 'frame_count': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
@@ -101,12 +110,16 @@ class DiskCacheBuilder:
         return video_info
 
     @staticmethod
-    def _chunk_video_worker(args) -> dict:
+    def _chunk_video_worker(args) -> Dict:
         """Worker function to chunk a single video."""
 
         video_idx, video_path, frame_count, width, height, frames_per_chunk, chunk_dir, progress_q, cancel_event = args
 
-        cap = cv2.VideoCapture(video_path)
+        # Just to be super safe
+        chunk_dir = Path(chunk_dir)
+        video_path = Path(video_path)
+
+        cap = cv2.VideoCapture(video_path.as_posix())
         chunk_files = []
         compressed_sizes = []
         for chunk_idx, start in enumerate(range(0, frame_count, frames_per_chunk)):
@@ -133,11 +146,12 @@ class DiskCacheBuilder:
             compressed = blosc.compress(
                 chunk_array.tobytes(), typesize=1, cname='lz4', clevel=5, shuffle=blosc.SHUFFLE
             )
-            filename = os.path.join(chunk_dir, f'video{video_idx}_chunk_{chunk_idx}.blosc')
-            with open(filename, 'wb') as f:
+
+            chunk_filepath = chunk_dir / f'video{video_idx}_chunk_{chunk_idx}.blosc'
+            with chunk_filepath.open(mode='wb') as f:
                 f.write(compressed)
 
-            chunk_files.append(filename)
+            chunk_files.append(str(chunk_filepath))     # as str because it's only returned for dumping into json
             compressed_sizes.append(len(compressed))
 
             # Report progress
@@ -156,7 +170,7 @@ class DiskCacheBuilder:
         }
 
     def build_cache(self, progress_callback=None, video_progress_callback=None, cancel_event: Optional[Event] = None,
-                    manager=None) -> dict:
+                    manager=None) -> Dict:
         """Build the video cache."""
 
         if manager is None:
@@ -172,7 +186,7 @@ class DiskCacheBuilder:
                 progress_callback, video_progress_callback, cancel_event, manager
             )
 
-    def _build_cache_internal(self, progress_callback, video_progress_callback, cancel_event, manager) -> dict:
+    def _build_cache_internal(self, progress_callback, video_progress_callback, cancel_event, manager) -> Dict:
         """Internal cache building logic that assumes a manager is present."""
 
         video_info = self.gather_video_info()
@@ -180,7 +194,7 @@ class DiskCacheBuilder:
             raise ValueError("No videos found!")
 
         self.delete_cache()
-        os.makedirs(self.cache_dir, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         frame_count = video_info[0]['frame_count']
         width = video_info[0]['width']
@@ -195,18 +209,22 @@ class DiskCacheBuilder:
 
         # Use the passed-in manager to create the queue
         video_progress_q = manager.Queue()
+
         args_list = [
             (idx, info['path'], info['frame_count'], info['width'], info['height'],
              frames_per_chunk, self.cache_dir, video_progress_q, cancel_event)
             for idx, info in enumerate(video_info)
         ]
+
         num_workers = min(len(self.video_paths), cpu_count())
+
         time_start = time.time()
         total_frames = frame_count * len(video_info)
         video_progress = {i: 0.0 for i in range(len(video_info))}
 
         with Pool(num_workers) as pool:
             async_results = pool.map_async(self._chunk_video_worker, args_list)
+
             while not async_results.ready():
                 if cancel_event and cancel_event.is_set():
                     pool.terminate()
@@ -215,14 +233,18 @@ class DiskCacheBuilder:
                 try:
                     v_idx, pct = video_progress_q.get(timeout=0.1)
                     video_progress[v_idx] = pct
+
                     if video_progress_callback:
                         video_progress_callback(v_idx, pct)
+
                     current_total_pct = sum(video_progress.values()) / len(video_info)
                     completed_frames = int(total_frames * (current_total_pct / 100.0))
                     if progress_callback:
                         progress_callback(completed_frames, total_frames)
+
                 except Exception:
                     pass
+
             results = async_results.get()
 
         if any(r.get('cancelled') for r in results):
@@ -244,19 +266,26 @@ class DiskCacheBuilder:
             'frames_per_chunk': frames_per_chunk,
             'compression': {'algorithm': 'blosc-lz4', 'clevel': 5, 'shuffle': True},
             'videos': [
-                {'index': r['video_idx'], 'path': video_info[r['video_idx']]['path'], 'chunk_files': r['chunk_files'],
-                 'num_chunks': len(r['chunk_files']), 'total_compressed_bytes': r['total_compressed_bytes']}
-                for r in sorted(results, key=lambda x: x['video_idx'])
+                {
+                    'index': r['video_idx'],
+                    'path': str(video_info[r['video_idx']]['path']),
+                    'chunk_files': r['chunk_files'],
+                    'num_chunks': len(r['chunk_files']),
+                    'total_compressed_bytes': r['total_compressed_bytes']
+                } for r in sorted(results, key=lambda x: x['video_idx'])
             ]
         }
-        with open(self.metadata_file, 'w') as f:
+
+        with self.metadata_file.open(mode='w') as f:
             json.dump(metadata, f, indent=2)
+
         print(f"Cache saved to: {self.cache_dir}")
         return metadata
 
     def delete_cache(self):
         """Delete all cache files from disk."""
-        if Path(self.cache_dir).exists():
+
+        if self.cache_dir.is_dir():
             shutil.rmtree(self.cache_dir)
 
 
@@ -266,9 +295,20 @@ class DiskCacheReader:
     Thread-safe for concurrent reads with background prefetching.
     """
 
-    def __init__(self, cache_dir: str = 'multiview_chunks_per_video', memory_budget_gb: float = 2.0):
-        self.cache_dir = cache_dir
-        self.metadata_file = os.path.join(cache_dir, 'cache_metadata.json')
+    def __init__(self,
+                 cache_dir: Optional[Union[Path, str]] = None,
+                 ram_budget_gb: float = 2.0
+        ):
+        if cache_dir is None:
+            if hasattr(config, 'VIDEO_CACHE_FOLDER'):
+                self.cache_dir = Path(config.VIDEO_CACHE_FOLDER)
+            elif hasattr(config, 'DATA_FOLDER'):
+                self.cache_dir = Path(config.DATA_FOLDER) / 'video_cache'
+            else:
+                self.cache_dir = Path.cwd() / 'data' / 'video_cache'
+        else:
+            self.cache_dir = Path(cache_dir)
+        self.metadata_file = self.cache_dir / 'cache_metadata.json'
         self._lock = threading.Lock()
 
         # Background loader
@@ -277,13 +317,13 @@ class DiskCacheReader:
         self._loading_futures: Dict[Tuple[int, int], Future] = {}
 
         # Load metadata
-        if not os.path.exists(self.metadata_file):
+        if not self.metadata_file.is_file():
             raise FileNotFoundError(
                 f"Cache not found: {self.metadata_file}\n"
                 f"Please build the cache first."
             )
 
-        with open(self.metadata_file, 'r') as f:
+        with self.metadata_file.open(mode='r') as f:
             self.metadata = json.load(f)
 
         # Extract properties
@@ -295,10 +335,12 @@ class DiskCacheReader:
         self.num_views = len(self.metadata['videos'])
 
         # Build chunk index
-        self._chunk_index: Dict[Tuple[int, int], str] = {}
+        self._chunk_index: Dict[Tuple[int, int], Path] = {}
+
         for video in self.metadata['videos']:
             for chunk_idx, chunk_file in enumerate(video['chunk_files']):
-                self._chunk_index[(video['index'], chunk_idx)] = chunk_file
+
+                self._chunk_index[(video['index'], chunk_idx)] = Path(chunk_file)
 
         # LRU cache for chunks
         self._chunk_cache: Dict[Tuple[int, int], np.ndarray] = {}
@@ -308,7 +350,7 @@ class DiskCacheReader:
         chunk_bytes = self.width * self.height * 3 * self.frames_per_chunk
 
         # Calculate how many chunks fit in the memory budget
-        budget_bytes = memory_budget_gb * (1024 ** 3)
+        budget_bytes = ram_budget_gb * (1024 ** 3)
         calculated_limit = int(budget_bytes // chunk_bytes)
 
         # Ensure we have at least 2 chunks per video in memory for smooth scrolling
@@ -316,7 +358,8 @@ class DiskCacheReader:
 
         print(f"VideoCacheReader initialized: {self.num_views} views, "
               f"{self.frame_count} frames, {self.width}x{self.height}")
-        print(f"Cache RAM Budget: {memory_budget_gb:.1f} GB. "
+
+        print(f"Cache RAM Budget: {ram_budget_gb:.1f} GB. "
               f"Chunk size: {chunk_bytes/1024**2:.1f} MB. "
               f"Keeping max {self._cache_size_limit} chunks in RAM.")
 
@@ -339,10 +382,10 @@ class DiskCacheReader:
         if chunk_file is None:
             raise ValueError(f"Chunk not found: video {video_idx}, chunk {chunk_idx}")
 
-        if not os.path.exists(chunk_file):
+        if not chunk_file.is_file():
             raise FileNotFoundError(f"Chunk file missing: {chunk_file}")
 
-        with open(chunk_file, 'rb') as f:
+        with chunk_file.open(mode='rb') as f:
             compressed = f.read()
 
         # Decompress (expensive operation)
@@ -495,7 +538,7 @@ class DiskCacheReader:
             self._cache_access_order.clear()
             self._loading_futures.clear()
 
-    def get_cache_info(self) -> dict:
+    def get_cache_info(self) -> Dict:
         """Get info about the cache."""
 
         total_size = sum(
@@ -542,7 +585,8 @@ class DiskCacheReader:
 
     def delete_cache(self):
         """Delete all cache files from disk."""
-        if Path(self.cache_dir).exists():
+
+        if self.cache_dir.is_dir():
             shutil.rmtree(self.cache_dir)
             print(f"Cache deleted: {self.cache_dir}")
         self._executor.shutdown(wait=False)

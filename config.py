@@ -6,6 +6,9 @@ import cv2
 from pathlib import Path
 import numpy as np
 
+# Debug prints
+VERBOSE = True
+
 # Display settings
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 480
@@ -16,9 +19,13 @@ BOTTOM_PANEL_HEIGHT_FULL = 220
 BOTTOM_PANEL_HEIGHT_COLLAPSED = 75
 PADDING = 20
 
-# Video settings
+# Data inputs
 DATA_FOLDER = Path.cwd() / 'data'
 VIDEO_FORMAT = '*.mp4'
+
+# Video cache settings
+VIDEO_CACHE_FOLDER = DATA_FOLDER / 'video_cache'
+RAM_MAX_BUDGET_GB = 1.5
 
 # Optical flow parameters
 LK_PARAMS = dict(

@@ -3,11 +3,57 @@ import numpy as np
 from dearpygui import dearpygui as dpg
 
 import config
-from gui import popups, callbacks, rendering, tracking_callbacks, calibration_callbacks, annotations_callbacks, mouse_handlers
+
+from gui.handlers import register_event_handlers
+from gui.rendering import resize_video_widgets
+
+from gui.callbacks.annotation import (
+    set_selected_point_callback,
+    clear_future_annotations_callback,
+    set_human_annotated_callback
+)
+from gui.callbacks.calibration import (
+    addremove_calib_frame_callback,
+    navigate_calib_frame_callback,
+    start_ga_callback,
+    clear_calib_frames_callback
+)
+from gui.callbacks.tracking import (
+    toggle_realtime_tracking_callback,
+    batch_tracking_fwd_callback,
+    batch_tracking_bwd_callback
+)
+from gui.callbacks.general import (
+    toggle_epipolar_lines_callback,
+    toggle_point_labels_callback,
+    toggle_reprojection_error_callback,
+    toggle_histogram_callback,
+    save_state_callback,
+    load_state_callback,
+    app_quit_callback
+)
+from gui.callbacks.playback import (
+    play_pause_callback,
+    next_frame_callback,
+    prev_frame_callback,
+    set_frame_callback
+)
+from gui.handlers.mouse import (
+    image_mousedown_callback,
+    histogram_leftclick
+)
+from gui.popups import (
+    create_ga_popup,
+    create_ba_config_popup,
+    create_ba_progress_popup,
+    create_batch_tracking_popup,
+    create_loupe,
+    cache_manager_callback
+)
 
 if TYPE_CHECKING:
     from state import AppState, Queues
-    from gui.viewer_3d import Viewer3D
+    from gui.rendering import Viewer3D
 
 
 def create_ui(app_state: 'AppState', queues: 'Queues', viewer_3d: 'Viewer3D'):
@@ -42,7 +88,7 @@ def create_ui(app_state: 'AppState', queues: 'Queues', viewer_3d: 'Viewer3D'):
     # Setup
     create_textures(app_state.video_metadata)
     create_themes()
-    callbacks.register_event_handlers(app_state, queues)
+    register_event_handlers(app_state, queues)
 
     # Main window layout
     with dpg.window(label="Main Window", tag="main_window", no_scrollbar=True):
@@ -61,15 +107,15 @@ def create_ui(app_state: 'AppState', queues: 'Queues', viewer_3d: 'Viewer3D'):
             create_bottom_panel(app_state)
 
     # Popups
-    popups.create_ga_popup(app_state, queues)
-    popups.create_ba_config_popup(app_state, queues)
-    popups.create_ba_progress_popup(app_state, queues)
-    popups.create_batch_tracking_popup(app_state, queues)
-    popups.create_loupe()
+    create_ga_popup(app_state, queues)
+    create_ba_config_popup(app_state, queues)
+    create_ba_progress_popup(app_state, queues)
+    create_batch_tracking_popup(app_state, queues)
+    create_loupe()
 
     # Viewport
     dpg.create_viewport(title="CATAR", width=window_width, height=window_height)
-    dpg.set_viewport_resize_callback(rendering.resize_video_widgets, user_data={"app_state": app_state})
+    dpg.set_viewport_resize_callback(resize_video_widgets, user_data={"app_state": app_state})
 
     dpg.setup_dearpygui()
     dpg.set_primary_window("main_window", True)
@@ -150,16 +196,16 @@ def create_menu_bar(app_state: 'AppState', queues: 'Queues'):
         with dpg.menu(label="File"):
             dpg.add_menu_item(
                 label="Save State (S)",
-                callback=callbacks.save_state_callback,
+                callback=save_state_callback,
                 user_data=user_data
             )
             dpg.add_menu_item(
                 label="Load State (L)",
-                callback=callbacks.load_state_callback,
+                callback=load_state_callback,
                 user_data=user_data
             )
             dpg.add_separator()
-            dpg.add_menu_item(label="Quit", callback=callbacks.app_quit_callback)
+            dpg.add_menu_item(label="Quit", callback=app_quit_callback)
 
         with dpg.menu(label="Display"):
             dpg.add_menu_item(
@@ -167,14 +213,14 @@ def create_menu_bar(app_state: 'AppState', queues: 'Queues'):
                 tag="show_histogram_checkbox",
                 check=True,
                 default_value=True,
-                callback=callbacks.toggle_histogram_callback
+                callback=toggle_histogram_callback
             )
             dpg.add_menu_item(
                 label="Show All Labels",
                 tag="show_all_labels_checkbox",
                 check=True,
                 default_value=False,
-                callback=callbacks.toggle_point_labels_callback,
+                callback=toggle_point_labels_callback,
                 user_data=user_data
             )
             dpg.add_menu_item(
@@ -182,7 +228,7 @@ def create_menu_bar(app_state: 'AppState', queues: 'Queues'):
                 tag="show_reprojection_error_checkbox",
                 check=True,
                 default_value=True,
-                callback=callbacks.toggle_reprojection_error_callback,
+                callback=toggle_reprojection_error_callback,
                 user_data=user_data
             )
             dpg.add_menu_item(
@@ -190,14 +236,14 @@ def create_menu_bar(app_state: 'AppState', queues: 'Queues'):
                 tag="show_epipolar_lines_checkbox",
                 check=True,
                 default_value=True,
-                callback=callbacks.toggle_epipolar_lines_callback,
+                callback=toggle_epipolar_lines_callback,
                 user_data=user_data
             )
 
         with dpg.menu(label="Tools"):
             dpg.add_menu_item(
                 label="Manage video cache...",
-                callback=popups.cache_manager_callback,
+                callback=cache_manager_callback,
                 user_data=user_data
             )
 
@@ -212,26 +258,18 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'V
     dpg.add_text("Best Fitness: inf", tag="fitness_text")
     dpg.add_separator()
 
-    dpg.add_text("3D View")
-    # TODO: this debug section probably needs to be removed now
-    dpg.add_button(
-        label="Refresh 3D View",
-        callback=lambda: open3d_viz.reset_view()
-    )
-    dpg.add_separator()
-
     with dpg.collapsing_header(label="Annotate", default_open=True):
         dpg.add_combo(
             label="Keypoint",
             items=app_state.point_names,
             default_value=app_state.point_names[0],
-            callback=annotations_callbacks.set_selected_point_callback,
+            callback=set_selected_point_callback,
             user_data=user_data,
             tag="point_combo"
         )
         dpg.add_button(
             label="Toggle live tracking",
-            callback=tracking_callbacks.toggle_realtime_tracking_callback,
+            callback=toggle_realtime_tracking_callback,
             user_data=user_data,
             tag="keypoint_tracking_button"
         )
@@ -239,25 +277,25 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'V
         with dpg.group(horizontal=True):
             dpg.add_button(
                 label="< Track Backward",
-                callback=tracking_callbacks.batch_tracking_bwd_callback,
+                callback=batch_tracking_bwd_callback,
                 user_data=user_data,
                 width=125
             )
             dpg.add_button(
                 label="Track Forward >",
-                callback=tracking_callbacks.batch_tracking_fwd_callback,
+                callback=batch_tracking_fwd_callback,
                 user_data=user_data,
                 width=125
             )
 
         dpg.add_button(
             label="Set as Human annotated (H)",
-            callback=annotations_callbacks.set_human_annotated_callback,
+            callback=set_human_annotated_callback,
             user_data=user_data
         )
         dpg.add_button(
             label="Delete future annots (D)",
-            callback=annotations_callbacks.clear_future_annotations_callback,
+            callback=clear_future_annotations_callback,
             user_data=user_data
         )
 
@@ -270,7 +308,7 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'V
         with dpg.group(horizontal=True):
             dpg.add_button(
                 label="< Prev",
-                callback=calibration_callbacks.navigate_calib_frame_callback,
+                callback=navigate_calib_frame_callback,
                 user_data={"app_state": app_state, "direction": -1},
                 width=60
             )
@@ -278,21 +316,21 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'V
             dpg.add_button(
                 label="Add (C)",
                 tag="toggle_calib_frame_button",
-                callback=calibration_callbacks.addremove_calib_frame_callback,
+                callback=addremove_calib_frame_callback,
                 user_data=user_data,
                 width=75
             )
 
             dpg.add_button(
                 label="Next >",
-                callback=calibration_callbacks.navigate_calib_frame_callback,
+                callback=navigate_calib_frame_callback,
                 user_data={"app_state": app_state, "direction": 1},
                 width=60
             )
 
         dpg.add_button(
             label="Clear calib set",
-            callback=calibration_callbacks.clear_calib_frames_callback,
+            callback=clear_calib_frames_callback,
             user_data=user_data,
             width=-1
         )
@@ -301,7 +339,7 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'V
 
         dpg.add_button(
             label="Create calibration (Genetic Algorithm)",
-            callback=calibration_callbacks.start_ga_callback,
+            callback=start_ga_callback,
             user_data=user_data,
             width=-1
         )
@@ -311,13 +349,6 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'V
             user_data={"app_state": app_state, "queues": queues},
             width=-1
         )
-
-        # dpg.add_button(
-        #     label="/!\\ DEBUG: Clear Current Calibration /!\\",
-        #     callback=_clear_calibration_callback,
-        #     user_data=user_data,
-        #     width=-1
-        # )
 
 
 def create_bottom_panel(app_state: 'AppState'):
@@ -330,18 +361,18 @@ def create_bottom_panel(app_state: 'AppState'):
         with dpg.group(horizontal=True):
             dpg.add_button(
                 label="<| Prev",
-                callback=callbacks.prev_frame_callback,
+                callback=prev_frame_callback,
                 user_data=user_data
             )
             dpg.add_button(
                 label="Play",
-                callback=callbacks.play_pause_callback,
+                callback=play_pause_callback,
                 user_data=user_data,
                 tag="play_pause_button"
             )
             dpg.add_button(
                 label="Next |>",
-                callback=callbacks.next_frame_callback,
+                callback=next_frame_callback,
                 user_data=user_data
             )
 
@@ -350,7 +381,7 @@ def create_bottom_panel(app_state: 'AppState'):
                 min_value=0,
                 max_value=app_state.video_metadata['num_frames'] - 1,
                 default_value=0,
-                callback=callbacks.set_frame_callback,
+                callback=set_frame_callback,
                 user_data=user_data,
                 tag="frame_slider",
                 width=-1
@@ -390,7 +421,7 @@ def create_bottom_panel(app_state: 'AppState'):
             vertical=True,
             default_value=0,
             tag="current_frame_line",
-            callback=callbacks.set_frame_callback,
+            callback=set_frame_callback,
             user_data=user_data
         )
 
@@ -403,7 +434,7 @@ def create_bottom_panel(app_state: 'AppState'):
 
     with dpg.item_handler_registry(tag="histogram_handler"):
         dpg.add_item_clicked_handler(
-            callback=mouse_handlers.histogram_leftclick,
+            callback=histogram_leftclick,
             user_data=user_data
         )
     dpg.bind_item_handler_registry("annotation_plot", "histogram_handler")
@@ -466,7 +497,7 @@ def create_video_cell(cam_idx: int, app_state: 'AppState'):
 
         with dpg.item_handler_registry(tag=f"image_handler_{cam_idx}"):
             dpg.add_item_clicked_handler(
-                callback=mouse_handlers.image_mousedown_callback,
+                callback=image_mousedown_callback,
                 user_data={"cam_idx": cam_idx, "app_state": app_state}
             )
         dpg.bind_item_handler_registry(f"drawlist_{cam_idx}", f"image_handler_{cam_idx}")

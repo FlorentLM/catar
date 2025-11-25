@@ -1,5 +1,4 @@
 from typing import Dict, Any
-
 import numpy as np
 from jax import numpy as jnp
 

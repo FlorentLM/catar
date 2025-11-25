@@ -1,9 +1,7 @@
 import multiprocessing
 import queue
 import time
-
-from core.genetic_algorithm import run_genetic_step
-from core.refinement import run_refinement
+from core import run_genetic_step, run_refinement
 
 
 class GAWorker(multiprocessing.Process):

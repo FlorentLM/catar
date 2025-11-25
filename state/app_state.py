@@ -16,7 +16,7 @@ from state.data_manager import DataManager
 from mokap.utils.fileio import probe_video
 
 if TYPE_CHECKING:
-    from cache_utils import DiskCacheReader
+    from video import DiskCacheReader
     from state.calibration_state import CalibrationState
     from utils import CalibrationDict
 
@@ -68,6 +68,7 @@ class AppState:
 
     def __init__(
         self,
+        data_folder: Union[Path, str],
         camera_names: List[str],
         video_paths: List[Union[Path, str]],
         calib_state: 'CalibrationState',
@@ -76,13 +77,21 @@ class AppState:
         if len(camera_names) != len(video_paths):
             raise ValueError("Mismatch between number of camera names and video paths.")
 
+        self.data_folder = Path(data_folder)
+        if hasattr(config, 'VIDEO_CACHE_FOLDER'):
+            self.video_cache_dir = Path(config.VIDEO_CACHE_FOLDER)
+        else:
+            self.video_cache_dir = self.data_folder / 'video_cache'
+
+        self.video_backend = None
+
         # Keep top-level lock for app-wide state coordination
         # (DataManager has its own lock for data arrays)
         self.lock = threading.RLock()
 
         # Video information (constant during runtime)
         self.camera_names: List[str] = camera_names
-        self.video_paths: List[str] = [str(Path(p).resolve()) for p in video_paths]
+        self.video_paths: List[Path] = [Path(p).resolve() for p in video_paths]
         self.video_filenames: List[str] = [Path(p).name for p in video_paths]
 
         # Probe videos for metadata

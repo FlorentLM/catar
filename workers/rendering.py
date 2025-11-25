@@ -6,13 +6,13 @@ import cv2
 import numpy as np
 
 import config
-from gui.rendering import create_camera_visual
-from gui.viewer_3d import Viewer3D, Object3D
+from gui.rendering import create_camera_visual, Object3D, Viewer3D
 
 if TYPE_CHECKING:
     from state import AppState
     from mokap.reconstruction.reconstruction import Reconstructor
     from mokap.reconstruction.tracking import MultiObjectTracker
+
 
 class RenderingWorker(threading.Thread):
     """Handles rendering of 2D overlays and 3D visualisation."""

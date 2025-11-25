@@ -1,12 +1,13 @@
 import sys
 import tomllib
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Tuple, Union
 import Levenshtein
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from state.calibration_state import CalibrationState
+if TYPE_CHECKING:
+    from state.calibration_state import CalibrationState
 
 CameraParameters = Dict[str, Union[float, np.ndarray]]
 CalibrationDict = Dict[str, CameraParameters]

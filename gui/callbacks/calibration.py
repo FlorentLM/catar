@@ -22,16 +22,6 @@ def addremove_calib_frame_callback(sender, app_data, user_data):
             print(f"Frame {frame_idx} added to calibration set.")
 
 
-def clear_calib_frames_callback(sender, app_data, user_data):
-    """Clears the entire calibration set."""
-
-    app_state = user_data["app_state"]
-
-    with app_state.lock:
-        app_state.calibration.calibration_frames.clear()
-    print("Calibration frame set has been cleared.")
-
-
 def navigate_calib_frame_callback(sender, app_data, user_data):
     """Jump to the next or previous frame in the calibration set."""
 
@@ -163,13 +153,11 @@ def stop_ba_callback(sender, app_data, user_data):
     dpg.hide_item("ba_progress_popup")
 
 
-def _clear_calibration_callback(sender, app_data, user_data):
-    """Clears the current calibration from the app state."""
+def clear_calib_frames_callback(sender, app_data, user_data):
+    """Clears the entire calibration set from the app state."""
 
     app_state = user_data["app_state"]
 
     with app_state.lock:
-        # Create a new empty calibration dictionary to clear the state
-        empty_calib = {name: {} for name in app_state.camera_names}
-        app_state.calibration.update_calibration(empty_calib)
-        app_state.calibration.best_fitness = float('inf')
+        app_state.calibration.calibration_frames.clear()
+    print("Calibration frame set has been cleared.")

@@ -1,47 +1,67 @@
 import queue
 import threading
-from typing import TYPE_CHECKING, List
-import cv2
+from typing import TYPE_CHECKING
+
 from utils import triangulate_and_score
-from core.tracking import process_frame
+from core import process_frame
+from video import BatchVideoReader
 
 if TYPE_CHECKING:
     from state import AppState
+    from video import VideoBackend
     from mokap.reconstruction.reconstruction import Reconstructor
     from mokap.reconstruction.tracking import MultiObjectTracker
 
 
 class TrackingWorker(threading.Thread):
     """
-    Handles automated point tracking and on-demand 3D reconstruction.
+    Runs the automated point tracking, and provides on-demand 3D reconstruction.
     """
 
     def __init__(
-        self,
-        app_state: 'AppState',
-        reconstructor: 'Reconstructor',
-        tracker: 'MultiObjectTracker',
-        frames_in_queue: queue.Queue,
-        progress_out_queue: queue.Queue,
-        command_queue: queue.Queue,
-        stop_batch_track: threading.Event
+            self,
+            app_state: 'AppState',
+            video_backend: 'VideoBackend',
+            reconstructor: 'Reconstructor',
+            tracker: 'MultiObjectTracker',
+            frames_in_queue: queue.Queue,
+            progress_out_queue: queue.Queue,
+            command_queue: queue.Queue,
+            stop_batch_track: threading.Event
     ):
+        """
+        Initialize TrackingWorker.
+
+        Args:
+            app_state: Shared application state
+            video_backend: VideoBackend for batch frame access
+            reconstructor: Mokap reconstructor instance
+            tracker: Mokap multi-object tracker instance
+            frames_in_queue: Queue receiving frames from VideoReaderWorker
+            progress_out_queue: Queue for reporting batch tracking progress
+            command_queue: Queue for receiving commands
+            stop_batch_track: Event to signal batch tracking cancellation
+        """
         super().__init__(daemon=True, name="TrackingWorker")
 
         self.app_state = app_state
+        self.video_backend = video_backend
         self.reconstructor = reconstructor
         self.tracker = tracker
         self.frames_in_queue = frames_in_queue
         self.progress_out_queue = progress_out_queue
-        self.video_paths = app_state.video_paths
         self.command_queue = command_queue
         self.stop_batch_track_event = stop_batch_track
-        self.shutdown_event = threading.Event()     # TODO Events should all be defined at the same place probably...
+        self.shutdown_event = threading.Event()
+
+        # State for live tracking
         self.prev_frames = None
         self.prev_frame_idx = -1
 
     def run(self):
-        print("Tracking worker started.")
+        """Main worker loop."""
+
+        print("TrackingWorker started")
 
         while not self.shutdown_event.is_set():
             # Check for special commands (batch tracking)
@@ -50,14 +70,18 @@ class TrackingWorker(threading.Thread):
 
                 if command.get("action") == "batch_track":
                     start_frame = command["start_frame"]
-                    direction = command.get("direction", 1) # default to forward (1)
+                    direction = command.get("direction", 1)
                     self._run_batch_tracking(start_frame, direction)
                     continue
 
                 elif command.get("action") == "update_calibration":
-                    print("TrackingWorker: Received calibration update command.")
+                    print("TrackingWorker: Received calibration update command")
                     self.reconstructor.update_camera_parameters(command["calibration"])
                     continue
+
+                elif command.get("action") == "shutdown":
+                    self.shutdown_event.set()
+                    break
 
             except queue.Empty:
                 pass
@@ -87,10 +111,15 @@ class TrackingWorker(threading.Thread):
                 import traceback
                 traceback.print_exc()
 
-        print("Tracking worker shut down.")
+        print("TrackingWorker shut down")
 
     def _reconstruct_for_display(self, frame_idx: int):
+        """
+        Perform on-demand 3D reconstruction for a single frame.
 
+        Args:
+            frame_idx: Frame to reconstruct
+        """
         with self.app_state.lock:
             calibration = self.app_state.calibration
 
@@ -98,22 +127,24 @@ class TrackingWorker(threading.Thread):
 
         if calibration.best_calibration is not None:
             points_4d = triangulate_and_score(annotations, calibration)
-
             self.app_state.data.set_frame_points3d(frame_idx, points_4d)
 
             with self.app_state.lock:
                 self.app_state.needs_3d_reconstruction = False
 
     def _process_frame_for_tracking(self, data: dict):
-        """Process a single frame for the automated tracking pipeline (Live Tracking)."""
+        """
+        Process a single frame for the live tracking.
 
+        Args:
+            data: Frame data from VideoReaderWorker
+        """
         frame_idx = data["frame_idx"]
 
         with self.app_state.lock:
             is_tracking_enabled = self.app_state.keypoint_tracking_enabled
 
-        # We can track if enabled, and if we have adjacent frames (either forward or backward)
-        # ('is_adjacent' is populated by VideoReaderWorker)
+        # We can track if enabled, and if we have adjacent frames
         can_track = is_tracking_enabled and self.prev_frames and data.get("is_adjacent", False)
 
         # Double check adjacency manually to be safe
@@ -121,7 +152,7 @@ class TrackingWorker(threading.Thread):
             can_track = False
 
         if can_track:
-            print(f"[Frame {frame_idx}] TrackingWorker: Live tracking from {self.prev_frame_idx}.")
+            print(f"[Frame {frame_idx}] TrackingWorker: Live tracking from {self.prev_frame_idx}")
             process_frame(
                 frame_idx=frame_idx,
                 source_frame_idx=self.prev_frame_idx,
@@ -137,71 +168,37 @@ class TrackingWorker(threading.Thread):
 
     def _run_batch_tracking(self, start_frame: int, direction: int = 1):
         """
-        Track points starting from start_frame in the given direction (1 = forward or -1 = backward).
+        Track points starting from start_frame in the given direction.
+
+        Args:
+            start_frame: Starting frame index
+            direction: 1 for forward, -1 for backward
         """
-        # TODO: This should use the VideoReaderWorker so we don't have to have separate VideoCaptures, and so we can uptate the UI in real time
 
         dir_str = "FORWARD" if direction == 1 else "BACKWARD"
         print(f"Starting batch track {dir_str} from frame {start_frame}...")
 
-        # Check cache
-        cache_reader = self.app_state.cache_reader
-        use_cache = cache_reader is not None
-
-        caps = []
-        caps_file_pointer = -1
-
-        if use_cache:
-            print("Batch tracking using DiskCacheReader.")
-        else:
-            print("Batch tracking using VideoCapture.")
-            # Only initialize caps if we have to
-            caps = [cv2.VideoCapture(path) for path in self.video_paths]
-            if not all(cap.isOpened() for cap in caps):
-                print("Batch track error: Could not open videos.")
-                return
+        batch_reader = BatchVideoReader(self.video_backend)
 
         num_frames = self.app_state.video_metadata['num_frames']
 
         # Determine the range of frames to process
         if direction == 1:
-            # Forward: start + 1 -> end
             frame_range = range(start_frame + 1, num_frames)
             total_to_process = num_frames - start_frame - 1
         else:
-            # Backward: start - 1 -> 0
             frame_range = range(start_frame - 1, -1, -1)
             total_to_process = start_frame
 
         if total_to_process <= 0:
-            print("Batch track: No frames to process in this direction.")
-            self._cleanup_captures(caps)
+            print("Batch track: No frames to process in this direction")
             return
 
         # Read the initial source frames
-        source_frames = []
-
-        if use_cache:
-            # Priority 1: cache
-            try:
-                source_frames = cache_reader.get_frame(start_frame)
-            except Exception as e:
-                print(f"Cache read error: {e}")
-        else:
-            # Priority 2/3: VideoCapture
-            # Since we just opened them we must seek to start_frame
-            for cap in caps:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-                ret, frame = cap.read()
-                if ret: source_frames.append(frame)
-
-            # Update pointer (VideoCapture is now at start_frame + 1)
-            if len(source_frames) == len(caps):
-                caps_file_pointer = start_frame + 1
+        source_frames = batch_reader.read_frame(start_frame)
 
         if not source_frames:
-            print("Could not read start frame.")
-            self._cleanup_captures(caps)
+            print("Could not read start frame")
             return
 
         current_source_idx = start_frame
@@ -209,48 +206,16 @@ class TrackingWorker(threading.Thread):
         # Main tracking loop
         for i, dest_frame_idx in enumerate(frame_range):
             if self.stop_batch_track_event.is_set():
-                print(f"Batch track stopped by user at frame {dest_frame_idx}.")
+                print(f"Batch track stopped by user at frame {dest_frame_idx}")
                 break
 
-            dest_frames = []
+            dest_frames = batch_reader.read_frame(dest_frame_idx)
 
-            if use_cache:
-                # Always use cache if available
-                try:
-                    dest_frames = cache_reader.get_frame(dest_frame_idx)
-                except Exception as e:
-                    print(f"Cache read error: {e}")
-                    break
-
-            else:
-                # VideoCapture sequential read (forward only)
-                if (direction == 1) and (dest_frame_idx == caps_file_pointer):
-                    for cap in caps:
-                        ret, f = cap.read()
-                        if ret: dest_frames.append(f)
-
-                    if len(dest_frames) == len(caps):
-                        caps_file_pointer += 1
-                    else:
-                        dest_frames = [] # Signal error
-
-                # VideoCapture seek (backward or jump)
-                else:
-                    dest_frames = []
-                    for cap in caps:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, dest_frame_idx)
-                        ret, f = cap.read()
-                        if ret: dest_frames.append(f)
-
-                    if len(dest_frames) == len(caps):
-                        caps_file_pointer = dest_frame_idx + 1 # Update pointer after seek+read
-
-            # Check if read was successful
             if not dest_frames:
-                print(f"Failed to read frames at index {dest_frame_idx}.")
+                print(f"Failed to read frames at index {dest_frame_idx}")
                 break
 
-            # Run the core logic source -> dest
+            # Run the core tracking logic: source -> dest
             process_frame(
                 frame_idx=dest_frame_idx,
                 source_frame_idx=current_source_idx,
@@ -261,7 +226,7 @@ class TrackingWorker(threading.Thread):
                 dest_frames=dest_frames
             )
 
-            # Destination becomes source for the next iteration
+            # Destination becomes source for next iteration
             source_frames = dest_frames
             current_source_idx = dest_frame_idx
 
@@ -275,15 +240,10 @@ class TrackingWorker(threading.Thread):
                     "total_frames": num_frames
                 })
 
-        # Signal completion with the final frame for the UI to jump to
+        # Signal completion
         final_frame = frame_range[-1] if len(frame_range) > 0 else start_frame
         self.progress_out_queue.put({"status": "complete", "final_frame": final_frame})
 
-        self._cleanup_captures(caps)
-        print(f"Batch track {dir_str} complete.")
-
-    def _cleanup_captures(self, caps: List[cv2.VideoCapture]):
-        """Release video captures if they were created."""
-        if caps:
-            for cap in caps:
-                cap.release()
+        # Clean up
+        batch_reader.clear_cache()
+        print(f"Batch track {dir_str} complete")

@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, List
 import cv2
 import numpy as np
 import config
-from core.annotation import fuse_annotations
+from core import fuse_annotations
 from utils import triangulate_and_score
 
 if TYPE_CHECKING:
@@ -78,9 +78,8 @@ def process_frame(
     cam_indices, point_indices = np.where(~np.isnan(annotations_from_lk[..., 0]))
     num_lk_points = len(cam_indices)
 
-    # Debug print
-    # TODO: Add toggle for these prints
-    print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
+    if config.VERBOSE:
+        print(f"LK PREDICT:    Started with {num_lk_points} raw 2D keypoints from Optical Flow.")
 
     if num_lk_points > 0:
         coords = annotations_from_lk[cam_indices, point_indices, :2]
@@ -100,12 +99,15 @@ def process_frame(
             keypoint_names=point_names
         )
 
-        print(f"MOKAP RECON:   Input {num_lk_points} 2D points -> Produced soup of {soup.num_points} 3D points and {len(soup.ray_origins)} orphan rays.")
+        if config.VERBOSE:
+            print(f"MOKAP RECON:   Input {num_lk_points} 2D points -> Produced soup "
+                  f"of {soup.num_points} 3D points and {len(soup.ray_origins)} orphan rays.")
 
         # Run multi-object tracking (skeleton assembly + time association)
         active_tracklets = tracker.update(soup, frame_idx)
     else:
-        print("MOKAP RECON:   No input points from LK.")
+        if config.VERBOSE:
+            print("MOKAP RECON:   No input points from LK.")
         active_tracklets = []
 
     # Extract best skeleton for feedback loop
@@ -122,9 +124,12 @@ def process_frame(
         avg_score = best_tracklet.skeleton.score / max(1, num_kps)
         normalised_skeleton_score = np.clip(avg_score / max_score, 0.0, 1.0)
 
-        print(f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints (score: {best_tracklet.skeleton.score:.2f} or {normalised_skeleton_score:.2f}).")
+        if config.VERBOSE:
+            print(f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints "
+                  f"(score: {best_tracklet.skeleton.score:.2f} or {normalised_skeleton_score:.2f}).")
     else:
-        print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
+        if config.VERBOSE:
+            print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
 
     # Get model-reprojected annotations
     annotations_from_model = np.full_like(annotations_from_lk, np.nan)
@@ -288,7 +293,9 @@ def track_points(
 
                 # Kill if terrible
                 if ncc_score < config.NCC_THRESHOLD_KILL:
-                    print(f"NCC CHECK: Killed point '{point_names[p_idx]}' in camera '{cam_names[cam_idx]}' (NCC score = {ncc_score:.2f})")
+                    if config.VERBOSE:
+                        print(f"NCC CHECK: Killed point '{point_names[p_idx]}' in "
+                              f"camera '{cam_names[cam_idx]}' (NCC score = {ncc_score:.2f})")
                     continue
 
                 # Confidence calculation
@@ -301,7 +308,11 @@ def track_points(
                 # Soft penalty for lower NCC scores
                 ncc_factor = 1.0
                 if ncc_score < config.NCC_THRESHOLD_WARNING:
-                    print(f"NCC CHECK: Penalty applied to '{point_names[p_idx]}' in camera '{cam_names[cam_idx]}' (NCC score = {ncc_score:.2f})")
+
+                    if config.VERBOSE:
+                        print(f"NCC CHECK: Penalty applied to '{point_names[p_idx]}' in "
+                              f"camera '{cam_names[cam_idx]}' (NCC score = {ncc_score:.2f})")
+
                     ncc_factor = max(0.0, (ncc_score - config.NCC_THRESHOLD_KILL) / (
                                 config.NCC_THRESHOLD_WARNING - config.NCC_THRESHOLD_KILL))
 
