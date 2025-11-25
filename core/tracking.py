@@ -7,6 +7,8 @@ from utils import triangulate_and_score
 
 if TYPE_CHECKING:
     from state import AppState
+    from mokap.reconstruction.reconstruction import Reconstructor
+    from mokap.reconstruction.tracking import MultiObjectTracker
 
 
 def compute_patch_ncc(
@@ -51,13 +53,14 @@ def process_frame(
         reconstructor: 'Reconstructor',
         tracker: 'MultiObjectTracker',
         source_frames: List[np.ndarray],
-        dest_frames: List[np.ndarray]
+        dest_frames: List[np.ndarray],
+        batch_step: int = 0
 ):
     """
     Runs the full processing pipeline for a frame.
     """
 
-    print(f"\n[Frame: {source_frame_idx} -> {frame_idx}]")
+    print(f"\n[Frame: {source_frame_idx} -> {frame_idx}] (step {batch_step})")
 
     with app_state.lock:
         calibration = app_state.calibration
@@ -240,6 +243,7 @@ def track_points(
         calibration = app_state.calibration
         cam_names = app_state.camera_names
         point_names = app_state.point_names
+        decay_rate = app_state.tracker_decay_rate
 
     annotations_source_full = app_state.data.get_frame_annotations(source_frame_idx, copy=True)
 
@@ -319,7 +323,7 @@ def track_points(
                     ncc_factor = max(0.0, (ncc_score - config.NCC_THRESHOLD_KILL) / (
                                 config.NCC_THRESHOLD_WARNING - config.NCC_THRESHOLD_KILL))
 
-                new_conf = prev_conf * geom_quality * ncc_factor * config.CONFIDENCE_TIME_DECAY
+                new_conf = prev_conf * geom_quality * ncc_factor * decay_rate
 
                 output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), new_conf]
 

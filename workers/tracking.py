@@ -160,7 +160,8 @@ class TrackingWorker(threading.Thread):
                 reconstructor=self.reconstructor,
                 tracker=self.tracker,
                 source_frames=self.prev_frames,
-                dest_frames=data["raw_frames"]
+                dest_frames=data["raw_frames"],
+                batch_step=1  # always step 1 for realtime tracking
             )
 
         self.prev_frames = data["raw_frames"]
@@ -223,7 +224,8 @@ class TrackingWorker(threading.Thread):
                 reconstructor=self.reconstructor,
                 tracker=self.tracker,
                 source_frames=source_frames,
-                dest_frames=dest_frames
+                dest_frames=dest_frames,
+                batch_step=i + 1
             )
 
             # Destination becomes source for next iteration

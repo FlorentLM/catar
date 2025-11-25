@@ -155,6 +155,13 @@ def fuse_annotations(
 
             # Check for agreement from other sources
             for other in other_sources:
+
+                # Fusion precedence ratio: Ratio by which a better source must exceed a worse source
+                # to completely take precedence on it
+                if other['type'] != 'human':
+                    if best_source['conf'] > (other['conf'] * config.FUSION_PRECEDENCE_RATIO):
+                        continue
+
                 distance = np.linalg.norm(best_source['pos'] - other['pos'])
 
                 # If sources agree spatially, we average them

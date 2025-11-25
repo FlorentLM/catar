@@ -113,8 +113,16 @@ class AppState:
         self.frame_width: int = first_metadata['width']
         self.frame_height: int = first_metadata['height']
         self.num_frames: int = first_metadata['num_frames']
-        self.fps: float = first_metadata['fps']
         self.video_duration: float = first_metadata['duration']
+        self.fps: float = first_metadata['fps'] or 30.0     # default to 30 if fps is missing
+
+        half_life_frames = config.TRACKER_HALF_LIFE_CONFIDENCE_DECAY * self.fps
+        if half_life_frames > 0:
+            self.tracker_decay_rate = 0.5 ** (1.0 / half_life_frames)
+        else:
+            self.tracker_decay_rate = 0.0  # instant decay if half-life is 0
+        print(f"Tracker: Half-life {config.TRACKER_HALF_LIFE_CONFIDENCE_DECAY:.1f}s @ {self.fps:.2f} FPS "
+              f"-> Decay rate per frame: {self.tracker_decay_rate:.4f}")
 
         # State Objects
         self.calibration: 'CalibrationState' = calib_state

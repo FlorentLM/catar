@@ -36,8 +36,24 @@ LK_PARAMS = dict(
 
 # Tracking parameters
 
-# Decaying confidence with time from last human-annotated frame
-CONFIDENCE_TIME_DECAY = 0.96
+# Tracker confidence half-life:
+# After how much (real-life) time its certainty is 50% compared to when it started.
+# This is automatically combined with the videos framerate.
+TRACKER_HALF_LIFE_CONFIDENCE_DECAY = 0.5  # in seconds
+
+# Fusion precedence ratio:
+# During tracking, if a source is > 2.0x more confident than an other source,
+# the weaker source is ignored.
+#
+# This creates a "winner-takes-all" to silence weak signals (e.g. drifted tracks),
+# while falling back to "weighted averaging" when signals have comparable confidence.
+#
+# Human annotations are EXEMPT from this check and are never ignored.
+#
+# Example (assuming fresh track confidence ~1.0):
+# 2.0 = discard old tracks decayed below 50% (1 half-life)
+# 4.0 = discard old tracks decayed below 25% (2 half-lives)
+FUSION_PRECEDENCE_RATIO = 2.0
 
 # The maximum distance for two sources to be considered in agreement.
 # This defines the tolerance for consensus and the boundary for the confidence bonus falloff.
