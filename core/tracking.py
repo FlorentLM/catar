@@ -202,7 +202,7 @@ def process_frame(
         for p_name, pos_3d in final_skeleton_kps.items():
             if p_name in point_names:
                 points3d.append(pos_3d)
-                p_indices.append(point_names.index(p_name))
+                p_indices.append(app_state.point_nti[p_name])
 
         points3d = np.array(points3d)
 
@@ -359,8 +359,8 @@ def track_points(
                 # Kill if terrible
                 if ncc_score < config.NCC_THRESHOLD_KILL:
                     if config.VERBOSE:
-                        print(f"NCC CHECK: Killed point '{point_names[p_idx]}' in "
-                              f"camera '{cam_names[cam_idx]}' (NCC score = {ncc_score:.2f})")
+                        print(f"NCC CHECK: Killed point '{app_state.point_itn[p_idx]}' in "
+                              f"camera '{app_state.camera_itn[cam_idx]}' (NCC score = {ncc_score:.2f})")
                     continue
 
                 # Confidence calculation
@@ -375,8 +375,8 @@ def track_points(
                 if ncc_score < config.NCC_THRESHOLD_WARNING:
 
                     if config.VERBOSE:
-                        print(f"NCC CHECK: Penalty applied to '{point_names[p_idx]}' in "
-                              f"camera '{cam_names[cam_idx]}' (NCC score = {ncc_score:.2f})")
+                        print(f"NCC CHECK: Penalty applied to '{app_state.point_itn[p_idx]}' in "
+                              f"camera '{app_state.camera_itn[cam_idx]}' (NCC score = {ncc_score:.2f})")
 
                     ncc_factor = max(0.0, (ncc_score - config.NCC_THRESHOLD_KILL) / (
                                 config.NCC_THRESHOLD_WARNING - config.NCC_THRESHOLD_KILL))
@@ -416,7 +416,7 @@ def track_points(
                 if np.isnan(point_3d_hypothesis).any():
                     continue
 
-                cam_name_to_check = cam_names[cam_idx_to_check]
+                cam_name_to_check = app_state.camera_itn[cam_idx_to_check]
                 reprojected = calibration.reproject_to_one(
                     point_3d_hypothesis.reshape(1, 3),
                     cam_name_to_check

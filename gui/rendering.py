@@ -1,7 +1,7 @@
 import queue
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Tuple, Optional
+from typing import TYPE_CHECKING, List, Tuple, Optional, Dict
 import numpy as np
 import open3d as o3d
 from dearpygui import dearpygui as dpg
@@ -300,7 +300,7 @@ def update_annotation_overlays(app_state: 'AppState'):
     with app_state.lock:
 
         frame_idx = app_state.frame_idx
-        num_videos = len(app_state.camera_names)
+        num_videos = app_state.num_videos
 
         focus_mode = app_state.focus_selected_point
         show_all_labels = app_state.show_all_labels
@@ -309,10 +309,7 @@ def update_annotation_overlays(app_state: 'AppState'):
         temp_hide_overlays = app_state.temp_hide_overlays
 
         calibration = app_state.calibration
-
-        point_names = app_state.point_names
         camera_colors = app_state.camera_colors
-        camera_names = app_state.camera_names
 
     all_annotations = app_state.data.get_frame_annotations(frame_idx)
     all_human_annotated = app_state.data.get_human_annotated_flags(frame_idx)
@@ -336,39 +333,59 @@ def update_annotation_overlays(app_state: 'AppState'):
         if widget_size[0] == 0:
             continue
 
-        camera_name = camera_names[cam_idx]
-        video_meta = app_state.get_video_metadata(camera_name)
+        cam_name = app_state.camera_itn[cam_idx]
+        video_meta = app_state.get_video_metadata(cam_name)
         video_w = video_meta['width']
         video_h = video_meta['height']
 
         scale_x = widget_size[0] / video_w
         scale_y = widget_size[1] / video_h
-        cam_name = camera_names[cam_idx]
 
         # epipolar lines for selected point
         if show_epipolar_lines and not temp_hide_overlays and best_calib and f_mats:
             draw_epipolar_lines(
-                cam_idx, selected_annots, f_mats, num_videos,
-                video_w, video_h, scale_x, scale_y,
-                camera_colors, camera_names, layer_tag
+                app_state=app_state,
+                cam_idx=cam_idx,
+                selected_annots=selected_annots,
+                f_mats=f_mats,
+                num_videos=num_videos,
+                video_w=video_w,
+                video_h=video_h,
+                scale_x=scale_x,
+                scale_y=scale_y,
+                camera_colors=camera_colors,
+                layer_tag=layer_tag
             )
 
         # reprojection for selected point
         if not temp_hide_overlays and not np.isnan(point_3d).any() and best_calib:
             draw_reprojection_errors(
-                cam_idx, point_3d, selected_annots,
-                calibration, cam_name,
-                scale_x, scale_y, layer_tag,
-                show_reprojection_error
+                cam_idx=cam_idx,
+                point_3d=point_3d,
+                selected_annots=selected_annots,
+                calibration=calibration,
+                cam_name=cam_name,
+                scale_x=scale_x,
+                scale_y=scale_y,
+                layer_tag=layer_tag,
+                show_reproj_error=show_reprojection_error
             )
 
         # and all annotated points
         if not temp_hide_overlays:
             draw_all_points(
-                cam_idx, all_annotations, all_human_annotated,
-                point_names, p_idx, focus_mode, app_state.num_points, scale_x, scale_y, layer_tag,
-                show_all_labels
+                app_state=app_state,
+                cam_idx=cam_idx,
+                selected_point_idx=p_idx,
+                annotations=all_annotations,
+                human_annotated=all_human_annotated,
+                scale_x=scale_x,
+                scale_y=scale_y,
+                layer_tag=layer_tag,
+                focus_mode=focus_mode,
+                show_all_labels=show_all_labels
             )
+
 
 
 def update_histogram(app_state: 'AppState'):
@@ -437,9 +454,17 @@ def update_control_panel(app_state: 'AppState'):
 
 
 def draw_epipolar_lines(
-        cam_idx, selected_annots, f_mats, num_videos,
-        video_w, video_h, scale_x, scale_y,
-        camera_colors, camera_names, layer_tag
+        app_state: 'AppState',
+        cam_idx: int,
+        selected_annots: np.ndarray,
+        f_mats: Dict[Tuple[int, int], np.ndarray],
+        num_videos: int,
+        video_w: int,
+        video_h: int,
+        scale_x: float,
+        scale_y: float,
+        camera_colors: List[Tuple[int, int, int]],
+        layer_tag: str
 ):
     """Draws epipolar lines from the other cameras with labels placed inside the view."""
 
@@ -475,11 +500,13 @@ def draw_epipolar_lines(
             font_size = 12
             inset = 5
 
+            from_cam_str = app_state.camera_itn[from_cam]
+
             # Adjust position based on which edge anchor is on
             if anchor_pos[0] < 1:  # Left edge
                 anchor_pos[0] = inset
             elif anchor_pos[0] > widget_size[0] - 1:  # Right edge
-                text_width_estimate = len(camera_names[from_cam]) * font_size * 0.6
+                text_width_estimate = len(from_cam_str) * font_size * 0.6
                 anchor_pos[0] = widget_size[0] - text_width_estimate - inset
 
             if anchor_pos[1] < 1:  # Top edge
@@ -489,7 +516,7 @@ def draw_epipolar_lines(
 
             dpg.draw_text(
                 pos=anchor_pos,
-                text=camera_names[from_cam],
+                text=from_cam_str,
                 color=color,
                 size=font_size,
                 parent=layer_tag
@@ -497,10 +524,15 @@ def draw_epipolar_lines(
 
 
 def draw_reprojection_errors(
-        cam_idx, point_3d, selected_annots,
-        calibration, cam_name,
-        scale_x, scale_y, layer_tag,
-        show_reprojection_error
+        cam_idx: int,
+        point_3d: np.ndarray,
+        selected_annots: np.ndarray,
+        calibration: 'CalibrationState',
+        cam_name: str,
+        scale_x: float,
+        scale_y: float,
+        layer_tag: str,
+        show_reproj_error: bool
 ):
     """Draws reproj and error line for reconstructed point."""
 
@@ -532,7 +564,7 @@ def draw_reprojection_errors(
 
     # Error line and distance label (if annotation exists and is enabled)
     # Check only x, y for existence
-    if show_reprojection_error and not np.isnan(selected_annots[cam_idx, :2]).any():
+    if show_reproj_error and not np.isnan(selected_annots[cam_idx, :2]).any():
         annot_scaled = (
             selected_annots[cam_idx, 0] * scale_x,
             selected_annots[cam_idx, 1] * scale_y
@@ -570,12 +602,20 @@ def draw_reprojection_errors(
 
 
 def draw_all_points(
-    cam_idx, annotations, human_annotated, point_names,
-    selected_point_idx, focus_mode, num_points, scale_x, scale_y, layer_tag, show_all_labels
+        app_state: 'AppState',
+        cam_idx: int,
+        selected_point_idx: int,
+        annotations: np.ndarray,
+        human_annotated: np.ndarray,
+        scale_x: float,
+        scale_y: float,
+        layer_tag: str,
+        focus_mode: bool,
+        show_all_labels: bool
 ):
     """Draws all annotated keypoints and their labels."""
 
-    for i in range(num_points):
+    for i in range(app_state.num_points):
 
         if focus_mode and i != selected_point_idx:
             continue
@@ -608,7 +648,7 @@ def draw_all_points(
         if show_all_labels or i == selected_point_idx:
             dpg.draw_text(
                 pos=(center_x + 8, center_y - 8),
-                text=f"{point_names[i]} ({point_data[2]:.2f})",
+                text=f"{app_state.point_itn[i]} ({point_data[2]:.2f})",
                 color=color,
                 size=12,
                 parent=layer_tag

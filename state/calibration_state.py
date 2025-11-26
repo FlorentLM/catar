@@ -48,7 +48,11 @@ class CalibrationState:
                 raise ValueError(f"Missing calibration for camera '{name}'")
         
         self._calibrations: 'CalibrationDict' = initial_calibration
-        self._camera_names: List[str] = camera_names
+
+        self._camera_names = tuple(camera_names)
+        self.camera_nti = {name: i for i, name in enumerate(self._camera_names)}
+        self.camera_itn = {i: name for name, i in self.camera_nti.items()}
+
         self._cache: Dict[str, np.ndarray] = {}
         self._f_mats_cache: Optional[Dict[Tuple[int, int], np.ndarray]] = None
         
@@ -106,7 +110,7 @@ class CalibrationState:
             Dictionary with keys: camera_matrix, dist_coeffs, rvec, tvec
             where rvec and tvec are in world-to-camera format
         """
-        cam_idx = self._camera_names.index(camera_name)
+        cam_idx = self.camera_nti[camera_name]
         
         params = self._calibrations[camera_name].copy()
         params['rvec'] = self.rvecs_w2c[cam_idx]
@@ -116,7 +120,7 @@ class CalibrationState:
     
     @property
     def camera_names(self) -> List[str]:
-        return self._camera_names
+        return list(self._camera_names)
     
     @property
     def n_cameras(self) -> int:
@@ -126,14 +130,6 @@ class CalibrationState:
     def best_calibration(self) -> Optional['CalibrationDict']:
         # TODO: Maybe get rid of this
         return self._calibrations
-    
-    def camera_nti(self, camera_name: str) -> int:
-        """Convert camera name to its index."""
-        return self._camera_names.index(camera_name)
-    
-    def camera_itn(self, cam_idx: int) -> str:
-        """Convert camera index to its name."""
-        return self._camera_names[cam_idx]
 
     def _get_or_compute(self, key: str, dtype=np.float32) -> np.ndarray:
         """
@@ -274,7 +270,7 @@ class CalibrationState:
         if points3d.shape[-1] == 4:
             points3d = points3d[..., :3]
         
-        cam_idx = self.camera_nti(camera_name)
+        cam_idx = self.camera_nti[camera_name]
         
         # Project using world-to-camera parameters
         reprojected, _ = projective.project_points(
@@ -337,7 +333,7 @@ class CalibrationState:
         if not np.any(valid_mask):
             return np.full_like(points2d, np.nan)
         
-        cam_idx = self.camera_nti(camera_name)
+        cam_idx = self.camera_nti[camera_name]
         
         valid_points = points2d[valid_mask]
         

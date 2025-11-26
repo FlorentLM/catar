@@ -54,7 +54,7 @@ def snap_annotation(
 
     point_3d = point_3d_single.flatten()
 
-    cam_name = calibration.camera_itn(target_cam_idx)
+    cam_name = calibration.camera_itn[target_cam_idx]
     reprojected_point_2d = calibration.reproject_to_one(
         point_3d.reshape(1, 3),
         cam_name

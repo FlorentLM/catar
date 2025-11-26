@@ -91,13 +91,14 @@ class AppState:
 
         # Cameras order and lookup accessors
         self.camera_names = tuple(camera_names)
+        self.num_cameras = len(camera_names)
         self.camera_nti = {name: i for i, name in enumerate(self.camera_names)}
         self.camera_itn = {i: name for name, i in self.camera_nti.items()}
-        # TODO: Use these accessors everywhere possible
 
         # Video information (constant during runtime)
         self.video_paths: List[Path] = [Path(p).resolve() for p in video_paths]
         self.video_filenames: List[str] = [Path(p).name for p in video_paths]
+        self.num_videos = len(self.video_paths)
 
         # Probe videos for metadata
         self._video_metadata: Dict[str, Dict[str, Any]] = {}
@@ -132,7 +133,6 @@ class AppState:
         self.point_names = tuple(skeleton_config['point_names'])
         self.point_nti = {name: i for i, name in enumerate(self.point_names)}
         self.point_itn = {i: name for name, i in self.point_nti.items()}
-        # TODO: Use these accessors everywhere possible
 
         self.skeleton = skeleton_config['skeleton']
 

@@ -113,7 +113,7 @@ class RenderingWorker(threading.Thread):
                     type='point',
                     coords=point[:3],
                     color=color,
-                    label=point_names[i]
+                    label=self.app_state.point_itn[i]
                 ))
 
                 # # Debug: print 1st point
@@ -123,7 +123,7 @@ class RenderingWorker(threading.Thread):
                 # Draw skeleton connections
                 for connected_name in skeleton.get(point_names[i], []):
                     try:
-                        j = point_names.index(connected_name)
+                        j = self.app_state.point_nti[connected_name]
                         if not np.isnan(points_3d[j][:3]).any():
                             scene.append(Object3D(
                                 type='line',

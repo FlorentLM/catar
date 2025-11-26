@@ -15,7 +15,7 @@ def set_human_annotated_callback(sender, app_data, user_data):
         p_idx = app_state.selected_point_idx
         with app_state.data.bulk_lock():
             app_state.data.human_annotated[:frame_idx + 1, :, p_idx] = True
-        print(f"Marked previous frames as human-annotated for '{app_state.point_names[p_idx]}'")
+        print(f"Marked previous frames as human-annotated for '{app_state.point_itn[p_idx]}'")
 
 
 def clear_future_annotations_callback(sender, app_data, user_data):
@@ -36,7 +36,7 @@ def clear_future_annotations_callback(sender, app_data, user_data):
             app_state.data.annotations[frame_idx + 1:, :, p_idx] = np.nan
             app_state.data.human_annotated[frame_idx + 1:, :, p_idx] = False
 
-        print(f"Cleared future annotations for '{app_state.point_names[p_idx]}'")
+        print(f"Cleared future annotations for '{app_state.point_itn[p_idx]}'")
 
 
 def set_selected_point_callback(sender, app_data, user_data):
@@ -44,4 +44,4 @@ def set_selected_point_callback(sender, app_data, user_data):
 
     app_state = user_data["app_state"]
     with app_state.lock:
-        app_state.selected_point_idx = app_state.point_names.index(app_data)
+        app_state.selected_point_idx = app_state.point_nti[app_data]

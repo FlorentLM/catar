@@ -480,7 +480,7 @@ def create_video_cell(cam_idx: int, app_state: 'AppState'):
         # Display Camera Name (bold) and Filename (faint)
 
         with dpg.group(horizontal=True, horizontal_spacing=5):
-            camera_name = app_state.camera_names[cam_idx]
+            camera_name = app_state.camera_itn[cam_idx]
             file_name = app_state.video_filenames[cam_idx]
 
             dpg.add_text(camera_name)

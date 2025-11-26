@@ -17,7 +17,7 @@ def image_mousedown_callback(sender, app_data, user_data):
     with app_state.lock:
         frame_idx = app_state.frame_idx
         p_idx = app_state.selected_point_idx
-        camera_name = app_state.camera_names[cam_idx]
+        camera_name = app_state.camera_itn[cam_idx]
         video_meta = app_state.get_video_metadata(camera_name)
 
     annotations = app_state.data.get_camera_annotations(frame_idx, cam_idx)
@@ -110,7 +110,7 @@ def image_mousedrag_callback(sender, app_data, user_data):
         p_idx = app_state.drag_state["p_idx"]
         frame_idx = app_state.frame_idx
 
-        camera_name = app_state.camera_names[cam_idx]
+        camera_name = app_state.camera_itn[cam_idx]
         video_meta = app_state.get_video_metadata(camera_name)
         video_w = video_meta['width']
         video_h = video_meta['height']
@@ -237,7 +237,7 @@ def image_mousedrag_callback(sender, app_data, user_data):
 
     # Draw reprojection for selected point
     if not temp_hide_overlays and best_calib and not np.isnan(point_3d_selected[:3]).any():
-        cam_name_target = cam_names[cam_idx]
+        cam_name_target = app_state.camera_itn[cam_idx]
         reprojected = app_state.calibration.reproject_to_one(
             point_3d_selected[:3].reshape(1, 3),
             cam_name_target
