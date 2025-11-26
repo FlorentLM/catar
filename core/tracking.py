@@ -46,6 +46,58 @@ def compute_patch_ncc(
         return -1.0
 
 
+def detect_track_collision(
+        existing_annots: np.ndarray,
+        new_predictions: np.ndarray,
+        distance_threshold: float = 30.0,
+        ratio_threshold: float = 0.25
+) -> bool:
+    """
+    Checks if the new predictions diverge significantly from existing annotations.
+
+    Args:
+        existing_annots: Array (C, P, 3) of existing data.
+        new_predictions: Array (C, P, 3) of new LK tracker data.
+        distance_threshold: Pixel distance to consider a single point in conflict.
+        ratio_threshold: Percentage (0.0-1.0) of total visible points that must
+                         be in conflict to trigger a stop.
+    """
+
+    valid_existing = ~np.isnan(existing_annots[..., 0])
+    valid_new = ~np.isnan(new_predictions[..., 0])
+
+    # Union (total scope of data available in this frame)
+    union_mask = valid_existing | valid_new
+    total_points_count = np.sum(union_mask)
+
+    if total_points_count == 0:
+        return False
+
+    # Intersection (waht can actually be compared)
+    overlap_mask = valid_existing & valid_new
+
+    # if no overlap, no conflict
+    if not np.any(overlap_mask):
+        return False
+
+    # Calculate vector diffs
+    diffs = existing_annots[..., :2] - new_predictions[..., :2]
+    dists_overlap = np.linalg.norm(diffs[overlap_mask], axis=1)
+
+    # How much of the total skeleton is currently contradicting?
+    n_conflicts = np.sum(dists_overlap > distance_threshold)
+    conflict_ratio = n_conflicts / total_points_count
+
+    if conflict_ratio > ratio_threshold:
+        print(f"!!! COLLISION DETECTED !!!")
+        print(f"    {n_conflicts} points conflict out of {total_points_count} visible points.")
+        print(f"    Ratio: {conflict_ratio:.2f} (Threshold: {ratio_threshold})")
+        print(f"    Stopping batch track.")
+        return True
+
+    return False
+
+
 def process_frame(
         frame_idx: int,
         source_frame_idx: int,
@@ -55,7 +107,7 @@ def process_frame(
         source_frames: List[np.ndarray],
         dest_frames: List[np.ndarray],
         batch_step: int = 0
-):
+) -> bool:
     """
     Runs the full processing pipeline for a frame.
     """
@@ -65,6 +117,7 @@ def process_frame(
     with app_state.lock:
         calibration = app_state.calibration
         point_names = app_state.point_names
+        collision_stop = app_state.tracker_collision_stop
 
     existing_annots = app_state.data.get_frame_annotations(frame_idx, copy=True)
     is_human_flags = app_state.data.get_human_annotated_flags(frame_idx, copy=True)
@@ -76,6 +129,10 @@ def process_frame(
     predictions_LK = track_points(
         app_state, src_gray, dst_gray, source_frame_idx, frame_idx
     )
+
+    if collision_stop:
+        if detect_track_collision(existing_annots, predictions_LK, distance_threshold=30.0, ratio_threshold=0.25):  # TODO: config for these
+            return False  # signal to stop
 
     # Prepare input for Mokap Reconstructor
     cam_indices, point_indices = np.where(~np.isnan(predictions_LK[..., 0]))
@@ -226,6 +283,7 @@ def process_frame(
     app_state.data.set_frame_annotations(frame_idx, annotations_fused)
     app_state.data.set_frame_points3d(frame_idx, final_points3d)
 
+    return True
 
 def track_points(
         app_state: 'AppState',

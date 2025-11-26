@@ -173,6 +173,7 @@ class AppState:
         # Feature Flags
         self.keypoint_tracking_enabled: bool = False
         self.needs_3d_reconstruction: bool = True
+        self.tracker_collision_stop: bool = True
 
         # Transient UI Data
 

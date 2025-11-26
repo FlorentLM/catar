@@ -20,6 +20,7 @@ from gui.callbacks.calibration import (
 )
 from gui.callbacks.tracking import (
     toggle_realtime_tracking_callback,
+    toggle_tracker_collision_callback,
     batch_tracking_fwd_callback,
     batch_tracking_bwd_callback
 )
@@ -258,7 +259,7 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'V
     dpg.add_text("Best Fitness: inf", tag="fitness_text")
     dpg.add_separator()
 
-    with dpg.collapsing_header(label="Annotate", default_open=True):
+    with dpg.collapsing_header(label="Annotations", default_open=True):
         dpg.add_combo(
             label="Keypoint",
             items=app_state.point_names,
@@ -268,7 +269,32 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'V
             tag="point_combo"
         )
         dpg.add_button(
-            label="Toggle live tracking",
+            label="Set as Human annotated (H)",
+            callback=set_human_annotated_callback,
+            user_data=user_data,
+        )
+        dpg.add_button(
+            label="Delete future annots (D)",
+            callback=clear_future_annotations_callback,
+            user_data=user_data
+        )
+
+    dpg.add_separator()
+
+    with dpg.collapsing_header(label="Tracking", default_open=True):
+        dpg.add_checkbox(
+            label="Stop on collision",
+            default_value=app_state.tracker_collision_stop,
+            callback=toggle_tracker_collision_callback,
+            user_data=user_data
+        )
+        with dpg.tooltip(dpg.last_item()):
+            dpg.add_text("If enabled, the tracker will stop automatically if it\n"
+                         "encounters existing annotations that are significantly\n"
+                         "different from its current prediction.")
+
+        dpg.add_button(
+            label="Live tracking",
             callback=toggle_realtime_tracking_callback,
             user_data=user_data,
             tag="keypoint_tracking_button"
@@ -287,17 +313,6 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'V
                 user_data=user_data,
                 width=125
             )
-
-        dpg.add_button(
-            label="Set as Human annotated (H)",
-            callback=set_human_annotated_callback,
-            user_data=user_data
-        )
-        dpg.add_button(
-            label="Delete future annots (D)",
-            callback=clear_future_annotations_callback,
-            user_data=user_data
-        )
 
     dpg.add_separator()
 

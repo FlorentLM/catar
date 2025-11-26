@@ -46,11 +46,11 @@ def on_key_press(sender, app_data, user_data):
             prev_frame_callback(sender, app_data, user_data)
         case dpg.mvKey_Up:
             with app_state.lock:
-                new_idx = (app_state.selected_point_idx - 1) % app_state.n_points
+                new_idx = (app_state.selected_point_idx - 1) % app_state.num_points
                 app_state.selected_point_idx = new_idx
         case dpg.mvKey_Down:
             with app_state.lock:
-                new_idx = (app_state.selected_point_idx + 1) % app_state.n_points
+                new_idx = (app_state.selected_point_idx + 1) % app_state.num_points
                 app_state.selected_point_idx = new_idx
         case dpg.mvKey_S:
             save_state_callback(sender, app_data, user_data)

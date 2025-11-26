@@ -16,6 +16,16 @@ def toggle_realtime_tracking_callback(sender, app_data, user_data):
         dpg.bind_item_theme("keypoint_tracking_button", 0)
 
 
+def toggle_tracker_collision_callback(sender, app_data, user_data):
+    """Toggle the tracking stop-on-collision behaviour."""
+
+    app_state = user_data["app_state"]
+    with app_state.lock:
+        app_state.tracker_collision_stop = dpg.get_value(sender)
+        status = "Enabled" if app_state.tracker_collision_stop else "Disabled"
+        print(f"Tracker stops on collision: {status}")
+
+
 def batch_tracking_fwd_callback(sender, app_data, user_data):
     """Start forward batch tracking from current frame."""
 

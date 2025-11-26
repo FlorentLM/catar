@@ -153,7 +153,7 @@ class TrackingWorker(threading.Thread):
 
         if can_track:
             print(f"[Frame {frame_idx}] TrackingWorker: Live tracking from {self.prev_frame_idx}")
-            process_frame(
+            success = process_frame(
                 frame_idx=frame_idx,
                 source_frame_idx=self.prev_frame_idx,
                 app_state=self.app_state,
@@ -217,7 +217,7 @@ class TrackingWorker(threading.Thread):
                 break
 
             # Run the core tracking logic: source -> dest
-            process_frame(
+            should_continue = process_frame(
                 frame_idx=dest_frame_idx,
                 source_frame_idx=current_source_idx,
                 app_state=self.app_state,
@@ -227,6 +227,14 @@ class TrackingWorker(threading.Thread):
                 dest_frames=dest_frames,
                 batch_step=i + 1
             )
+
+            # Check if collision detection triggered a stop
+            if not should_continue:
+                self.progress_out_queue.put({
+                    "status": "complete",
+                    "final_frame": dest_frame_idx - direction  # set playback to frame before collision
+                })
+                break
 
             # Destination becomes source for next iteration
             source_frames = dest_frames
