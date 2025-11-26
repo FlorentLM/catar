@@ -4,6 +4,7 @@ All application state and communication queues are managed here.
 import queue
 import threading
 import multiprocessing
+import tomllib
 import numpy as np
 import pickle
 import json
@@ -129,6 +130,10 @@ class AppState:
         self.calibration: 'CalibrationState' = calib_state
         self.cache_reader: Optional['DiskCacheReader'] = None
 
+        # Default scene bounds and centre
+        self.volume_bounds = {'x': (-1e9, 1e9), 'y': (-1e9, 1e9), 'z': (-1e9, 1e9)}
+        self.scene_centre = np.zeros(3)
+
         # Keypoints order and lookup accessors (read-only after init)
         self.point_names = tuple(skeleton_config['point_names'])
         self.point_nti = {name: i for i, name in enumerate(self.point_names)}
@@ -179,9 +184,6 @@ class AppState:
 
         # Frame cache for UI zoom (raw frames from current playback position)
         self.current_video_frames: Optional[List[np.ndarray]] = None
-
-        # Scene centre for 3D visualization
-        self.scene_centre = np.zeros(3)
 
     def get_video_metadata(self, camera_name: str) -> Dict[str, Any]:
         """Get metadata for a specific camera's video."""
@@ -263,6 +265,7 @@ class AppState:
             'reconstructed_3d.npy': ('numpy', 'reconstructed_3d'),
             'best_individual.pkl': ('pickle', 'best_individual'),
             'calibration_frames.json': ('json', 'calibration_frames'),
+            'volume.toml': ('toml', 'volume_bounds'),
         }
 
         loaded_data = {}
@@ -279,13 +282,26 @@ class AppState:
                 elif file_type == 'json':
                     with file_path.open('r') as f:
                         loaded_data[attr_name] = json.load(f)
+                elif file_type == 'toml':
+                    with file_path.open('rb') as f:
+                        loaded_data[attr_name] = tomllib.load(f)
                 print(f"  - Loaded '{filename}'")
             except Exception as e:
                 print(f"  - WARNING: Could not load '{filename}': {e}")
 
         if not loaded_data:
-            print("No saved state found. Starting fresh.")
+            print("No annotation/calibration state found. Starting fresh.")
             return
+
+        if 'volume_bounds' in loaded_data:
+            # Expands bounds outwards to the next 0.5 just to be safe (e.g. 2.12 -> 2.50, -1.41 -> -1.50)
+            self.volume_bounds = {
+                axis: tuple(np.ceil(np.abs(data) * 2) / 2 * np.sign(data))
+                for axis, data in loaded_data['volume_bounds'].items()
+            }
+            self.scene_centre = np.vstack(list(self.volume_bounds.values())).mean(axis=1)
+
+            # TODO: should use mokap's rays_intersection_3d as a fallback to create the AABB
 
         with self.lock:
             # Load into DataManager's arrays

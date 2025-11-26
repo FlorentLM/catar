@@ -265,7 +265,7 @@ def main():
     )
 
     # Create state objects
-    print("Initializing application state...")
+    print("Initialising application state...")
     calib_state = CalibrationState(mokap_calibration, camera_names)
     app_state = AppState(data_folder, camera_names, video_paths, calib_state, config.SKELETON_CONFIG)
 
@@ -305,7 +305,6 @@ def main():
         bootstrap_data=None,
         config=mokap_config.anatomy
     )
-
     try:
         bone_stats = bootstrapper.get_initial_stats()
         print(f"Loaded bone stats. Reference bone: {bone_stats['reference_bone']}")
@@ -313,13 +312,13 @@ def main():
         print(f"\n[ERROR] Could not get bone statistics: {e}")
         sys.exit(1)
 
-    # Define 3D volume
-    volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}   # TODO: Load this from disk
-    scene_centre = np.vstack([b for b in volume_bounds.values()]).mean(axis=1)
+    # Load saved data
+    app_state.load_from_disk(config.DATA_FOLDER)
 
+    # Define 3D volume
     reconstructor = Reconstructor(
         camera_parameters=calib_state.best_calibration,
-        volume_bounds=volume_bounds,
+        volume_bounds=app_state.volume_bounds,
         config=mokap_config.reconstruction
     )
 
@@ -333,10 +332,6 @@ def main():
         assembler=assembler,
         config=mokap_config.tracker
     )
-
-    # Load saved data
-    app_state.load_from_disk(config.DATA_FOLDER)
-    app_state.scene_centre = scene_centre
 
     print("Initialising workers...")
 
