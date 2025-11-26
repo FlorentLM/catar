@@ -299,8 +299,6 @@ def track_points(
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
         calibration = app_state.calibration
-        cam_names = app_state.camera_names
-        point_names = app_state.point_names
         decay_rate = app_state.tracker_decay_rate
 
     annotations_source_full = app_state.data.get_frame_annotations(source_frame_idx, copy=True)

@@ -123,7 +123,6 @@ def image_mousedrag_callback(sender, app_data, user_data):
 
         f_mats = app_state.calibration.F_mats
         camera_colors = app_state.camera_colors
-        cam_names = app_state.camera_names
 
     all_annotations = app_state.data.get_frame_annotations(frame_idx)
     point_3d_selected = app_state.data.get_point3d(frame_idx, p_idx)

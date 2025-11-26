@@ -394,7 +394,7 @@ def update_histogram(app_state: 'AppState'):
     with app_state.lock:
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
-        point_name = app_state.point_names[selected_idx]
+        point_name = app_state.point_itn[selected_idx]
         num_cams = app_state.video_metadata['num_videos']
 
     if focus_mode:
@@ -435,7 +435,7 @@ def update_control_panel(app_state: 'AppState'):
             "play_pause_button",
             label="Play" if app_state.paused else "Pause"
         )
-        dpg.set_value("point_combo", app_state.point_names[app_state.selected_point_idx])
+        dpg.set_value("point_combo", app_state.point_itn[app_state.selected_point_idx])
 
         focus_status = "Enabled" if app_state.focus_selected_point else "Disabled"
         dpg.set_value("focus_text", f"Focus Mode: {focus_status}")
