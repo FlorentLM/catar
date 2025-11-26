@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import cv2
 import numpy as np
 import config
@@ -7,8 +7,20 @@ from utils import triangulate_and_score
 
 if TYPE_CHECKING:
     from state import AppState
+    from state.calibration_state import CalibrationState
     from mokap.reconstruction.reconstruction import Reconstructor
     from mokap.reconstruction.tracking import MultiObjectTracker
+
+
+class OverlapStats(NamedTuple):
+    """Result of comparing two sets of tracking points."""
+    total_overlap: int
+    n_conflicts: int
+    n_safe: int
+    mean_dist: float
+    max_dist: float
+    conflict_ratio: float
+    safe_ratio: float
 
 
 def compute_patch_ncc(
@@ -40,62 +52,107 @@ def compute_patch_ncc(
             return 0.0
 
         res = cv2.matchTemplate(patch_curr.astype(np.float32), patch_prev.astype(np.float32), cv2.TM_CCOEFF_NORMED)
-        return res[0][0]
+        return float(res[0][0])
 
     except Exception:
         return -1.0
 
 
+def compute_comparison_stats(
+        points_a: np.ndarray,
+        points_b: np.ndarray,
+        conflict_threshold: float,
+        safe_threshold: float
+) -> Optional[OverlapStats]:
+    """
+    Computes distance statistics between two sets of points (C, P, 2/3)
+    """
+
+    valid_a = ~np.isnan(points_a[..., 0])
+    valid_b = ~np.isnan(points_b[..., 0])
+    overlap_mask = valid_a & valid_b
+
+    total_overlap = np.sum(overlap_mask)
+    if total_overlap == 0:
+        return None
+
+    diffs = points_a[..., :2] - points_b[..., :2]
+    dists = np.linalg.norm(diffs[overlap_mask], axis=1)
+
+    n_conflicts = np.sum(dists > conflict_threshold)
+    n_safe = np.sum(dists < safe_threshold)
+
+    return OverlapStats(
+        total_overlap=total_overlap,
+        n_conflicts=n_conflicts,
+        n_safe=n_safe,
+        mean_dist=np.mean(dists),
+        max_dist=np.max(dists),
+        conflict_ratio=n_conflicts / total_overlap,
+        safe_ratio=n_safe / total_overlap
+    )
+
+
 def detect_track_collision(
         existing_annots: np.ndarray,
         new_predictions: np.ndarray,
+        calibration: 'CalibrationState',
         distance_threshold: float = 30.0,
-        ratio_threshold: float = 0.25
+        ratio_threshold: float = 0.25,
+        safe_zone_radius: float = 5.0  # points closer than this are definitely fine
 ) -> bool:
     """
-    Checks if the new predictions diverge significantly from existing annotations.
-
-    Args:
-        existing_annots: Array (C, P, 3) of existing data.
-        new_predictions: Array (C, P, 3) of new LK tracker data.
-        distance_threshold: Pixel distance to consider a single point in conflict.
-        ratio_threshold: Percentage (0.0-1.0) of total visible points that must
-                         be in conflict to trigger a stop.
+    Checks if new predictions conflict with existing annotations.
     """
 
-    valid_existing = ~np.isnan(existing_annots[..., 0])
-    valid_new = ~np.isnan(new_predictions[..., 0])
+    # Direct 2D Comparison
+    comparison_2d = compute_comparison_stats(
+        existing_annots,
+        new_predictions,
+        conflict_threshold=distance_threshold,
+        safe_threshold=safe_zone_radius
+    )
 
-    # Union (total scope of data available in this frame)
-    union_mask = valid_existing | valid_new
-    total_points_count = np.sum(union_mask)
+    # Short-circuit: we have overlap and > 90% of points are within the safe zone
+    if comparison_2d is not None:
+        if comparison_2d.safe_ratio > 0.90:
+            # The tracks are nearly identical: we assume 3D consistency without calculating it
+            return False
 
-    if total_points_count == 0:
-        return False
+    # Triangulate existing data
+    existing_3d_points = triangulate_and_score(existing_annots, calibration)
+    valid_3d_mask = ~np.isnan(existing_3d_points[:, 0])
 
-    # Intersection (waht can actually be compared)
-    overlap_mask = valid_existing & valid_new
+    if np.any(valid_3d_mask):
+        # We have a valid 3D consensus: reproject this consensus into all cameras to check against the new track
+        reprojected_expectations = calibration.reproject_to_all(existing_3d_points[:, :3])
 
-    # if no overlap, no conflict
-    if not np.any(overlap_mask):
-        return False
+        stats = compute_comparison_stats(
+            reprojected_expectations,
+            new_predictions,
+            conflict_threshold=distance_threshold,
+            safe_threshold=safe_zone_radius
+        )
+        check_type = "3D"
 
-    # Calculate vector diffs
-    diffs = existing_annots[..., :2] - new_predictions[..., :2]
-    dists_overlap = np.linalg.norm(diffs[overlap_mask], axis=1)
+    else:
+        # Fallback: triangulation failed (e.g. single view) so we rely on the raw 2D stats
+        stats = comparison_2d
+        check_type = "2D"
 
-    # How much of the total skeleton is currently contradicting?
-    n_conflicts = np.sum(dists_overlap > distance_threshold)
-    conflict_ratio = n_conflicts / total_points_count
+    # Decision
+    if stats is None:
+        return False  # no overlap to compare against
 
-    if conflict_ratio > ratio_threshold:
-        print(f"!!! COLLISION DETECTED !!!")
-        print(f"    {n_conflicts} points conflict out of {total_points_count} visible points.")
-        print(f"    Ratio: {conflict_ratio:.2f} (Threshold: {ratio_threshold})")
-        print(f"    Stopping batch track.")
+    if stats.conflict_ratio > ratio_threshold:
+        print(f"[ {check_type} COLLISION ]")
+        print(f"    {stats.n_conflicts}/{stats.total_overlap} points ({stats.conflict_ratio:.1%}) conflict. "
+              f"Mean dist: {stats.mean_dist:.1f}px")
         return True
-
-    return False
+    else:
+        print(f"COLLISION CHECK ({check_type}): Compatible. "
+              f"{stats.safe_ratio:.1%} in safe zone. Max err: {stats.max_dist:.1f}px")
+        return False
 
 
 def process_frame(
@@ -131,7 +188,7 @@ def process_frame(
     )
 
     if collision_stop:
-        if detect_track_collision(existing_annots, predictions_LK, distance_threshold=30.0, ratio_threshold=0.25):  # TODO: config for these
+        if detect_track_collision(existing_annots, predictions_LK, calibration, distance_threshold=20.0):  # TODO: config for this
             return False  # signal to stop
 
     # Prepare input for Mokap Reconstructor
