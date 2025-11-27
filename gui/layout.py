@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     from gui.rendering import Viewer3D
 
 
-def create_ui(app_state: 'AppState', queues: 'Queues', viewer_3d: 'Viewer3D'):
+def create_ui(app_state: 'AppState', queues: 'Queues'):
     """Create the main DearPyGUI window."""
 
     dpg.create_context()
@@ -99,7 +99,7 @@ def create_ui(app_state: 'AppState', queues: 'Queues', viewer_3d: 'Viewer3D'):
 
             with dpg.group(horizontal=True):
                 with dpg.child_window(width=config.CONTROL_PANEL_WIDTH, tag="control_panel_window"):
-                    create_control_panel(app_state, queues, viewer_3d)
+                    create_control_panel(app_state, queues)
 
                 with dpg.child_window(width=-1, tag="video_grid_window"):
                     create_video_grid(app_state, n_cols, n_rows)
@@ -249,7 +249,7 @@ def create_menu_bar(app_state: 'AppState', queues: 'Queues'):
             )
 
 
-def create_control_panel(app_state: 'AppState', queues: 'Queues', open3d_viz: 'Viewer3D'):
+def create_control_panel(app_state: 'AppState', queues: 'Queues'):
     """Create left control panel."""
 
     user_data = {"app_state": app_state, "queues": queues}

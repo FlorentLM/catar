@@ -1,6 +1,6 @@
 import queue
 import threading
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import cv2
 import numpy as np
@@ -20,15 +20,15 @@ class RenderingWorker(threading.Thread):
     def __init__(
         self,
         app_state: 'AppState',
-        open3d_viz: 'Viewer3D',
         reconstructor: 'Reconstructor',
         tracker: 'MultiObjectTracker',
         frames_in_queue: queue.Queue,
         results_out_queue: queue.Queue,
+        viewer_3d: Optional['Viewer3D'],
     ):
         super().__init__(daemon=True, name="RenderingWorker")
         self.app_state = app_state
-        self.open3d_viz = open3d_viz
+        self.viewer_3d = viewer_3d
         self.reconstructor = reconstructor
         self.tracker = tracker
         self.frames_in_queue = frames_in_queue
@@ -63,8 +63,9 @@ class RenderingWorker(threading.Thread):
             # Cache the raw video frames for the loupe tool
             self.app_state.current_video_frames = data["raw_frames"]
 
-        scene = self._build_3d_scene()
-        self.open3d_viz.queue_update(scene)
+        if not config.DISABLE_3D_VIEW and self.viewer_3d is not None:
+            scene = self._build_3d_scene()
+            self.viewer_3d.queue_update(scene)
 
         # Resize all frames to display size
         video_frames = [

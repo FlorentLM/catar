@@ -8,6 +8,7 @@ import numpy as np
 
 # Debug prints
 VERBOSE = True
+DISABLE_3D_VIEW = True
 
 # Display settings
 DISPLAY_WIDTH = 640

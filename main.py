@@ -3,6 +3,8 @@ Main entry point for CATAR.
 """
 import queue
 import sys
+from typing import Optional
+
 import cv2
 import multiprocessing
 import numpy as np
@@ -196,7 +198,7 @@ def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
         print(f"BA ERROR: {ba_result['message']}")
 
 
-def main_loop(app_state: 'AppState', queues: 'Queues', viewer_3d: 'Viewer3D'):
+def main_loop(app_state: 'AppState', queues: 'Queues', viewer_3d: Optional['Viewer3D']):
     """Main GUI update loop."""
 
     initial_resize_counter = 3  # TODO: why 3 lol
@@ -207,7 +209,8 @@ def main_loop(app_state: 'AppState', queues: 'Queues', viewer_3d: 'Viewer3D'):
             initial_resize_counter -= 1
 
         # 3D visualisation updates
-        viewer_3d.process_updates()
+        if viewer_3d is not None:
+            viewer_3d.process_updates()
 
         # Process rendered frames
         try:
@@ -336,7 +339,7 @@ def main():
     print("Initialising workers...")
 
     queues = Queues()
-    open3d_viz = Viewer3D()
+    open3d_viz = Viewer3D() if not config.DISABLE_3D_VIEW else None
 
     workers = [
 
@@ -360,11 +363,11 @@ def main():
 
         RenderingWorker(
             app_state,
-            open3d_viz,
             reconstructor,
             tracker,
             queues.frames_for_rendering,
-            queues.results
+            queues.results,
+            open3d_viz
         ),
 
         GAWorker(
@@ -384,7 +387,7 @@ def main():
         worker.start()
 
     # Create UI
-    create_ui(app_state, queues, open3d_viz)
+    create_ui(app_state, queues)
 
     # Run main loop
     try:
