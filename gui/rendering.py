@@ -3,7 +3,6 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Tuple, Optional, Dict
 import numpy as np
-import open3d as o3d
 from dearpygui import dearpygui as dpg
 
 from utils import line_box_intersection, get_confidence_color
@@ -55,6 +54,8 @@ class Viewer3D:
             return
 
         try:
+            import open3d as o3d
+
             self.vis = o3d.visualization.Visualizer()
             self.vis.create_window(
                 window_name=self.window_name,
