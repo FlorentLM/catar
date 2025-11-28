@@ -145,7 +145,6 @@ class AppState:
         self.all_points_set = set(self.point_names)
         self.skeleton_points_set = {'s_small', 's_large'}
         # Points that are tracked but NOT part of the skeleton graph (objects, props, etc)
-        # TODO: Move this to config, and add a GUI way to edit them
         self.non_skeleton_points_set = {'s_small', 's_large'}
 
         self.point_colors = skeleton_config['point_colors']
@@ -255,24 +254,33 @@ class AppState:
 
     def load_from_disk(self, folder: Path):
         """
-        Load persistent state from disk.
+        Load persistent state from disk, supporting both legacy and new formats.
         """
         print(f"Loading state from: '{folder}'")
 
-        files_to_load = {
-            'annotations.npy': ('numpy', 'annotations'),
-            'human_annotated.npy': ('numpy', 'human_annotated'),
-            'reconstructed_3d.npy': ('numpy', 'reconstructed_3d'),
-            'best_individual.pkl': ('pickle', 'best_individual'),
-            'calibration_frames.json': ('json', 'calibration_frames'),
-            'volume.toml': ('toml', 'volume_bounds'),
-        }
+        files_to_load = [
+            # (filename, file_type, attr_name)
+            ('annotations.npy', 'numpy', 'annotations'),
+            ('human_annotated.npy', 'numpy', 'human_annotated'),
+            ('reconstructed_3d.npy', 'numpy', 'reconstructed_3d'),
+            # Fallback to legacy 3D filename
+            ('reconstructed_3d_points.npy', 'numpy', 'reconstructed_3d'),
+            ('best_individual.pkl', 'pickle', 'best_individual'),
+            ('calibration_frames.json', 'json', 'calibration_frames'),
+            ('volume.toml', 'toml', 'volume_bounds'),
+        ]
 
         loaded_data = {}
-        for filename, (file_type, attr_name) in files_to_load.items():
+
+        for filename, file_type, attr_name in files_to_load:
             file_path = folder / filename
             if not file_path.exists():
                 continue
+
+            # If we already loaded this attribute (e.g. found new 3d file), skip legacy one
+            if attr_name in loaded_data:
+                continue
+
             try:
                 if file_type == 'numpy':
                     loaded_data[attr_name] = np.load(file_path)
@@ -309,45 +317,64 @@ class AppState:
 
                 # Load human annotation flags
                 if 'human_annotated' in loaded_data:
-                    self.data.human_annotated = loaded_data['human_annotated']
+                    data = loaded_data['human_annotated']
+                    if data.shape != self.data.human_annotated.shape:
+                        print(f"  - WARNING: Shape mismatch for 'human_annotated'. "
+                              f"Disk: {data.shape}, Config: {self.data.human_annotated.shape}. Skipping.")
+                    else:
+                        self.data.human_annotated = data
 
                 # Load 3D reconstruction data
                 if 'reconstructed_3d' in loaded_data:
                     loaded_pts = loaded_data['reconstructed_3d']
 
-                    # Handle legacy 3-channel data (old format was (N, 3))
-                    if loaded_pts.shape[-1] == 3:
-                        print("  - Converting legacy 3D points (N, 3) to (N, 4)...")
-                        F, P, _ = loaded_pts.shape
-                        new_pts = np.full((F, P, 4), np.nan, dtype=np.float32)
-                        new_pts[..., :3] = loaded_pts
-                        new_pts[..., 3] = np.nan  # No scores in legacy format
-                        self.data.reconstructed_3d = new_pts
+                    # Check frame/point count
+                    F_disk, P_disk = loaded_pts.shape[0], loaded_pts.shape[1]
+                    if F_disk != self.num_frames or P_disk != self.num_points:
+                        print(f"  - WARNING: Shape mismatch for 3D points. "
+                              f"Disk: {loaded_pts.shape}, Config: ({self.num_frames}, {self.num_points}, ...). Skipping.")
                     else:
-                        self.data.reconstructed_3d = loaded_pts
+                        # Handle legacy 3-channel data (old format was (N, 3))
+                        if loaded_pts.shape[-1] == 3:
+                            print("  - Converting legacy 3D points (N, 3) to (N, 4)...")
+                            new_pts = np.full((F_disk, P_disk, 4), np.nan, dtype=np.float32)
+                            new_pts[..., :3] = loaded_pts
+                            new_pts[..., 3] = np.nan  # No scores in legacy format
+                            self.data.reconstructed_3d = new_pts
+                        else:
+                            self.data.reconstructed_3d = loaded_pts
 
                 # Load annotation data
                 if 'annotations' in loaded_data:
                     annots = loaded_data['annotations']
 
-                    # Handle legacy 2-channel data (old format was (x, y) only)
-                    if annots.ndim == 4 and annots.shape[-1] == 2:
-                        print("  - Converting legacy 2D annotations to 3D (x, y, confidence)...")
-                        F, C, P, _ = annots.shape
-                        new_annots = np.full((F, C, P, 3), np.nan, dtype=np.float32)
-                        new_annots[..., :2] = annots
+                    # Check dimension consistency
+                    if annots.shape[0] != self.num_frames or \
+                       annots.shape[1] != self.num_videos or \
+                       annots.shape[2] != self.num_points:
 
-                        # Add default confidence of 1.0 where points exist
-                        is_valid = ~np.isnan(annots[..., 0])
-                        new_annots[is_valid, 2] = 1.0
+                        print(f"  - WARNING: Shape mismatch for annotations. "
+                              f"Disk: {annots.shape}, Config: ({self.num_frames}, {self.num_videos}, {self.num_points}). Skipping.")
 
-                        self.data.annotations = new_annots
-
-                    # Modern format with confidence
-                    elif annots.ndim == 4 and annots.shape[-1] == 3:
-                        self.data.annotations = annots
                     else:
-                        print(f"  - WARNING: Loaded annotations have unsupported shape {annots.shape}. Skipping.")
+                        # Handle legacy 2-channel data (old format was (x, y) only)
+                        if annots.ndim == 4 and annots.shape[-1] == 2:
+                            print("  - Converting legacy 2D annotations to 3D (x, y, confidence)...")
+                            F, C, P, _ = annots.shape
+                            new_annots = np.full((F, C, P, 3), np.nan, dtype=np.float32)
+                            new_annots[..., :2] = annots
+
+                            # Add default confidence of 1.0 where points exist
+                            is_valid = ~np.isnan(annots[..., 0])
+                            new_annots[is_valid, 2] = 1.0
+
+                            self.data.annotations = new_annots
+
+                        # Modern format with confidence
+                        elif annots.ndim == 4 and annots.shape[-1] == 3:
+                            self.data.annotations = annots
+                        else:
+                            print(f"  - WARNING: Loaded annotations have unsupported shape {annots.shape}. Skipping.")
 
             # Load calibration data
             if 'calibration_frames' in loaded_data:
