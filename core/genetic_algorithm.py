@@ -217,7 +217,7 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
             child_cam = {}
 
             # rvec averaging (quaternion)
-            q_batch = transforms.axisangle_to_quaternion_batched(jnp.stack([p1_cam['rvec'], p2_cam['rvec']]))
+            q_batch = transforms.axisangle_to_quaternion(jnp.stack([p1_cam['rvec'], p2_cam['rvec']]))
             q_avg = quaternion_average(q_batch)
 
             rvec_avg = transforms.quaternion_to_axisangle(q_avg)

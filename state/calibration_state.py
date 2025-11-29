@@ -1,6 +1,7 @@
 """
 This module centralizes all calibration data and provides methods for projection/reprojection.
 """
+import itertools
 import numpy as np
 import jax.numpy as jnp
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -158,24 +159,26 @@ class CalibrationState:
         if self.n_cameras < 2:
             return {}
 
-        import itertools
-
         # Create camera pair indices
         cam_indices = list(range(self.n_cameras))
         pairs = [p for p in itertools.product(cam_indices, repeat=2) if p[0] != p[1]]
 
-        # Prepare batch data
-        K_pairs = jnp.asarray([(self.K_mats[i], self.K_mats[j]) for i, j in pairs])
-        rvecs_w2c_pairs = jnp.asarray([
-            (self.rvecs_w2c[i], self.rvecs_w2c[j]) for i, j in pairs
-        ])
-        tvecs_w2c_pairs = jnp.asarray([
-            (self.tvecs_w2c[i], self.tvecs_w2c[j]) for i, j in pairs
-        ])
+        idx_i = [p[0] for p in pairs]
+        idx_j = [p[1] for p in pairs]
 
-        # Compute all F matrices at once
-        F_matrices_batched = transforms.batched_fundamental_matrices(
-            K_pairs, rvecs_w2c_pairs, tvecs_w2c_pairs
+        K_i = jnp.asarray(self.K_mats[idx_i])
+        K_j = jnp.asarray(self.K_mats[idx_j])
+
+        r_i = jnp.asarray(self.rvecs_w2c[idx_i])
+        r_j = jnp.asarray(self.rvecs_w2c[idx_j])
+
+        t_i = jnp.asarray(self.tvecs_w2c[idx_i])
+        t_j = jnp.asarray(self.tvecs_w2c[idx_j])
+
+        F_matrices_batched = transforms.fundamental_matrix(
+            (K_i, K_j),
+            (r_i, r_j),
+            (t_i, t_j)
         )
 
         # Build result dictionary
@@ -422,7 +425,7 @@ class CalibrationState:
             Array of shape (C, N, 2) with undistorted 2D coordinates
         """
 
-        undistorted = projective.undistort_multiple(
+        undistorted = projective.undistort_points(
             jnp.asarray(points2d),
             jnp.asarray(self.K_mats),
             jnp.asarray(self.dist_coeffs)
