@@ -207,7 +207,7 @@ class CalibrationState:
     @property
     def rvecs_w2c(self) -> np.ndarray:
         if 'rvecs_w2c' not in self._cache:
-            r_inv, _ = transforms.invert_rtvecs(
+            r_inv, _ = transforms.invert_vectors(
                 jnp.asarray(self.rvecs_c2w),
                 jnp.asarray(self.tvecs_c2w)
             )
@@ -217,7 +217,7 @@ class CalibrationState:
     @property
     def tvecs_w2c(self) -> np.ndarray:
         if 'tvecs_w2c' not in self._cache:
-            _, t_inv = transforms.invert_rtvecs(
+            _, t_inv = transforms.invert_vectors(
                 jnp.asarray(self.rvecs_c2w),
                 jnp.asarray(self.tvecs_c2w)
             )
@@ -233,7 +233,7 @@ class CalibrationState:
                 rvec_w2c = self.rvecs_w2c[i]
                 tvec_w2c = self.tvecs_w2c[i]
                 
-                E_w2c = transforms.extrinsics_matrix(
+                E_w2c = transforms.compose_transform_matrix(
                     jnp.asarray(rvec_w2c),
                     jnp.asarray(tvec_w2c)
                 )
@@ -275,13 +275,12 @@ class CalibrationState:
         
         cam_idx = self.camera_nti[camera_name]
         
-        # Project using world-to-camera parameters
-        reprojected, _ = projective.project_points(
-            object_points=jnp.asarray(points3d),
+        reprojected, _ = projective.project(
+            points3d=jnp.asarray(points3d),
             rvec=jnp.asarray(self.rvecs_w2c[cam_idx]),
             tvec=jnp.asarray(self.tvecs_w2c[cam_idx]),
-            camera_matrix=jnp.asarray(self.K_mats[cam_idx]),
-            dist_coeffs=jnp.asarray(self.dist_coeffs[cam_idx])
+            K=jnp.asarray(self.K_mats[cam_idx]),
+            D=jnp.asarray(self.dist_coeffs[cam_idx])
         )
         
         return np.asarray(reprojected).reshape(-1, 2)
@@ -308,11 +307,11 @@ class CalibrationState:
         
         # Project to all cameras at once
         reprojected, _ = projective.project_to_multiple_cameras(
-            object_points=jnp.asarray(points3d),
+            points3d=jnp.asarray(points3d),
             rvec=jnp.asarray(self.rvecs_w2c),
             tvec=jnp.asarray(self.tvecs_w2c),
-            camera_matrix=jnp.asarray(self.K_mats),
-            dist_coeffs=jnp.asarray(self.dist_coeffs)
+            K=jnp.asarray(self.K_mats),
+            D=jnp.asarray(self.dist_coeffs)
         )
         
         return np.asarray(reprojected)  # Shape: (C, N, 2)
@@ -369,9 +368,9 @@ class CalibrationState:
         if weights is None:
             weights = np.ones(points2d.shape[:2], dtype=np.float32)
         
-        points3d = projective.triangulate_points_from_projections(
+        points3d = projective.triangulate_from_projections(
             points2d=jnp.asarray(points2d),
-            P_mats=jnp.asarray(self.P_mats),
+            P=jnp.asarray(self.P_mats),
             weights=jnp.asarray(weights)
         )
         
@@ -403,9 +402,9 @@ class CalibrationState:
         # Get projection matrices for the subset of cameras
         proj_matrices = self.P_mats[camera_indices]
 
-        points3d = projective.triangulate_points_from_projections(
+        points3d = projective.triangulate_from_projections(
             points2d=jnp.asarray(points2d),
-            P_mats=jnp.asarray(proj_matrices),
+            P=jnp.asarray(proj_matrices),
             weights=jnp.asarray(weights)
         )
 
