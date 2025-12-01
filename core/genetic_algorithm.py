@@ -2,13 +2,11 @@ import random
 from typing import Dict, List, Any
 
 import numpy as np
-from jax import numpy as jnp
 
 import config
 from state.calibration_state import CalibrationState
 
-from mokap.utils.geometry import transforms
-from mokap.utils.geometry.fitting import quaternion_average
+from mokap.geometry import quaternion_average, rotation_vector, vector_from_quaternion, quaternion_from_vector
 
 def create_individual(video_metadata: Dict, cam_names: List[str], scene_centre: np.ndarray) -> Dict[str, Dict]:
     """Create a random camera calibration individual."""
@@ -35,7 +33,7 @@ def create_individual(video_metadata: Dict, cam_names: List[str], scene_centre: 
         R_w2c = np.array([-right, cam_up, -forward])
         R_c2w = R_w2c.T
         tvec_c2w = cam_pos_world
-        rvec_c2w = transforms.inverse_rodrigues(R_c2w)
+        rvec_c2w = rotation_vector(R_c2w)
 
         # Randomize K components
         # TODO: These factors are a bit large...
@@ -217,10 +215,10 @@ def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
             child_cam = {}
 
             # rvec averaging (quaternion)
-            q_batch = transforms.axisangle_to_quaternion(jnp.stack([p1_cam['rvec'], p2_cam['rvec']]))
+            q_batch = quaternion_from_vector(np.stack([p1_cam['rvec'], p2_cam['rvec']]))
             q_avg = quaternion_average(q_batch)
 
-            rvec_avg = transforms.quaternion_to_axisangle(q_avg)
+            rvec_avg = vector_from_quaternion(q_avg)
             child_cam['rvec'] = np.asarray(rvec_avg)
 
             # Linear Averaging for other parameters

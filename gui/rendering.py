@@ -7,7 +7,7 @@ from dearpygui import dearpygui as dpg
 
 from utils import line_box_intersection, get_confidence_color
 
-from mokap.utils.geometry import transforms
+from mokap.geometry import rotation_matrix
 
 if TYPE_CHECKING:
     from state import AppState
@@ -716,7 +716,7 @@ def create_camera_visual(
     cam_params = calibration.get_camera_params_c2w(camera_name)
     rvec, tvec = cam_params['rvec'], cam_params['tvec']
 
-    R_c2w = transforms.rodrigues(rvec)
+    R_c2w = rotation_matrix(rvec)
     camera_center_world = tvec.flatten()
 
     distance_to_center = np.linalg.norm(camera_center_world - scene_centre)

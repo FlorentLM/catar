@@ -3,10 +3,11 @@ This module centralizes all calibration data and provides methods for projection
 """
 import itertools
 import numpy as np
-import jax.numpy as jnp
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from mokap.utils.geometry import transforms, projective
+from mokap.geometry import (invert_vectors, projection_matrix, compose_transform_matrix, project,
+                            project_to_cameras_multi, undistort, triangulate_from_projections,
+                            fundamental_matrix)
 
 if TYPE_CHECKING:
     from utils import CameraParameters, CalibrationDict
@@ -166,25 +167,16 @@ class CalibrationState:
         idx_i = [p[0] for p in pairs]
         idx_j = [p[1] for p in pairs]
 
-        K_i = jnp.asarray(self.K_mats[idx_i])
-        K_j = jnp.asarray(self.K_mats[idx_j])
-
-        r_i = jnp.asarray(self.rvecs_w2c[idx_i])
-        r_j = jnp.asarray(self.rvecs_w2c[idx_j])
-
-        t_i = jnp.asarray(self.tvecs_w2c[idx_i])
-        t_j = jnp.asarray(self.tvecs_w2c[idx_j])
-
-        F_matrices_batched = transforms.fundamental_matrix(
-            (K_i, K_j),
-            (r_i, r_j),
-            (t_i, t_j)
+        F_matrices = fundamental_matrix(
+            (self.K_mats[idx_i], self.K_mats[idx_j]),
+            (self.rvecs_w2c[idx_i], self.rvecs_w2c[idx_j]),
+            (self.tvecs_w2c[idx_i], self.tvecs_w2c[idx_j])
         )
 
         # Build result dictionary
         f_mats = {}
         for idx, (i, j) in enumerate(pairs):
-            f_mats[(i, j)] = np.asarray(F_matrices_batched[idx])
+            f_mats[(i, j)] = np.asarray(F_matrices[idx])
 
         return f_mats
 
@@ -203,45 +195,40 @@ class CalibrationState:
     @property
     def tvecs_c2w(self) -> np.ndarray:
         return self._get_or_compute('tvec')
-    
+
+    @property
+    def T_c2w(self) -> np.ndarray:
+        if 'T_c2w' not in self._cache:
+            T_c2w = compose_transform_matrix(self.rvecs_c2w, self.tvecs_c2w)
+            self._cache['T_c2w'] = np.asarray(T_c2w)
+        return self._cache['T_c2w']
+
+    @property
+    def T_w2c(self) -> np.ndarray:
+        if 'T_w2c' not in self._cache:
+            T_w2c = compose_transform_matrix(self.rvecs_w2c, self.tvecs_w2c)
+            self._cache['T_w2c'] = np.asarray(T_w2c)
+        return self._cache['T_w2c']
+
     @property
     def rvecs_w2c(self) -> np.ndarray:
         if 'rvecs_w2c' not in self._cache:
-            r_inv, _ = transforms.invert_vectors(
-                jnp.asarray(self.rvecs_c2w),
-                jnp.asarray(self.tvecs_c2w)
-            )
+            r_inv, _ = invert_vectors(self.rvecs_c2w, self.tvecs_c2w)
             self._cache['rvecs_w2c'] = np.asarray(r_inv)
         return self._cache['rvecs_w2c']
     
     @property
     def tvecs_w2c(self) -> np.ndarray:
         if 'tvecs_w2c' not in self._cache:
-            _, t_inv = transforms.invert_vectors(
-                jnp.asarray(self.rvecs_c2w),
-                jnp.asarray(self.tvecs_c2w)
-            )
+            _, t_inv = invert_vectors(self.rvecs_c2w, self.tvecs_c2w)
             self._cache['tvecs_w2c'] = np.asarray(t_inv)
         return self._cache['tvecs_w2c']
     
     @property
     def P_mats(self) -> np.ndarray:
         if 'P_mats' not in self._cache:
-            proj_matrices = []
-            for i in range(self.n_cameras):
-                K = self.K_mats[i]
-                rvec_w2c = self.rvecs_w2c[i]
-                tvec_w2c = self.tvecs_w2c[i]
-                
-                E_w2c = transforms.compose_transform_matrix(
-                    jnp.asarray(rvec_w2c),
-                    jnp.asarray(tvec_w2c)
-                )
-                P = transforms.projection_matrix(jnp.asarray(K), E_w2c)
-                proj_matrices.append(np.asarray(P))
-            
-            self._cache['P_mats'] = np.array(proj_matrices)
-        
+            P = projection_matrix(self.K_mats, self.T_w2c)
+            self._cache['P_mats'] = np.asarray(P)
         return self._cache['P_mats']
     
     @property
@@ -274,13 +261,12 @@ class CalibrationState:
             points3d = points3d[..., :3]
         
         cam_idx = self.camera_nti[camera_name]
-        
-        reprojected, _ = projective.project(
-            points3d=jnp.asarray(points3d),
-            rvec=jnp.asarray(self.rvecs_w2c[cam_idx]),
-            tvec=jnp.asarray(self.tvecs_w2c[cam_idx]),
-            K=jnp.asarray(self.K_mats[cam_idx]),
-            D=jnp.asarray(self.dist_coeffs[cam_idx])
+
+        reprojected, _ = project(
+            points3d=points3d,
+            T=self.T_w2c[cam_idx],
+            K=self.K_mats[cam_idx],
+            D=self.dist_coeffs[cam_idx]
         )
         
         return np.asarray(reprojected).reshape(-1, 2)
@@ -306,15 +292,14 @@ class CalibrationState:
             points3d = points3d[..., :3]
         
         # Project to all cameras at once
-        reprojected, _ = projective.project_to_multiple_cameras(
-            points3d=jnp.asarray(points3d),
-            rvec=jnp.asarray(self.rvecs_w2c),
-            tvec=jnp.asarray(self.tvecs_w2c),
-            K=jnp.asarray(self.K_mats),
-            D=jnp.asarray(self.dist_coeffs)
+        reprojected, _ = project_to_cameras_multi(
+            points3d=points3d,
+            T_w2c=self.T_w2c,
+            K=self.K_mats,
+            D=self.dist_coeffs
         )
         
-        return np.asarray(reprojected)  # Shape: (C, N, 2)
+        return np.asarray(reprojected).squeeze(1)  # Shape: (C, N, 2)
     
     def undistort(
         self,
@@ -339,10 +324,10 @@ class CalibrationState:
         
         valid_points = points2d[valid_mask]
         
-        undistorted = projective.undistort_points(
-            points2d=jnp.asarray(valid_points),
-            camera_matrix=jnp.asarray(self.K_mats[cam_idx]),
-            dist_coeffs=jnp.asarray(self.dist_coeffs[cam_idx])
+        undistorted = undistort(
+            points2d=valid_points,
+            camera_matrix=self.K_mats[cam_idx],
+            dist_coeffs=self.dist_coeffs[cam_idx]
         )
         
         result = np.full_like(points2d, np.nan)
@@ -368,10 +353,10 @@ class CalibrationState:
         if weights is None:
             weights = np.ones(points2d.shape[:2], dtype=np.float32)
         
-        points3d = projective.triangulate_from_projections(
-            points2d=jnp.asarray(points2d),
-            P=jnp.asarray(self.P_mats),
-            weights=jnp.asarray(weights)
+        points3d = triangulate_from_projections(
+            points2d=points2d,
+            P=self.P_mats,
+            weights=weights
         )
         
         return np.asarray(points3d)
@@ -402,10 +387,10 @@ class CalibrationState:
         # Get projection matrices for the subset of cameras
         proj_matrices = self.P_mats[camera_indices]
 
-        points3d = projective.triangulate_from_projections(
-            points2d=jnp.asarray(points2d),
-            P=jnp.asarray(proj_matrices),
-            weights=jnp.asarray(weights)
+        points3d = triangulate_from_projections(
+            points2d=points2d,
+            P=proj_matrices,
+            weights=weights
         )
 
         return np.asarray(points3d)
@@ -424,10 +409,10 @@ class CalibrationState:
             Array of shape (C, N, 2) with undistorted 2D coordinates
         """
 
-        undistorted = projective.undistort_points(
-            jnp.asarray(points2d),
-            jnp.asarray(self.K_mats),
-            jnp.asarray(self.dist_coeffs)
+        undistorted = undistort(
+            points2d,
+            self.K_mats,
+            self.dist_coeffs
         )
 
         return np.asarray(undistorted)
