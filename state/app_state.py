@@ -381,6 +381,11 @@ class AppState:
                             is_valid = ~np.isnan(annots[..., 0])
                             new_annots[is_valid, 2] = 1.0
 
+                            old_order = ['avocado', 'coconut', 'banana', 'strawberry', 'blueberry']
+                            current_ranks = [self.camera_nti[key] for key in old_order]
+                            perm_indices = np.argsort(current_ranks)
+                            new_annots = new_annots[:, perm_indices, :]
+
                             self.data.annotations = new_annots
 
                         # Modern format with confidence
