@@ -169,8 +169,7 @@ class CalibrationState:
 
         F_matrices = fundamental_matrix(
             (self.K_mats[idx_i], self.K_mats[idx_j]),
-            (self.rvecs_w2c[idx_i], self.rvecs_w2c[idx_j]),
-            (self.tvecs_w2c[idx_i], self.tvecs_w2c[idx_j])
+            (self.T_w2c[idx_i], self.T_w2c[idx_j]),
         )
 
         # Build result dictionary
