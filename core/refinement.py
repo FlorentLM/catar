@@ -4,6 +4,7 @@ from jax import numpy as jnp
 
 from state.calibration_state import CalibrationState
 
+from mokap.geometry import compose_transform_matrix, decompose_transform_matrix
 from mokap.calibration import bundle_adjustment
 
 
@@ -134,12 +135,11 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     D_init = jnp.asarray(temp_calib_state.dist_coeffs)
     r_init = jnp.asarray(temp_calib_state.rvecs_c2w)
     t_init = jnp.asarray(temp_calib_state.tvecs_c2w)
-
+    T_init = compose_transform_matrix(r_init, t_init)
     success, results = bundle_adjustment.run_bundle_adjustment(
         camera_matrices_initial=K_init,
         distortion_coeffs_initial=D_init,
-        cam_rvecs_initial=r_init,
-        cam_tvecs_initial=t_init,
+        cam_poses_initial=T_init,
         images_sizes_wh=image_sizes_wh,
 
         image_points=jnp.asarray(ba_data["image_points"]),
@@ -160,7 +160,9 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         return {"status": "error", "message": "Bundle Adjustment failed to converge."}
 
     print("[BA] Optimization successful!")
-    K_opt, D_opt, r_opt, t_opt = results['K_opt'], results['D_opt'], results['cam_r_opt'], results['cam_t_opt']
+    K_opt, D_opt, T_opt = results['K_opt'], results['D_opt'], results['cam_poses_opt']
+
+    r_opt, t_opt = decompose_transform_matrix(T_opt)
 
     # Convert refined results back to Dict[str, Dict]
     refined_calib: Dict[str, Dict] = {}
