@@ -245,8 +245,16 @@ class AppState:
                     json.dump(self.calibration.calibration_frames, f)
 
                 if self.calibration.best_calibration is not None:
-                    with open(folder / 'best_individual.pkl', 'wb') as f:
-                        pickle.dump(self.calibration.best_calibration, f)
+                    with open(folder / 'catar_calibration.toml', 'w') as f:
+                        for cam_name, cam_data in self.calibration.best_calibration.items():
+                            f.write(f"[{cam_name}]\n")
+                            for key, value in cam_data.items():
+                                if isinstance(value, np.ndarray):
+                                    val_to_write = value.tolist()
+                                else:
+                                    val_to_write = value
+                                f.write(f"{key} = {json.dumps(val_to_write)}\n")
+                            f.write("\n")
 
                 print("State saved successfully.")
             except Exception as e:
@@ -263,9 +271,14 @@ class AppState:
             ('annotations.npy', 'numpy', 'annotations'),
             ('human_annotated.npy', 'numpy', 'human_annotated'),
             ('reconstructed_3d.npy', 'numpy', 'reconstructed_3d'),
+
             # Fallback to legacy 3D filename
             ('reconstructed_3d_points.npy', 'numpy', 'reconstructed_3d'),
+
+            # Calibration: try TOML first, then legacy pickle
+            ('catar_calibration.toml', 'toml', 'best_individual'),
             ('best_individual.pkl', 'pickle', 'best_individual'),
+
             ('calibration_frames.json', 'json', 'calibration_frames'),
             ('volume.toml', 'toml', 'volume_bounds'),
         ]
@@ -425,8 +438,17 @@ class AppState:
                         new_calib_dict = None
 
                 else:
-                    # Modern format
-                    new_calib_dict = loaded_calib
+                    # Modern format (Dict) - Could be from Pickle (arrays) or TOML (lists)
+                    new_calib_dict = {}
+                    for cam_name, params in loaded_calib.items():
+                        new_params = {}
+                        for k, v in params.items():
+                            # Convert lists (from TOML) to numpy arrays
+                            if isinstance(v, list):
+                                new_params[k] = np.array(v)
+                            else:
+                                new_params[k] = v
+                        new_calib_dict[cam_name] = new_params
 
                 if new_calib_dict is not None:
                     self.calibration.update_calibration(new_calib_dict)
