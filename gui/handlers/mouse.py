@@ -3,7 +3,7 @@ import numpy as np
 from dearpygui import dearpygui as dpg
 
 import config
-from core.annotation import snap_annotation
+from core import snap_annotation
 from utils import line_box_intersection
 
 

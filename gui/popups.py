@@ -8,14 +8,14 @@ from dearpygui import dearpygui as dpg
 
 from video import DiskCacheBuilder
 
-from gui.callbacks.calibration import (
+from gui.callbacks.calibration_callbacks import (
     stop_ga_callback,
     ba_mode_change_callback,
     start_ba_callback,
     stop_ba_callback,
 
 )
-from gui.callbacks.tracking import stop_batch_tracking_callback
+from gui.callbacks.tracking_callbacks import stop_batch_tracking_callback
 
 from mokap.utils.fileio import probe_video
 

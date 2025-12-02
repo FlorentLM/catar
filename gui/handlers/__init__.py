@@ -1,6 +1,6 @@
 from gui.handlers.mouse import *
 from gui.handlers.keyboard import *
-from gui.callbacks.playback import *
+from gui.callbacks.playback_callbacks import *
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:

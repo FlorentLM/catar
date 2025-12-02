@@ -1,16 +1,16 @@
 from dearpygui import dearpygui as dpg
 
-from gui.callbacks.annotation import (
+from gui.callbacks.annotation_callbacks import (
     set_human_annotated_callback,
     clear_future_annotations_callback
 )
-from gui.callbacks.calibration import addremove_calib_frame_callback
-from gui.callbacks.general import (
+from gui.callbacks.calibration_callbacks import addremove_calib_frame_callback
+from gui.callbacks.general_callbacks import (
     save_state_callback,
     load_state_callback,
     toggle_focus_mode_callback
 )
-from gui.callbacks.playback import (
+from gui.callbacks.playback_callbacks import (
     play_pause_callback,
     next_frame_callback,
     prev_frame_callback

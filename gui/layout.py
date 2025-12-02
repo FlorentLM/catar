@@ -7,24 +7,24 @@ import config
 from gui.handlers import register_event_handlers
 from gui.rendering import resize_video_widgets
 
-from gui.callbacks.annotation import (
+from gui.callbacks.annotation_callbacks import (
     set_selected_point_callback,
     clear_future_annotations_callback,
     set_human_annotated_callback
 )
-from gui.callbacks.calibration import (
+from gui.callbacks.calibration_callbacks import (
     addremove_calib_frame_callback,
     navigate_calib_frame_callback,
     start_ga_callback,
     clear_calib_frames_callback
 )
-from gui.callbacks.tracking import (
+from gui.callbacks.tracking_callbacks import (
     toggle_realtime_tracking_callback,
     toggle_tracker_collision_callback,
     batch_tracking_fwd_callback,
     batch_tracking_bwd_callback
 )
-from gui.callbacks.general import (
+from gui.callbacks.general_callbacks import (
     toggle_epipolar_lines_callback,
     toggle_point_labels_callback,
     toggle_reprojection_error_callback,
@@ -33,7 +33,7 @@ from gui.callbacks.general import (
     load_state_callback,
     app_quit_callback
 )
-from gui.callbacks.playback import (
+from gui.callbacks.playback_callbacks import (
     play_pause_callback,
     next_frame_callback,
     prev_frame_callback,

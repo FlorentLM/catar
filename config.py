@@ -21,7 +21,7 @@ BOTTOM_PANEL_HEIGHT_COLLAPSED = 75
 PADDING = 20
 
 # Data inputs
-DATA_FOLDER = Path.cwd() / 'data'
+DATA_FOLDER = Path.cwd() / 'data_29'
 VIDEO_FORMAT = '*.mp4'
 
 # Video cache settings
