@@ -1,22 +1,33 @@
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 import numpy as np
 
 from lucida import CameraRig
 from lucida.calibration import bundle_adjustment
 
 
-def prepare_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+def _get_anchor_index(rig: CameraRig) -> int:
+    """
+    The anchor camera is held fixed during optimisation
+    """
+    anchor_cam = rig.anchor_camera
+    if anchor_cam is not None:
+        return rig.get_index(anchor_cam.name)
+    # if no explicit anchor, default to first camera
+    return 0
+
+
+def prepare_refinement(rig: CameraRig, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
     """
     Prepares data for Bundle Adjustment.
     Returns dictionaries of numpy arrays ready for JAX.
     """
 
     all_annots = snapshot["annotations"]
-    initial_calib_dict = snapshot["best_individual"]
     calib_frames = snapshot["calibration_frames"]
 
-    # Re-hydrate rig
-    rig = CameraRig.from_dict(initial_calib_dict)
+    # Determine anchor camera index
+    anchor_idx = _get_anchor_index(rig)
+    print(f"[BA] Using camera '{rig.names[anchor_idx]}' (index {anchor_idx}) as anchor")
 
     # Prepare 2D observations
     # (snapshot annotations is (F_total, C, N, 3))
@@ -33,7 +44,6 @@ def prepare_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 
     # Initial triangulation to find outliers and nuke them
     C, P, N, _ = points_2d.shape
-
 
     # Scaffolding mode so treat every frame's points as unique in time
     points_2d_flat = points_2d.reshape(C, P * N, 2)
@@ -81,7 +91,7 @@ def prepare_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
             cov = np.array(cam.intrinsics.covariance)
 
             # Safety around dimension mismatch
-            expected_dim = 4 + len(cam.intrinsics.D.flatten()) # 4 K params + whatever D is
+            expected_dim = 4 + len(cam.intrinsics.D.flatten())  # 4 K params + whatever D is
 
             if cov.shape[0] != expected_dim:
                 # Pad covariance matrix with high variance (low confidence) for missing params
@@ -104,9 +114,11 @@ def prepare_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
 
     cov_extr_stack = None
     if all(c is not None for c in cov_extr_list):
-        # BA expects extrinsics covariance only for optimisable camrras (C-1)
-        # TODO: DO NOT drop the first camera but the ACTUAL anchor!!!
-        cov_extr_stack = np.stack(cov_extr_list)[1:]
+        # BA expects extrinsics covariance only for optimisable cameras (C-1)
+        # Exclude the anchor camera
+        cov_extr_stack = np.stack([
+            cov_extr_list[i] for i in range(len(cov_extr_list)) if i != anchor_idx
+        ])
 
     return {
         "points2d_observed": points_2d,
@@ -114,7 +126,8 @@ def prepare_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         "object_points": points_3d_safe,
         "covariance_intrinsics": cov_intr_stack,
         "covariance_extrinsics": cov_extr_stack,
-        "shape_info": (C, P, N)
+        "shape_info": (C, P, N),
+        "anchor_idx": anchor_idx
     }
 
 
@@ -142,16 +155,18 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         fix_cameras = False
         fix_points = False
 
+    # Hydrate rig first so we can determine anchor
+    rig = CameraRig.from_dict(initial_calib_dict)
+
     try:
-        ba_data = prepare_refinement(snapshot)
+        ba_data = prepare_refinement(rig, snapshot)
     except Exception as e:
         import traceback
         traceback.print_exc()
         return {"status": "error", "message": f"Data preparation failed: {str(e)}"}
 
+    anchor_idx = ba_data["anchor_idx"]
     print(f"[BA] Starting optimisation engine (Mode: {mode})...")
-
-    rig = CameraRig.from_dict(initial_calib_dict)
 
     K_init = np.array([c.intrinsics.K for c in rig])
     D_init = np.array([c.intrinsics.D for c in rig])
@@ -181,7 +196,7 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         fix_extrinsics=fix_cameras,
         fix_object_points=fix_points,
 
-        origin_cam_idx=0,
+        origin_cam_idx=anchor_idx,
         distortion_model=dist_model,
 
         covariance_intrinsics=ba_data["covariance_intrinsics"],
@@ -201,6 +216,10 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     D_opt = results['D_opt']
     T_opt = results['camera_poses_opt']  # c2w
 
+    # Build index mapping for extrinsics covariance results
+    # BA returns covariances for (C-1) cameras, excluding the anchor
+    optimized_cam_indices = [i for i in range(len(rig)) if i != anchor_idx]
+
     for i, cam in enumerate(rig):
         if not fix_cameras:
             cam.intrinsics.K = K_opt[i]
@@ -211,11 +230,10 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
             if 'covariance_intrinsics' in results:
                 cam.intrinsics.covariance = results['covariance_intrinsics'][i].tolist()
 
-            if 'covariance_extrinsics' in results:
-                # Results return (C-1, 6, 6) for optimisable cams
-                # TODO: Anchor is not necessarily cam 0!!!!
-                if i > 0:
-                    cam.extrinsics.covariance = results['covariance_extrinsics'][i - 1].tolist()
+            if 'covariance_extrinsics' in results and i != anchor_idx:
+                # Find the position of this camera in the optimized set
+                opt_idx = optimized_cam_indices.index(i)
+                cam.extrinsics.covariance = results['covariance_extrinsics'][opt_idx].tolist()
 
     refined_calib_dict = rig.to_dict()
 
