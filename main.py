@@ -28,21 +28,6 @@ from mokap.reconstruction.reconstruction import Reconstructor
 from mokap.reconstruction.tracking import SkeletonAssembler, MultiObjectTracker
 
 
-def rig_to_mokap_dict(rig: CameraRig):
-    """Helper to convert Lucida Rig to legacy Mokap calibration dictionary."""
-    out = {}
-    for cam in rig:
-        # Mokap expects standard OpenCV w2c parameters
-        out[cam.name] = {
-            'camera_matrix': cam.K,
-            'dist_coeffs': cam.D,
-            'rvec': cam.extrinsics.rvec,
-            'tvec': cam.extrinsics.tvec,
-            'image_size': cam.image_size
-        }
-    return out
-
-
 def handle_rendered_frames(new_frames: dict, app_state: 'AppState', queues: 'Queues'):
     for i, frame_bgr in enumerate(new_frames['video_frames_bgr']):
         rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
@@ -188,11 +173,8 @@ def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
             # Re-hydrate rig from dict
             app_state.rig = CameraRig.from_dict(refined_calib_dict)
 
-        # Notify trackers of calibration change
-        queues.tracking_command.put({
-            "action": "update_calibration",
-            "calibration": rig_to_mokap_dict(app_state.rig)
-        })
+        # Notify workers of calibration change
+        queues.tracking_command.put({"action": "update_calibration"})
 
         refined_3d_points = ba_result.get('refined_3d_points')
         if refined_3d_points is not None:
