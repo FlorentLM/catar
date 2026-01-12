@@ -12,17 +12,35 @@ from pathlib import Path
 import dearpygui.dearpygui as dpg
 
 import config
-from state import AppState, Queues, CalibrationState
+from state import AppState, Queues
 from gui import create_ui, update_ui, resize_video_widgets
 from gui.rendering import Viewer3D
 from utils import load_and_match_videos, compute_3d_scores
 from video import create_video_backend, DiskCacheBuilder, VideoReaderWorker
 from workers import GAWorker, BAWorker, TrackingWorker, RenderingWorker
+# from workers.kalman_worker import KalmanWorker
+
+from lucida import CameraRig
 
 from mokap.reconstruction.config import PipelineConfig
 from mokap.reconstruction.anatomy import StatsBootstrapper
 from mokap.reconstruction.reconstruction import Reconstructor
 from mokap.reconstruction.tracking import SkeletonAssembler, MultiObjectTracker
+
+
+def rig_to_mokap_dict(rig: CameraRig):
+    """Helper to convert Lucida Rig to legacy Mokap calibration dictionary."""
+    out = {}
+    for cam in rig:
+        # Mokap expects standard OpenCV w2c parameters
+        out[cam.name] = {
+            'camera_matrix': cam.K,
+            'dist_coeffs': cam.D,
+            'rvec': cam.extrinsics.rvec,
+            'tvec': cam.extrinsics.tvec,
+            'image_size': cam.image_size
+        }
+    return out
 
 
 def handle_rendered_frames(new_frames: dict, app_state: 'AppState', queues: 'Queues'):
@@ -149,11 +167,12 @@ def handle_ga_progress(ga_progress: dict, app_state: 'AppState'):
         dpg.set_value("ga_fitness_text", f"Best Fitness: {ga_progress['best_fitness']:.2f}")
         dpg.set_value("ga_mean_fitness_text", f"Mean Fitness: {ga_progress['mean_fitness']:.2f}")
 
-        new_best_calib = ga_progress.get("new_best_individual")
-        if new_best_calib:
+        new_best_calib_dict = ga_progress.get("new_best_individual")
+        if new_best_calib_dict:
             with app_state.lock:
-                app_state.calibration.update_calibration(new_best_calib)
-                app_state.calibration.best_fitness = ga_progress['best_fitness']
+                # Re-hydrate rig from dict
+                app_state.rig = CameraRig.from_dict(new_best_calib_dict)
+                app_state.best_fitness = ga_progress['best_fitness']
 
 
 def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
@@ -164,13 +183,15 @@ def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
     if ba_result['status'] == 'success':
         print("BA completed successfully!")
 
-        refined_calib = ba_result['refined_calibration']
+        refined_calib_dict = ba_result['refined_calibration']
         with app_state.lock:
-            app_state.calibration.update_calibration(refined_calib)
+            # Re-hydrate rig from dict
+            app_state.rig = CameraRig.from_dict(refined_calib_dict)
 
+        # Notify trackers of calibration change
         queues.tracking_command.put({
             "action": "update_calibration",
-            "calibration": refined_calib
+            "calibration": rig_to_mokap_dict(app_state.rig)
         })
 
         refined_3d_points = ba_result.get('refined_3d_points')
@@ -184,7 +205,7 @@ def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
                 pts_3d = refined_3d_points[i]
                 frame_annots = ba_annotations[i]
 
-                scores = compute_3d_scores(pts_3d, frame_annots, app_state.calibration)
+                scores = compute_3d_scores(pts_3d, frame_annots, app_state.rig)
 
                 pts_4d = np.full((pts_3d.shape[0], 4), np.nan, dtype=np.float32)
                 pts_4d[:, :3] = pts_3d
@@ -201,7 +222,7 @@ def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
 def main_loop(app_state: 'AppState', queues: 'Queues', viewer_3d: Optional['Viewer3D']):
     """Main GUI update loop."""
 
-    initial_resize_counter = 3  # TODO: why 3 lol
+    initial_resize_counter = 3
 
     while dpg.is_dearpygui_running():
         if initial_resize_counter > 0:
@@ -262,15 +283,14 @@ def main():
         sys.exit(0)
 
     print("Loading videos and calibration...")
-    video_paths, _, camera_names, mokap_calibration = load_and_match_videos(
+    video_paths, _, _, camera_rig = load_and_match_videos(
         data_folder,
         config.VIDEO_FORMAT
     )
 
     # Create state objects
     print("Initialising application state...")
-    calib_state = CalibrationState(mokap_calibration, camera_names)
-    app_state = AppState(data_folder, camera_names, video_paths, calib_state, config.SKELETON_CONFIG)
+    app_state = AppState(data_folder, video_paths, camera_rig, config.SKELETON_CONFIG)
 
     print("Initialising video backend...")
 
@@ -318,9 +338,8 @@ def main():
     # Load saved data
     app_state.load_from_disk(config.DATA_FOLDER)
 
-    # Define 3D volume
     reconstructor = Reconstructor(
-        camera_parameters=calib_state.best_calibration,
+        rig=app_state.rig,
         volume_bounds=app_state.volume_bounds,
         config=mokap_config.reconstruction
     )
@@ -360,6 +379,17 @@ def main():
             command_queue=queues.tracking_command,
             stop_batch_track=queues.stop_batch_track
         ),
+
+        # KalmanWorker(
+        #     app_state=app_state,
+        #     video_backend=video_backend,
+        #     reconstructor=reconstructor,
+        #     tracker=tracker,
+        #     frames_in_queue=queues.frames_for_tracking,
+        #     progress_out_queue=queues.tracking_progress,
+        #     command_queue=queues.tracking_command,
+        #     stop_batch_track=queues.stop_batch_track
+        # ),
 
         RenderingWorker(
             app_state,

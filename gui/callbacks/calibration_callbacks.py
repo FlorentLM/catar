@@ -12,13 +12,13 @@ def addremove_calib_frame_callback(sender, app_data, user_data):
     with app_state.lock:
         frame_idx = app_state.frame_idx
 
-        if frame_idx in app_state.calibration.calibration_frames:
-            app_state.calibration.calibration_frames.remove(frame_idx)
+        if frame_idx in app_state.calibration_frames:
+            app_state.calibration_frames.remove(frame_idx)
             print(f"Frame {frame_idx} removed from calibration set.")
 
         else:
-            app_state.calibration.calibration_frames.append(frame_idx)
-            app_state.calibration.calibration_frames.sort()
+            app_state.calibration_frames.append(frame_idx)
+            app_state.calibration_frames.sort()
             print(f"Frame {frame_idx} added to calibration set.")
 
 
@@ -29,7 +29,7 @@ def navigate_calib_frame_callback(sender, app_data, user_data):
     direction = user_data["direction"]  # +1 for next or -1 for previous
 
     with app_state.lock:
-        calib_frames = sorted(app_state.calibration.calibration_frames)
+        calib_frames = sorted(app_state.calibration_frames)
         if not calib_frames:
             print("No calibration frames to navigate.")
             return
@@ -58,12 +58,12 @@ def start_ga_callback(sender, app_data, user_data):
     queues = user_data["queues"]
 
     with app_state.lock:
-        app_state.calibration.best_fitness = float('inf')   # this needs to not be 0.0 on start
+        app_state.best_fitness = float('inf')  # this needs to not be 0.0 on start
         ga_snapshot = app_state.get_ga_snapshot()
 
     queues.ga_command.put({
         "action": "start",
-        "ga_state_snapshot": ga_snapshot
+        "snapshot": ga_snapshot
     })
 
     dpg.show_item("ga_popup")
@@ -135,7 +135,7 @@ def start_ba_callback(sender, app_data, user_data):
 
     queues.ba_command.put({
         "action": "start",
-        "ba_state_snapshot": ba_snapshot
+        "snapshot": ba_snapshot
     })
 
     dpg.set_value("ba_status_text", f"Running Bundle Adjustment ({selected_mode_label})...")
@@ -159,5 +159,5 @@ def clear_calib_frames_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
 
     with app_state.lock:
-        app_state.calibration.calibration_frames.clear()
+        app_state.calibration_frames.clear()
     print("Calibration frame set has been cleared.")

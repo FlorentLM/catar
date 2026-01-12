@@ -76,7 +76,8 @@ class TrackingWorker(threading.Thread):
 
                 elif command.get("action") == "update_calibration":
                     print("TrackingWorker: Received calibration update command")
-                    self.reconstructor.update_camera_parameters(command["calibration"])
+                    with self.app_state.lock:
+                        self.reconstructor.rig = self.app_state.rig
                     continue
 
                 elif command.get("action") == "shutdown":
@@ -116,28 +117,22 @@ class TrackingWorker(threading.Thread):
     def _reconstruct_for_display(self, frame_idx: int):
         """
         Perform on-demand 3D reconstruction for a single frame.
-
-        Args:
-            frame_idx: Frame to reconstruct
         """
         with self.app_state.lock:
-            calibration = self.app_state.calibration
+            rig = self.app_state.rig
 
         annotations = self.app_state.data.get_frame_annotations(frame_idx)
 
-        if calibration.best_calibration is not None:
-            points_4d = triangulate_and_score(annotations, calibration)
-            self.app_state.data.set_frame_points3d(frame_idx, points_4d)
+        # Use updated utility that accepts rig
+        points_4d = triangulate_and_score(annotations, rig)
+        self.app_state.data.set_frame_points3d(frame_idx, points_4d)
 
-            with self.app_state.lock:
-                self.app_state.needs_3d_reconstruction = False
+        with self.app_state.lock:
+            self.app_state.needs_3d_reconstruction = False
 
     def _process_frame_for_tracking(self, data: dict):
         """
         Process a single frame for the live tracking.
-
-        Args:
-            data: Frame data from VideoReaderWorker
         """
         frame_idx = data["frame_idx"]
 
@@ -147,7 +142,6 @@ class TrackingWorker(threading.Thread):
         # We can track if enabled, and if we have adjacent frames
         can_track = is_tracking_enabled and self.prev_frames and data.get("is_adjacent", False)
 
-        # Double check adjacency manually to be safe
         if can_track and abs(frame_idx - self.prev_frame_idx) != 1:
             can_track = False
 
@@ -170,10 +164,6 @@ class TrackingWorker(threading.Thread):
     def _run_batch_tracking(self, start_frame: int, direction: int = 1):
         """
         Track points starting from start_frame in the given direction.
-
-        Args:
-            start_frame: Starting frame index
-            direction: 1 for forward, -1 for backward
         """
 
         dir_str = "FORWARD" if direction == 1 else "BACKWARD"
@@ -195,7 +185,7 @@ class TrackingWorker(threading.Thread):
             print("Batch track: No frames to process in this direction")
             return
 
-        # Read the initial source frames
+        # Read initial source frames
         source_frames = batch_reader.read_frame(start_frame)
 
         if not source_frames:
@@ -216,7 +206,7 @@ class TrackingWorker(threading.Thread):
                 print(f"Failed to read frames at index {dest_frame_idx}")
                 break
 
-            # Run the core tracking logic: source -> dest
+            # tracking source -> dest
             should_continue = process_frame(
                 frame_idx=dest_frame_idx,
                 source_frame_idx=current_source_idx,

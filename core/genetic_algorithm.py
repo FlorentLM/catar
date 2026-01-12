@@ -1,77 +1,66 @@
-import random
 from typing import Dict, List, Any
 
 import numpy as np
 
 import config
-from state.calibration_state import CalibrationState
+from lucida import CameraRig
+from lucida.geometry import quaternion_average, rotation_vector, vector_from_quaternion, quaternion_from_vector
 
-from mokap.geometry import quaternion_average, rotation_vector, vector_from_quaternion, quaternion_from_vector
 
-def create_individual(video_metadata: Dict, cam_names: List[str], scene_centre: np.ndarray) -> Dict[str, Dict]:
-    """Create a random camera calibration individual."""
+def create_individual(rig_template: CameraRig, scene_centre: np.ndarray) -> CameraRig:
+    """
+    Create a random camera calibration individual using Lucida.
 
-    w, h = video_metadata['width'], video_metadata['height']
-    num_cameras = video_metadata['num_videos']
+    Uses the template rig to get camera names and image sizes, then randomizes
+    intrinsics and extrinsics for genetic algorithm initialization.
 
-    radius = np.linalg.norm(scene_centre) if np.linalg.norm(scene_centre) > 1 else 100.0
+    TODO: Use Lucida's CameraRig factory methods
+    """
+    cam_names = rig_template.names
+    first_cam = rig_template[cam_names[0]]
+    w, h = first_cam.image_size
 
-    individual: Dict[str, Dict] = {}
-    for i, cam_name in enumerate(cam_names):
-        # Position cameras in a circle around the scene centre
-        angle = (2 * np.pi / num_cameras) * i
+    # Create circular layout as starting point
+    # TODO: Expose more layout options via Lucida factories
+    rig = CameraRig.from_circular_layout(
+        cameras=cam_names,
+        radius=100.0,
+        center=scene_centre,
+        target=scene_centre,
+        plane='xz'
+    )
 
-        # Offset camera positions by the scene centre
-        cam_pos_world = scene_centre + np.array([radius * np.cos(angle), 2.0, radius * np.sin(angle)])
+    for cam in rig:
+        # Randomise intrinsics
+        fx = np.random.uniform(w * 0.8, w * 1.5)
+        fy = np.random.uniform(h * 0.8, h * 1.5)
+        cx = w / 2 + np.random.uniform(-w * 0.05, w * 0.05)
+        cy = h / 2 + np.random.uniform(-h * 0.05, h * 0.05)
 
-        up_vector = np.array([0.0, 1.0, 0.0])
-        forward = (scene_centre - cam_pos_world) / np.linalg.norm(scene_centre - cam_pos_world)
-
-        right = np.cross(forward, up_vector)
-        cam_up = np.cross(right, forward)
-
-        R_w2c = np.array([-right, cam_up, -forward])
-        R_c2w = R_w2c.T
-        tvec_c2w = cam_pos_world
-        rvec_c2w = rotation_vector(R_c2w)
-
-        # Randomize K components
-        # TODO: These factors are a bit large...
-        fx = random.uniform(w * 0.8, w * 1.5)
-        fy = random.uniform(h * 0.8, h * 1.5)
-        cx = w / 2 + random.uniform(-w * 0.05, w * 0.05)
-        cy = h / 2 + random.uniform(-h * 0.05, h * 0.05)
-
-        K = np.array([
+        cam.intrinsics.K = np.array([
             [fx, 0.0, cx],
             [0.0, fy, cy],
             [0.0, 0.0, 1.0]
         ], dtype=np.float32)
 
-        individual[cam_name] = {
-            'camera_matrix': K,
-            'dist_coeffs': np.random.normal(0.0, 0.001, size=config.NUM_DIST_COEFFS),
-            'rvec': rvec_c2w.flatten(),
-            'tvec': tvec_c2w.flatten()
-        }
+        # Randomise distortion
+        cam.intrinsics.D = np.random.normal(0.0, 0.001, size=config.NUM_DIST_COEFFS)
 
-    return individual
+        # Perturb pose slightly
+        cam.translate(np.random.normal(0, 5.0, 3), relative=True)
+
+    return rig
 
 
 def compute_fitness(
-    individual: Dict[str, Dict],  # This is the candidate from the GA
-    annotations: np.ndarray,
-    calibration_frames: List[int],
-    video_metadata: Dict,
-    cam_names: List[str]
+        individual: CameraRig,
+        annotations: np.ndarray,
+        calibration_frames: List[int]
 ) -> float:
     """Compute reprojection error fitness for a calibration."""
 
     if not calibration_frames:
         return float('inf')
-
-    # Temporary CalibrationState for candidate individual
-    temp_calib_state = CalibrationState(individual, cam_names)
 
     # Filter to calibration frames with valid data
     calib_mask = np.zeros(annotations.shape[0], dtype=bool)
@@ -83,38 +72,43 @@ def compute_fitness(
         return float('inf')
 
     # Get annotations (x, y) for valid frames
-    valid_annots = annotations[combined_mask][..., :2]
-    num_cams = video_metadata['num_videos']
+    valid_annots = annotations[combined_mask][..., :2]  # (F_valid, C, P, 2)
+    num_cams = len(individual)
 
-    annots_for_undistort = np.transpose(valid_annots, (1, 2, 0, 3)).reshape(num_cams, -1, 2)
-    undistorted_flat = temp_calib_state.undistort_all(annots_for_undistort)
-    undistorted_annots = undistorted_flat.reshape(num_cams, -1, valid_annots.shape[2], 2)
-    undistorted_annots = np.transpose(undistorted_annots, (1, 0, 2, 3))
+    # Undistort observations
+    # Flatten to (C, N_total, 2) for batch processing
+    annots_flat = np.transpose(valid_annots, (1, 0, 2, 3)).reshape(num_cams, -1, 2)
+    undistorted_flat = individual.undistort(annots_flat)
 
-    # Triangulate for each frame
-    points_3d_per_frame = [
-        temp_calib_state.triangulate(frame_annots, weights=None)
-        for frame_annots in undistorted_annots
-    ]
-    points_3d = np.array(points_3d_per_frame)  # shape (F, P, 3)
+    # Reshape back to (F_valid, C, P, 2)
+    F_valid, C, P, _ = valid_annots.shape
+    undistorted_annots = undistorted_flat.reshape(C, F_valid, P, 2).transpose(1, 0, 2, 3)
 
-    # Temporary state for candidate calibration
-    temp_calib_state = CalibrationState(individual, cam_names)
+    # Triangulate for each frame (requires rearranging dimensions)
+    # Lucida expects (C, N, 2)
+
+    points_3d_per_frame = []
+    for f in range(F_valid):
+        # (C, P, 2)
+        frame_obs = undistorted_annots[f]
+        p3d = individual.triangulate(frame_obs)
+        points_3d_per_frame.append(p3d)
+
+    points_3d = np.array(points_3d_per_frame)  # shape (F_valid, P, 3)
 
     num_frames, num_points, _ = points_3d.shape
     points_3d_flat = points_3d.reshape(-1, 3)  # shape (F*P, 3)
 
     # Project all points into all cameras
-    reprojected_flat = temp_calib_state.reproject_to_all(points_3d_flat)
+    reprojected_flat = individual.project(points_3d_flat)  # (C, F*P, 2)
 
     # Reshape back to match annotation structure
     reprojected_unflat = reprojected_flat.reshape(num_cams, num_frames, num_points, 2)
     reprojected_final = np.transpose(reprojected_unflat, (1, 0, 2, 3))  # shape (F, C, P, 2)
 
-    # Calculate error across all points and cameras
+    # Calculate error
     errors = np.linalg.norm(reprojected_final - undistorted_annots, axis=-1)
 
-    # Mask out invalid points and calculate final fitness score
     valid_mask = ~np.isnan(undistorted_annots[..., 0])
     total_error = np.sum(errors[valid_mask])
     total_points = np.sum(valid_mask)
@@ -125,143 +119,130 @@ def compute_fitness(
 def run_genetic_step(ga_state: Dict[str, Any]) -> Dict[str, Any]:
     """Execute one generation of the genetic algorithm."""
 
-    population = ga_state.get("population")
+    population = ga_state.get("population")  # List of CameraRig objects
     best_fitness = ga_state.get("best_fitness", float('inf'))
-    best_individual = ga_state.get("best_individual")
+    best_individual_dict = ga_state.get("best_individual")  # could be None for fresh start
     generation = ga_state.get("generation", 0)
     scene_centre = ga_state.get("scene_centre", np.zeros(3))
     stagnation_counter = ga_state.get("stagnation_counter", 0)
-    cam_names = ga_state["camera_names"]
 
+    # Re-hydrate best individual (to get camera names/sizes)
+    best_individual = CameraRig.from_dict(best_individual_dict)
+
+    # Re-hydrate population if needed (first run or from serialization)
     if population is None:
-        if best_individual:
-            # Seed initial population from best individual
+        if best_fitness < float('inf'):
+            # We have a valid starting calibration - seed from it
             population = [best_individual]
             for _ in range(config.GA_POPULATION_SIZE - 1):
-                mutated_ind = {}
-
-                for cam_name, cam_params in best_individual.items():
-                    # TODO: Are these copies really necessary?
-                    mutated_cam = cam_params.copy()
-
-                    # Mutate K matrix elements (fx, fy, cx, cy)
-                    K = cam_params['camera_matrix'].copy()
-                    K[0, 0] += np.random.normal(0, config.GA_MUTATION_STRENGTH_INIT * abs(K[0, 0]))  # fx
-                    K[1, 1] += np.random.normal(0, config.GA_MUTATION_STRENGTH_INIT * abs(K[1, 1]))  # fy
-                    K[0, 2] += np.random.normal(0, config.GA_MUTATION_STRENGTH_INIT * abs(K[0, 2]))  # cx
-                    K[1, 2] += np.random.normal(0, config.GA_MUTATION_STRENGTH_INIT * abs(K[1, 2]))  # cy
-                    mutated_cam['camera_matrix'] = K
-
-                    # Mutate other parameters
-                    for key in ['tvec', 'dist_coeffs']:
-                        mutated_cam[key] = np.asarray(mutated_cam[key]) + np.random.normal(0,
-                                                                                           config.GA_MUTATION_STRENGTH_INIT,
-                                                                                           size=mutated_cam[key].shape)
-
-                    mutated_cam['rvec'] = np.asarray(mutated_cam['rvec']) + np.random.normal(0,
-                                                                                             config.GA_MUTATION_STRENGTH_INIT * 0.001,
-                                                                                             # Massively reduce mutation on rvec because radians
-                                                                                             size=mutated_cam['rvec'].shape)
-                    mutated_ind[cam_name] = mutated_cam
-                population.append(mutated_ind)
+                mutated_rig = best_individual.copy()
+                mutate_rig(mutated_rig, config.GA_MUTATION_STRENGTH_INIT)
+                population.append(mutated_rig)
         else:
-            population = [create_individual(ga_state['video_metadata'], cam_names, scene_centre) for _ in
-                          range(config.GA_POPULATION_SIZE)]
+            # Fresh start - create random individuals
+            population = [
+                create_individual(best_individual, scene_centre)
+                for _ in range(config.GA_POPULATION_SIZE)
+            ]
+
+    # Ensure all are CameraRig objects
+    population = [p if isinstance(p, CameraRig) else CameraRig.from_dict(p) for p in population]
 
     # Evaluate fitness
     fitness_scores = np.array([
         compute_fitness(
             ind,
             ga_state['annotations'],
-            ga_state['calibration_frames'],
-            ga_state['video_metadata'],
-            cam_names
+            ga_state['calibration_frames']
         )
         for ind in population
     ])
     sorted_indices = np.argsort(fitness_scores)
 
-    if fitness_scores[sorted_indices[0]] < best_fitness:
-        best_fitness = fitness_scores[sorted_indices[0]]
-        best_individual = population[sorted_indices[0]]
+    # Elitism
+    current_best_fit = fitness_scores[sorted_indices[0]]
+    current_best_ind = population[sorted_indices[0]]
+
+    if current_best_fit < best_fitness:
+        best_fitness = current_best_fit
+        best_individual_dict = current_best_ind.to_dict()
         stagnation_counter = 0
     else:
         stagnation_counter += 1
 
-    current_mutation_strength = config.GA_MUTATION_STRENGTH
+    mutation_str = config.GA_MUTATION_STRENGTH
     if stagnation_counter > 20:
-        print("GA is stagnating, temporarily increasing mutation strength.")
-        current_mutation_strength *= 2.5
+        mutation_str *= 2.5
 
-    # Create next generation
+    # Selection & Reproduction
     num_elites = int(config.GA_POPULATION_SIZE * config.GA_ELITISM_RATE)
-    next_population = [population[i] for i in sorted_indices[:num_elites]]
+    next_population = [population[i].copy() for i in sorted_indices[:num_elites]]
 
     while len(next_population) < config.GA_POPULATION_SIZE:
+        # Tournament
+        idx_a, idx_b = np.random.choice(len(population), 2, replace=False)
+        p1 = population[idx_a] if fitness_scores[idx_a] < fitness_scores[idx_b] else population[idx_b]
 
-        # Tournament selection
-        # TODO: This is a bit simple, could be improved
+        idx_c, idx_d = np.random.choice(len(population), 2, replace=False)
+        p2 = population[idx_c] if fitness_scores[idx_c] < fitness_scores[idx_d] else population[idx_d]
 
-        p1_idx, p2_idx = np.random.choice(len(population), 2, replace=False)
-        parent1 = population[p1_idx] if fitness_scores[p1_idx] < fitness_scores[p2_idx] else population[p1_idx]
-        p3_idx, p4_idx = np.random.choice(len(population), 2, replace=False)
-        parent2 = population[p3_idx] if fitness_scores[p3_idx] < fitness_scores[p4_idx] else population[p3_idx]
+        child = crossover_rigs(p1, p2)
 
-        child = {}
-        for cam_name in cam_names:
-            p1_cam = parent1[cam_name]
-            p2_cam = parent2[cam_name]
+        if np.random.rand() < config.GA_MUTATION_RATE:
+            mutate_rig(child, mutation_str)
 
-            child_cam = {}
-
-            # rvec averaging (quaternion)
-            q_batch = quaternion_from_vector(np.stack([p1_cam['rvec'], p2_cam['rvec']]))
-            q_avg = quaternion_average(q_batch)
-
-            rvec_avg = vector_from_quaternion(q_avg)
-            child_cam['rvec'] = np.asarray(rvec_avg)
-
-            # Linear Averaging for other parameters
-            for key in p1_cam:
-                if key != 'rvec':
-                    p1_val = np.asarray(p1_cam[key])
-                    p2_val = np.asarray(p2_cam[key])
-                    child_cam[key] = (p1_val + p2_val) / 2.0
-
-            # Mutation
-            if np.random.rand() < config.GA_MUTATION_RATE:
-
-                # Mutate K elements
-                K_mut = child_cam['camera_matrix'].copy()
-                K_mut[0, 0] += np.random.normal(0, current_mutation_strength * abs(K_mut[0, 0]))
-                K_mut[1, 1] += np.random.normal(0, current_mutation_strength * abs(K_mut[1, 1]))
-                K_mut[0, 2] += np.random.normal(0, current_mutation_strength * abs(K_mut[0, 2]))
-                K_mut[1, 2] += np.random.normal(0, current_mutation_strength * abs(K_mut[1, 2]))
-                child_cam['camera_matrix'] = K_mut
-
-                # Mutate tvec and dist_coeffs
-                for key in ['tvec', 'dist_coeffs']:
-                    child_cam[key] = child_cam[key] + np.random.normal(0, current_mutation_strength,
-                                                                       size=child_cam[key].shape)
-
-                # Mutate rvec
-                child_cam['rvec'] = child_cam['rvec'] + np.random.normal(0,
-                                                                         current_mutation_strength * 0.001, # Massively reduce mutation on rvec because radians
-                                                                         size=child_cam['rvec'].shape)
-
-            child[cam_name] = child_cam
         next_population.append(child)
-
-    mean_fitness = np.nanmean(fitness_scores)
-    std_fitness = np.nanstd(fitness_scores)
 
     return {
         "status": "running",
         "new_best_fitness": best_fitness,
-        "new_best_individual": best_individual,
+        "new_best_individual": best_individual_dict,  # dict for serialization
         "generation": generation + 1,
-        "mean_fitness": mean_fitness,
-        "std_fitness": std_fitness,
+        "mean_fitness": np.nanmean(fitness_scores),
+        "std_fitness": np.nanstd(fitness_scores),
         "next_population": next_population,
         "stagnation_counter": stagnation_counter,
     }
+
+
+def mutate_rig(rig: CameraRig, strength: float):
+    for cam in rig:
+        # K
+        K = cam.intrinsics.K
+        K[0, 0] += np.random.normal(0, strength * abs(K[0, 0]))
+        K[1, 1] += np.random.normal(0, strength * abs(K[1, 1]))
+        K[0, 2] += np.random.normal(0, strength * abs(K[0, 2]))
+        K[1, 2] += np.random.normal(0, strength * abs(K[1, 2]))
+        cam.intrinsics.K = K
+
+        # D
+        cam.intrinsics.D += np.random.normal(0, strength, size=cam.intrinsics.D.shape)
+
+        # Pose
+        cam.translate(np.random.normal(0, strength, 3), relative=True)
+
+        # Rotate (small perturbations)
+        rvec = np.random.normal(0, strength * 0.001, 3)
+        cam.rotate(rotation_vector(rvec), relative=True)
+
+
+def crossover_rigs(parent1: CameraRig, parent2: CameraRig) -> CameraRig:
+    child_cams = []
+    for c1, c2 in zip(parent1, parent2):
+        new_cam = c1.copy()
+
+        # Average Intrinsics
+        new_cam.intrinsics.K = (c1.intrinsics.K + c2.intrinsics.K) / 2.0
+        new_cam.intrinsics.D = (c1.intrinsics.D + c2.intrinsics.D) / 2.0
+
+        # Average Pose (Linear position, Slerp rotation via quaternion average)
+        new_cam.extrinsics.tvec_c2w = (c1.extrinsics.tvec_c2w + c2.extrinsics.tvec_c2w) / 2.0
+
+        q1 = quaternion_from_vector(c1.extrinsics.rvec_c2w)
+        q2 = quaternion_from_vector(c2.extrinsics.rvec_c2w)
+        q_avg = quaternion_average(np.stack([q1, q2]))
+        new_cam.extrinsics.rvec_c2w = vector_from_quaternion(q_avg)
+
+        child_cams.append(new_cam)
+
+    return CameraRig(child_cams)

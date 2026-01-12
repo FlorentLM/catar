@@ -17,7 +17,7 @@ def image_mousedown_callback(sender, app_data, user_data):
     with app_state.lock:
         frame_idx = app_state.frame_idx
         p_idx = app_state.selected_point_idx
-        camera_name = app_state.camera_itn[cam_idx]
+        camera_name = app_state.rig.names[cam_idx]
         video_meta = app_state.get_video_metadata(camera_name)
 
     annotations = app_state.data.get_camera_annotations(frame_idx, cam_idx)
@@ -42,7 +42,7 @@ def image_mousedown_callback(sender, app_data, user_data):
     )
 
     # Check if near existing point
-    existing_point = annotations[p_idx, :2] # only check x, y
+    existing_point = annotations[p_idx, :2]  # only check x, y
     is_drag_start = False
 
     if not np.isnan(existing_point).any():
@@ -110,18 +110,18 @@ def image_mousedrag_callback(sender, app_data, user_data):
         p_idx = app_state.drag_state["p_idx"]
         frame_idx = app_state.frame_idx
 
-        camera_name = app_state.camera_itn[cam_idx]
+        camera_name = app_state.rig.names[cam_idx]
         video_meta = app_state.get_video_metadata(camera_name)
         video_w = video_meta['width']
         video_h = video_meta['height']
 
         current_frames = app_state.current_video_frames
-        best_calib = app_state.calibration.best_calibration
+
+        # Lucida access
+        rig = app_state.rig
 
         show_epipolar_lines = app_state.show_epipolar_lines
         temp_hide_overlays = app_state.temp_hide_overlays
-
-        f_mats = app_state.calibration.F_mats
         camera_colors = app_state.camera_colors
 
     all_annotations = app_state.data.get_frame_annotations(frame_idx)
@@ -160,7 +160,8 @@ def image_mousedrag_callback(sender, app_data, user_data):
             drag_state["slow_down_start_mouse_pos"] = current_scaled_pos.copy()
             with app_state.lock:
                 # get (x, y) coordinates
-                drag_state["slow_down_start_annotation_pos"] = app_state.data.get_annotation(frame_idx, cam_idx, p_idx)[:2].copy()
+                drag_state["slow_down_start_annotation_pos"] = app_state.data.get_annotation(frame_idx, cam_idx, p_idx)[
+                    :2].copy()
 
         # Continue slow movement relative to the anchor point
         mouse_delta = current_scaled_pos - drag_state["slow_down_start_mouse_pos"]
@@ -177,7 +178,6 @@ def image_mousedrag_callback(sender, app_data, user_data):
     # Clamp position to be in video boundaries
     final_scaled_pos[0] = np.clip(final_scaled_pos[0], 0, video_w - 1)
     final_scaled_pos[1] = np.clip(final_scaled_pos[1], 0, video_h - 1)
-
 
     with app_state.lock:
         # Update the (x, y) and set confidence to 1.0 (it's a manual annotation)
@@ -198,7 +198,13 @@ def image_mousedrag_callback(sender, app_data, user_data):
 
     center_coords = (final_scaled_pos[0], final_scaled_pos[1])
     patch_size = (int(src_patch_width), int(src_patch_width))
-    patch = cv2.getRectSubPix(video_frame, patch_size, center_coords)
+
+    # Handle edge cases for crop
+    if (center_coords[0] < 0 or center_coords[0] >= video_w or
+            center_coords[1] < 0 or center_coords[1] >= video_h):
+        patch = np.zeros((patch_size[1], patch_size[0], 3), dtype=np.uint8)
+    else:
+        patch = cv2.getRectSubPix(video_frame, patch_size, center_coords)
 
     if patch is not None and patch.size > 0:
         # Smoother interpolation for a less blocky look
@@ -214,14 +220,19 @@ def image_mousedrag_callback(sender, app_data, user_data):
         return ((p[0] - src_x) * zoom_factor, (p[1] - src_y) * zoom_factor)
 
     # Draw epipolar lines for selected point
-    if show_epipolar_lines and not temp_hide_overlays and best_calib and f_mats:
-        for from_cam in range(len(current_frames)):
+    if show_epipolar_lines and not temp_hide_overlays and len(rig) > 1:
+        target_cam_name = rig.names[cam_idx]
 
-            point_2d = all_annotations[from_cam, p_idx, :2]
-            F = f_mats.get((from_cam, cam_idx))
-
-            if cam_idx == from_cam or np.isnan(point_2d).any() or F is None:
+        for from_cam_idx in range(len(current_frames)):
+            if cam_idx == from_cam_idx:
                 continue
+
+            point_2d = all_annotations[from_cam_idx, p_idx, :2]
+            if np.isnan(point_2d).any():
+                continue
+
+            from_cam_name = rig.names[from_cam_idx]
+            F = rig.F_between(from_cam_name, target_cam_name)
 
             p_hom = np.array([point_2d[0], point_2d[1], 1.0])
             line = F @ p_hom
@@ -231,18 +242,16 @@ def image_mousedrag_callback(sender, app_data, user_data):
             if len(intersection_points) == 2:
                 p1_video_coords, p2_video_coords = intersection_points
                 p1_loupe, p2_loupe = to_loupe_coords(p1_video_coords), to_loupe_coords(p2_video_coords)
-                color = (*camera_colors[from_cam % len(camera_colors)], 120)    # slightly transparent
+                color = (*camera_colors[from_cam_idx % len(camera_colors)], 120)  # slightly transparent
                 dpg.draw_line(p1_loupe, p2_loupe, color=color, thickness=1, parent=layer_tag)
 
     # Draw reprojection for selected point
-    if not temp_hide_overlays and best_calib and not np.isnan(point_3d_selected[:3]).any():
-        cam_name_target = app_state.camera_itn[cam_idx]
-        reprojected = app_state.calibration.reproject_to_one(
-            point_3d_selected[:3].reshape(1, 3),
-            cam_name_target
-        ).flatten()
+    if not temp_hide_overlays and len(rig) > 0 and not np.isnan(point_3d_selected[:3]).any():
+        cam = rig[rig.names[cam_idx]]
 
-        if reprojected.size > 0:
+        reprojected = cam.project(point_3d_selected[:3].reshape(1, 3)).flatten()
+
+        if reprojected.size > 0 and not np.isnan(reprojected).any():
             reproj_loupe_coords = to_loupe_coords(reprojected)
 
             # only draw if the reprojection is visible within the loupe

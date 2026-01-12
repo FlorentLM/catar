@@ -85,12 +85,12 @@ class RenderingWorker(threading.Thread):
         scene = []
 
         with self.app_state.lock:
-            calibration = self.app_state.calibration
+            rig = self.app_state.rig
 
-            if self.app_state.show_cameras_in_3d and calibration.best_calibration:
-                for cam_name in calibration.camera_names:
+            if self.app_state.show_cameras_in_3d:
+                for cam_name in rig.names:
                     scene.extend(
-                        create_camera_visual(calibration, cam_name, self.app_state.scene_centre)
+                        create_camera_visual(rig, cam_name, self.app_state.scene_centre)
                     )
 
             # Add reconstructed points and skeleton
@@ -101,14 +101,9 @@ class RenderingWorker(threading.Thread):
 
         points_3d = self.app_state.data.get_frame_points3d(frame_idx)
 
-        # Debug: count valid points
-        # valid_points = 0
-
         # Draw points
         for i, point in enumerate(points_3d):
             if not np.isnan(point[:3]).any():
-                # valid_points += 1
-
                 color = tuple(point_colors[i])
                 scene.append(Object3D(
                     type='point',
@@ -117,10 +112,6 @@ class RenderingWorker(threading.Thread):
                     label=self.app_state.point_itn[i]
                 ))
 
-                # # Debug: print 1st point
-                # if valid_points == 1:
-                #     print(f"Adding point '{point_names[i]}' at {point} with color {color}")
-
                 # Draw skeleton connections
                 for connected_name in skeleton.get(point_names[i], []):
                     try:
@@ -128,16 +119,12 @@ class RenderingWorker(threading.Thread):
                         if not np.isnan(points_3d[j][:3]).any():
                             scene.append(Object3D(
                                 type='line',
-                                coords=np.array([point, points_3d[j, :3]]),
+                                coords=np.array([point[:3], points_3d[j, :3]]),
                                 color=(128, 128, 128),
                                 label=None
                             ))
                     except ValueError:
                         pass
-
-        # # Debug: Print scene info sometimes
-        # if self.app_state.frame_idx % 30 == 0:  # every 30 frames
-        #     print(f"3D Scene: {len(scene)} objects, {valid_points} valid keypoints")
 
         return scene
 

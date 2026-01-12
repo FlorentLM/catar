@@ -17,7 +17,7 @@ from gui.callbacks.calibration_callbacks import (
 )
 from gui.callbacks.tracking_callbacks import stop_batch_tracking_callback
 
-from mokap.utils.fileio import probe_video
+from lucida.utils import probe_video
 
 from video.backends import create_video_backend
 

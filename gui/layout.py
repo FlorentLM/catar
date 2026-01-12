@@ -54,7 +54,6 @@ from gui.popups import (
 
 if TYPE_CHECKING:
     from state import AppState, Queues
-    from gui.rendering import Viewer3D
 
 
 def create_ui(app_state: 'AppState', queues: 'Queues'):
@@ -62,7 +61,7 @@ def create_ui(app_state: 'AppState', queues: 'Queues'):
 
     dpg.create_context()
 
-    nb_videos = app_state.video_metadata['num_videos']
+    nb_videos = len(app_state.rig)
     if nb_videos > 0:
         # Calculate the most 'square' layout
         n_cols = int(np.ceil(np.sqrt(nb_videos)))
@@ -87,7 +86,7 @@ def create_ui(app_state: 'AppState', queues: 'Queues'):
     )
 
     # Setup
-    create_textures(app_state.video_metadata)
+    create_textures(len(app_state.rig))
     create_themes()
     register_event_handlers(app_state, queues)
 
@@ -123,12 +122,12 @@ def create_ui(app_state: 'AppState', queues: 'Queues'):
     dpg.show_viewport()
 
 
-def create_textures(video_meta: dict):
+def create_textures(num_videos: int):
     """Create GPU textures for video frames and 3D view."""
 
     with dpg.texture_registry():
         # Video textures
-        for i in range(video_meta['num_videos']):
+        for i in range(num_videos):
             black = np.zeros(
                 (config.DISPLAY_HEIGHT, config.DISPLAY_WIDTH, 4),
                 dtype=np.float32
@@ -458,7 +457,7 @@ def create_bottom_panel(app_state: 'AppState'):
 def create_video_grid(app_state: 'AppState', n_cols: int, n_rows: int):
     """Create grid of videos."""
 
-    nb_videos = app_state.video_metadata['num_videos']
+    nb_videos = len(app_state.rig)
 
     with dpg.table(header_row=False, resizable=True, policy=dpg.mvTable_SizingStretchProp, tag="video_table"):
         for _ in range(n_cols):
@@ -480,7 +479,7 @@ def create_video_cell(cam_idx: int, app_state: 'AppState'):
         # Display Camera Name (bold) and Filename (faint)
 
         with dpg.group(horizontal=True, horizontal_spacing=5):
-            camera_name = app_state.camera_itn[cam_idx]
+            camera_name = app_state.rig.names[cam_idx]
             file_name = app_state.video_filenames[cam_idx]
 
             dpg.add_text(camera_name)

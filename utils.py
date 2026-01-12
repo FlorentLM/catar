@@ -1,16 +1,13 @@
 import sys
 import tomllib
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Tuple, Union
+from typing import List, Tuple
+
 import Levenshtein
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-if TYPE_CHECKING:
-    from state.calibration_state import CalibrationState
-
-CameraParameters = Dict[str, Union[float, np.ndarray]]
-CalibrationDict = Dict[str, CameraParameters]
+from lucida import Intrinsics, Extrinsics, CameraModel, CameraRig
 
 
 def get_confidence_color(confidence: float) -> tuple:
@@ -40,27 +37,24 @@ def get_confidence_color(confidence: float) -> tuple:
 
 
 def load_and_match_videos(data_folder: Path, video_format: str) -> Tuple[
-    List[str], List[str], List[str], CalibrationDict]:
+    List[str], List[str], List[str], CameraRig]:
     """
     Load videos and calibration with smart names matching.
 
     Returns:
-        Tuple of (video_paths, video_filenames, camera_names, calibration_dict)
-        where calibration_dict is in the mokap-style Dict[CamName, CamParams]
-        with keys: 'camera_matrix', 'dist_coeffs', 'rvec', 'tvec'.
+        Tuple of (video_paths, video_filenames, camera_names, camera_rig)
     """
-    # TODO: Port this logic to mokap
 
-    # Load calibration TOML
-    calib_file = data_folder / 'parameters.toml'
-    if not calib_file.exists():
-        print(f"ERROR: 'parameters.toml' not found in '{data_folder}'")
+    # Fallback to Lucida specific file if parameters.toml doesn't exist
+    rig_file = data_folder / 'rig.toml'
+
+    if rig_file.exists():
+        print(f"Loading Lucida rig from '{rig_file}'...")
+        rig = CameraRig.load(rig_file)
+        toml_names = sorted(rig.names)
+    else:
+        print(f"ERROR: No calibration file ('rig.toml') found in '{data_folder}'")
         sys.exit(1)
-
-    with calib_file.open("rb") as f:
-        calib_data = tomllib.load(f)
-
-    toml_names = sorted(calib_data.keys())
 
     # Find video files
     video_paths = sorted(data_folder.glob(video_format))
@@ -71,7 +65,8 @@ def load_and_match_videos(data_folder: Path, video_format: str) -> Tuple[
     video_filenames = [p.name for p in video_paths]
 
     if len(toml_names) != len(video_paths):
-        print("ERROR: Number of cameras in TOML doesn't match number of videos")
+        print(f"ERROR: Number of cameras in calibration ({len(toml_names)}) "
+              f"doesn't match number of videos ({len(video_paths)})")
         sys.exit(1)
 
     # Match with Levenshtein distance
@@ -83,7 +78,6 @@ def load_and_match_videos(data_folder: Path, video_format: str) -> Tuple[
 
     toml_indices, video_indices = linear_sum_assignment(cost_matrix)
 
-    # Build ordered lists based on the sorted toml_names order (which is the canonical order)
     ordered_paths = ["" for _ in range(n)]
     ordered_filenames = ["" for _ in range(n)]
     ordered_toml_names = toml_names
@@ -96,18 +90,7 @@ def load_and_match_videos(data_folder: Path, video_format: str) -> Tuple[
         ordered_paths[i] = str(video_paths[matched_video_idx])
         ordered_filenames[i] = video_filenames[matched_video_idx]
 
-    # Build calibration dictionary (format {cam_name: cam_params})
-    calibration_dict: CalibrationDict = {}
-    for toml_name in ordered_toml_names:
-        cam = calib_data[toml_name]
-        calibration_dict[toml_name] = {
-            'camera_matrix': np.array(cam['camera_matrix'], dtype=np.float32),
-            'dist_coeffs': np.array(cam['dist_coeffs'], dtype=np.float32),
-            'rvec': np.array(cam['rvec'], dtype=np.float32),
-            'tvec': np.array(cam['tvec'], dtype=np.float32),
-        }
-
-    return ordered_paths, ordered_filenames, ordered_toml_names, calibration_dict
+    return ordered_paths, ordered_filenames, ordered_toml_names, rig
 
 
 def line_box_intersection(a: float, b: float, c: float, box_x: float, box_y: float, box_w: float, box_h: float) -> list:
@@ -147,24 +130,27 @@ def line_box_intersection(a: float, b: float, c: float, box_x: float, box_y: flo
     return unique_points
 
 
-# TODO: Maybe these two functions could be methods of the CalibrationState class
+# TODO: Maybe these two functions could be removed / replaced by Lucida's own
 
 def compute_3d_scores(
-        points_3d: np.ndarray,      # shape (P, 3)
-        annotations: np.ndarray,    # shape (C, P, 3) or (C, P, 2)
-        calibration: 'CalibrationState'
+        points_3d: np.ndarray,  # shape (P, 3)
+        annotations: np.ndarray,  # shape (C, P, 3) or (C, P, 2)
+        rig: CameraRig
 ) -> np.ndarray:
     """
     Computes confidence scores (0.0 to 1.0) for 3D points based on reprojection error.
     """
-    if calibration.best_calibration is None:
+    if len(rig) == 0:
         return np.zeros(points_3d.shape[0], dtype=np.float32)
 
     valid_3d = ~np.isnan(points_3d).any(axis=1)
     if not np.any(valid_3d):
         return np.zeros(points_3d.shape[0], dtype=np.float32)
 
-    reprojected = calibration.reproject_to_all(points_3d)  # (C, P, 2)
+    if points_3d.ndim == 1:
+        points_3d = points_3d[None, :]
+
+    reprojected = rig.project(points_3d)  # (C, P, 2)
 
     # Calculate errors against observations
     obs_2d = annotations[..., :2]
@@ -198,21 +184,21 @@ def compute_3d_scores(
 
 def triangulate_and_score(
         annotations: np.ndarray,  # shape (C, P, 3)
-        calibration: 'CalibrationState'
+        rig: CameraRig
 ) -> np.ndarray:
     """
     Triangulates points and computes their scores.
     """
-    if calibration.best_calibration is None:
+    if len(rig) < 2:
         return np.full((annotations.shape[1], 4), np.nan, dtype=np.float32)
 
     points2d = annotations[..., :2]
     weights = annotations[..., 2]
 
-    points_3d = calibration.triangulate(points2d, weights)
+    points_3d = rig.triangulate(points2d, weights=weights)
 
     # Compute scores
-    scores = compute_3d_scores(points_3d, annotations, calibration)
+    scores = compute_3d_scores(points_3d, annotations, rig)
 
     # Combine into (P, 4) format
     points_4d = np.full((points_3d.shape[0], 4), np.nan, dtype=np.float32)

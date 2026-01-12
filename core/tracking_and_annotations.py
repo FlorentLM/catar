@@ -1,12 +1,12 @@
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple
 import cv2
 import numpy as np
 import config
-from utils import triangulate_and_score
+from utils import triangulate_and_score # TODO: Can maybe now remove this function
 
 if TYPE_CHECKING:
     from state import AppState
-    from state.calibration_state import CalibrationState
+    from lucida import CameraRig
     from mokap.reconstruction.reconstruction import Reconstructor
     from mokap.reconstruction.tracking import MultiObjectTracker
 
@@ -22,20 +22,10 @@ class OverlapStats(NamedTuple):
     safe_ratio: float
 
 
-def compute_patch_ncc(
-        img_prev: np.ndarray,
-        img_curr: np.ndarray,
-        p_prev: np.ndarray,
-        p_curr: np.ndarray,
-        patch_size: int = config.NCC_PATCH_SIZE
-) -> float:
-    """
-    Computes Normalised Cross Correlation between two patches.
-    Returns 1.0 if identical, -1.0 if inverted, 0.0 if uncorrelated.
-    """
+def compute_patch_ncc(img_prev, img_curr, p_prev, p_curr, patch_size=config.NCC_PATCH_SIZE):
+    """Computes NCC between patches."""
     h, w = img_prev.shape
     pad = patch_size // 2
-
     u_p, v_p = p_prev
     u_c, v_c = p_curr
 
@@ -44,114 +34,73 @@ def compute_patch_ncc(
         return -1.0
 
     try:
-        patch_prev = cv2.getRectSubPix(img_prev, (patch_size, patch_size), (float(u_p), float(v_p)))
-        patch_curr = cv2.getRectSubPix(img_curr, (patch_size, patch_size), (float(u_c), float(v_c)))
-
-        if np.std(patch_prev) < 1e-5 or np.std(patch_curr) < 1e-5:
-            return 0.0
-
-        res = cv2.matchTemplate(patch_curr.astype(np.float32), patch_prev.astype(np.float32), cv2.TM_CCOEFF_NORMED)
-        return float(res[0][0])
-
-    except Exception:
+        p1 = cv2.getRectSubPix(img_prev, (patch_size, patch_size), (float(u_p), float(v_p)))
+        p2 = cv2.getRectSubPix(img_curr, (patch_size, patch_size), (float(u_c), float(v_c)))
+        if np.std(p1) < 1e-5 or np.std(p2) < 1e-5: return 0.0
+        return float(cv2.matchTemplate(p2.astype(np.float32), p1.astype(np.float32), cv2.TM_CCOEFF_NORMED)[0][0])
+    except:
         return -1.0
 
 
-def compute_comparison_stats(
-        points_a: np.ndarray,
-        points_b: np.ndarray,
-        conflict_threshold: float,
-        safe_threshold: float
-) -> Optional[OverlapStats]:
-    """
-    Computes distance statistics between two sets of points (C, P, 2/3)
-    """
-
+def compute_comparison_stats(points_a, points_b, conflict_threshold, safe_threshold):
     valid_a = ~np.isnan(points_a[..., 0])
     valid_b = ~np.isnan(points_b[..., 0])
-    overlap_mask = valid_a & valid_b
+    overlap = valid_a & valid_b
+    total = np.sum(overlap)
 
-    total_overlap = np.sum(overlap_mask)
-    if total_overlap == 0:
-        return None
+    if total == 0: return None
 
-    diffs = points_a[..., :2] - points_b[..., :2]
-    dists = np.linalg.norm(diffs[overlap_mask], axis=1)
-
-    n_conflicts = np.sum(dists > conflict_threshold)
-    n_safe = np.sum(dists < safe_threshold)
+    dists = np.linalg.norm(points_a[overlap, :2] - points_b[overlap, :2], axis=1)
 
     return OverlapStats(
-        total_overlap=total_overlap,
-        n_conflicts=n_conflicts,
-        n_safe=n_safe,
+        total_overlap=total,
+        n_conflicts=np.sum(dists > conflict_threshold),
+        n_safe=np.sum(dists < safe_threshold),
         mean_dist=np.mean(dists),
         max_dist=np.max(dists),
-        conflict_ratio=n_conflicts / total_overlap,
-        safe_ratio=n_safe / total_overlap
+        conflict_ratio=np.sum(dists > conflict_threshold) / total,
+        safe_ratio=np.sum(dists < safe_threshold) / total
     )
 
 
-def detect_track_collision(
-        existing_annots: np.ndarray,
-        new_predictions: np.ndarray,
-        calibration: 'CalibrationState',
-        distance_threshold: float = 30.0,
-        ratio_threshold: float = 0.25,
-        safe_zone_radius: float = 5.0  # points closer than this are definitely fine
-) -> bool:
-    """
-    Checks if new predictions conflict with existing annotations.
-    """
+def detect_track_collision(existing_annots, new_predictions, rig: 'CameraRig', distance_threshold=30.0,
+                           ratio_threshold=0.25):
+    """Checks if new predictions conflict with existing annotations."""
 
-    # Direct 2D Comparison
-    comparison_2d = compute_comparison_stats(
-        existing_annots,
-        new_predictions,
-        conflict_threshold=distance_threshold,
-        safe_threshold=safe_zone_radius
-    )
+    # 2D check
+    stats = compute_comparison_stats(existing_annots, new_predictions, distance_threshold, 5.0)
 
-    # Short-circuit: we have overlap and > 90% of points are within the safe zone
-    if comparison_2d is not None:
-        if comparison_2d.safe_ratio > 0.90:
-            # The tracks are nearly identical: we assume 3D consistency without calculating it
-            return False
+    if stats and stats.safe_ratio > 0.90:
+        return False  # safe match
 
-    # Triangulate existing data
-    existing_3d_points = triangulate_and_score(existing_annots, calibration)
-    valid_3d_mask = ~np.isnan(existing_3d_points[:, 0])
+    # 3D check
+    existing_3d = triangulate_and_score(existing_annots, rig)
+    valid_3d_mask = ~np.isnan(existing_3d[:, 0])
 
+    check_type = "2D"
     if np.any(valid_3d_mask):
-        # We have a valid 3D consensus: reproject this consensus into all cameras to check against the new track
-        reprojected_expectations = calibration.reproject_to_all(existing_3d_points[:, :3])
+        # Reproject expectations
+        p3d = existing_3d[:, :3]
+        if p3d.ndim == 1: p3d = p3d[None, :]
 
-        stats = compute_comparison_stats(
-            reprojected_expectations,
-            new_predictions,
-            conflict_threshold=distance_threshold,
-            safe_threshold=safe_zone_radius
-        )
-        check_type = "3D"
+        reproj = rig.project(p3d)  # (C, P, 2)
 
-    else:
-        # Fallback: triangulation failed (e.g. single view) so we rely on the raw 2D stats
-        stats = comparison_2d
-        check_type = "2D"
+        # Handle shape mismatch if rig subset (unlikely with full rig)
+        if reproj.shape[:-1] != new_predictions[..., :2].shape[:-1]:
+            return False  # cant compare mismatched shapes
 
-    # Decision
+        stats_3d = compute_comparison_stats(reproj, new_predictions, distance_threshold, 5.0)
+        if stats_3d:
+            stats = stats_3d
+            check_type = "3D"
+
     if stats is None:
-        return False  # no overlap to compare against
+        return False
 
     if stats.conflict_ratio > ratio_threshold:
-        print(f"[ {check_type} COLLISION ]")
-        print(f"    {stats.n_conflicts}/{stats.total_overlap} points ({stats.conflict_ratio:.1%}) conflict. "
-              f"Mean dist: {stats.mean_dist:.1f}px")
+        print(f"[ {check_type} COLLISION ] {stats.conflict_ratio:.1%} conflict. Mean: {stats.mean_dist:.1f}px")
         return True
-    else:
-        print(f"COLLISION CHECK ({check_type}): Compatible. "
-              f"{stats.safe_ratio:.1%} in safe zone. Max err: {stats.max_dist:.1f}px")
-        return False
+    return False
 
 
 def process_frame(
@@ -164,405 +113,206 @@ def process_frame(
         dest_frames: List[np.ndarray],
         batch_step: int = 0
 ) -> bool:
-    """
-    Runs the full processing pipeline for a frame.
-    """
-
+    """Runs processing pipeline."""
     print(f"\n[Frame: {source_frame_idx} -> {frame_idx}] (step {batch_step})")
 
     with app_state.lock:
-        calibration = app_state.calibration
+        rig = app_state.rig
         point_names = app_state.point_names
         collision_stop = app_state.tracker_collision_stop
 
-    existing_annots = app_state.data.get_frame_annotations(frame_idx, copy=True)
-    is_human_flags = app_state.data.get_human_annotated_flags(frame_idx, copy=True)
+    existing = app_state.data.get_frame_annotations(frame_idx, copy=True)
+    is_human = app_state.data.get_human_annotated_flags(frame_idx, copy=True)
 
     src_gray = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in source_frames]
     dst_gray = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in dest_frames]
 
-    # Get geometric prediction from LK tracking
-    predictions_LK = track_points(
-        app_state, src_gray, dst_gray, source_frame_idx, frame_idx
-    )
+    # LK tracking
+    pred_LK = track_points(app_state, src_gray, dst_gray, source_frame_idx, frame_idx)
 
-    if collision_stop:
-        if detect_track_collision(existing_annots, predictions_LK, calibration, distance_threshold=20.0):  # TODO: config for this
-            return False  # signal to stop
+    if collision_stop and detect_track_collision(existing, pred_LK, rig):
+        return False
 
-    # Prepare input for Mokap Reconstructor
-    cam_indices, point_indices = np.where(~np.isnan(predictions_LK[..., 0]))
-    n_points_LK = len(point_indices)
+    # Mokap reconstruction
+    cam_indices, point_indices = np.where(~np.isnan(pred_LK[..., 0]))
+    n_pts = len(point_indices)
 
-    if config.VERBOSE:
-        print(f"LK PREDICT:    Started with {n_points_LK} raw 2D keypoints from Optical Flow.")
-
-    if n_points_LK > 0:
-        coords = predictions_LK[cam_indices, point_indices, :2]
-        scores = predictions_LK[cam_indices, point_indices, 2]
-
-        reconstruction_input = {
-            "frame_indices": np.full(n_points_LK, frame_idx, dtype=np.int32),
+    active_tracklets = []
+    if n_pts > 0:
+        inputs = {
+            "frame_indices": np.full(n_pts, frame_idx, dtype=np.int32),
             "kp_type_ids": point_indices.astype(np.int16),
             "cam_ids": cam_indices.astype(np.int8),
-            "coords": coords.astype(np.float32),
-            "scores": scores.astype(np.float32)
+            "coords": pred_LK[cam_indices, point_indices, :2].astype(np.float32),
+            "scores": pred_LK[cam_indices, point_indices, 2].astype(np.float32)
         }
-
-        # Run Mokap reconstruction
-        soup = reconstructor.reconstruct_batch(
-            inputs=reconstruction_input,
-            keypoint_names=point_names
-        )
-
-        if config.VERBOSE:
-            print(f"MOKAP RECON:   Input {n_points_LK} 2D points -> Produced soup "
-                  f"of {soup.num_points} 3D points and {len(soup.ray_origins)} orphan rays.")
-
-        # Run multi-object tracking (skeleton assembly + time association)
+        soup = reconstructor.reconstruct_batch(inputs=inputs, keypoint_names=point_names)
         active_tracklets = tracker.update(soup, frame_idx)
-    else:
-        if config.VERBOSE:
-            print("MOKAP RECON:   No input points from LK.")
-        active_tracklets = []
 
-    # Extract best skeleton for feedback loop
-    final_skeleton_kps = None
-    norm_skeleton_score = 0.0
+    # Skeleton feedback
+    final_skel_kps = None
+    norm_score = 0.0
 
     if active_tracklets:
-        # Heuristic: Pick tracklet with most keypoints or highest score
-        # TODO: maybe this should be smarter
-        best_tracklet = max(active_tracklets, key=lambda t: (len(t.skeleton.keypoints), t.skeleton.score))
-        final_skeleton_kps = best_tracklet.skeleton.keypoints
-        num_kps = len(final_skeleton_kps)
+        best = max(active_tracklets, key=lambda t: (len(t.skeleton.keypoints), t.skeleton.score))
+        final_skel_kps = best.skeleton.keypoints
+        norm_score = np.clip(best.skeleton.score / (max(1, len(final_skel_kps)) * reconstructor.max_point_score), 0, 1)
 
-        max_score = reconstructor.max_point_score
-        avg_score = best_tracklet.skeleton.score / max(1, num_kps)
-        norm_skeleton_score = np.clip(avg_score / max_score, 0.0, 1.0)
+    # Model reproj
+    pred_model = np.full_like(pred_LK, np.nan)
+    if final_skel_kps and len(rig) > 0:
+        p3d_list = []
+        p_ind_list = []
+        for name, pos in final_skel_kps.items():
+            if name in point_names:
+                p3d_list.append(pos)
+                p_ind_list.append(app_state.point_nti[name])
 
-        if config.VERBOSE:
-            print(f"MOKAP ASSEMBLE: SUCCESS -> Assembled 1 skeleton with {num_kps} keypoints "
-                  f"(score: {best_tracklet.skeleton.score:.2f}, or {norm_skeleton_score:.2f} normalised).")
-    else:
-        if config.VERBOSE:
-            print(f"MOKAP ASSEMBLE: Could not assemble any skeletons from the soup.")
+        if p3d_list:
+            reproj = rig.project(np.array(p3d_list))  # (C, P_subset, 2)
+            for i, p_idx in enumerate(p_ind_list):
+                pred_model[:, p_idx, :2] = reproj[:, i, :]
+                pred_model[:, p_idx, 2] = norm_score
 
-    # Get model-reprojected annotations
-    predictions_model = np.full_like(predictions_LK, np.nan)
+    # Fusion
+    annots_fused = fuse_annotations(existing, is_human, pred_LK, pred_model)
 
-    if final_skeleton_kps and calibration.best_calibration:
-        points3d = []
-        p_indices = []
-
-        for p_name, pos_3d in final_skeleton_kps.items():
-            if p_name in point_names:
-                points3d.append(pos_3d)
-                p_indices.append(app_state.point_nti[p_name])
-
-        points3d = np.array(points3d)
-
-        if points3d.size > 0:
-            reprojected_all_cams = calibration.reproject_to_all(points3d)  # (C, P, 2)
-
-            # Fill annotation array
-            for i, p_idx in enumerate(p_indices):
-                predictions_model[:, p_idx, :2] = reprojected_all_cams[:, i, :]
-                predictions_model[:, p_idx, 2] = norm_skeleton_score
-
-    # Step 1: Fuse all evidence to get best 2D annotations
-    annotations_fused = fuse_annotations(
-        existing_annots=existing_annots,
-        human_flags=is_human_flags,
-        lk_annots=predictions_LK,
-        model_annots=predictions_model,
-    )
-
-    # Rescue single-view LK tracks that were lost during fusion
-    valid_mask_LK = ~np.isnan(predictions_LK[..., 0])
-    n_views_per_LK_point = np.sum(valid_mask_LK, axis=0)
-
-    valid_mask_fused = ~np.isnan(annotations_fused[..., 0])
-    is_fused_point_lost = ~np.any(valid_mask_fused, axis=0)
+    # Rescue single-view points lost in fusion
+    valid_LK = ~np.isnan(pred_LK[..., 0])
+    valid_Fused = ~np.isnan(annots_fused[..., 0])
+    n_views_LK = np.sum(valid_LK, axis=0)
+    is_fused_lost = ~np.any(valid_Fused, axis=0)
 
     for p_idx in range(app_state.num_points):
-        #   LK had exactly one view         AND  the point was lost in fusion
-        if n_views_per_LK_point[p_idx] == 1 and is_fused_point_lost[p_idx]:
+        if n_views_LK[p_idx] == 1 and is_fused_lost[p_idx]:
+            cam_idx = np.where(valid_LK[:, p_idx])[0][0]
+            annots_fused[cam_idx, p_idx] = pred_LK[cam_idx, p_idx]
 
-            # find the camera that had the single track and re-insert it
-            cam_idx = np.where(valid_mask_LK[:, p_idx])[0][0]
-            annotations_fused[cam_idx, p_idx] = predictions_LK[cam_idx, p_idx]
+    # Final triangulation
+    final_3d = triangulate_and_score(annots_fused, rig)
 
-    # Step 2: Triangulate fused 2D points
-    if calibration.best_calibration is not None:
-        final_points3d = triangulate_and_score(annotations_fused, calibration)
-    else:
-        final_points3d = np.full((app_state.num_points, 4), np.nan, dtype=np.float32)
-
-    # Step 3: Create final 3D pose (with priority on triangulation)
-    if final_skeleton_kps:
-
-        # Calculate mask of points where triangulation failed
-        missing_mask = np.isnan(final_points3d[:, 0])
-
-        # Fill where triangulation failed with mokap skeleton
-        for name, coords in final_skeleton_kps.items():
+    # Fill missing triangulation with Skeleton
+    if final_skel_kps:
+        missing = np.isnan(final_3d[:, 0])
+        for name, coords in final_skel_kps.items():
             idx = app_state.point_nti.get(name)
-            if idx is not None and missing_mask[idx]:
-                final_points3d[idx, :3] = coords
-                final_points3d[idx, 3] = norm_skeleton_score * 0.8
+            if idx is not None and missing[idx]:
+                final_3d[idx, :3] = coords
+                final_3d[idx, 3] = norm_score * 0.8
 
-    # Step 4: Structural feedback (penalize points rejected by skeleton assembler)
-    if final_skeleton_kps:
-        assembled_kps = set(final_skeleton_kps.keys())
-
-        # Rejected points: all - (assembled + non skeleton)
+    # Zombie point filter
+    if final_skel_kps:
+        assembled_kps = set(final_skel_kps.keys())
         rejected_kps = app_state.all_points_set - (assembled_kps | app_state.non_skeleton_points_set)
-
         for p_name in rejected_kps:
             p_idx = app_state.point_nti[p_name]
-
-            valid_mask = ~np.isnan(annotations_fused[:, p_idx, 0])
-
+            valid_mask = ~np.isnan(annots_fused[:, p_idx, 0])
             if np.any(valid_mask):
-                if config.VERBOSE:
-                    print(f"ZOMBIE POINT: '{p_name}' was rejected by Mokap")
+                annots_fused[valid_mask, p_idx, 2] *= 0.5
+                kill_mask = annots_fused[:, p_idx, 2] < 0.1
+                annots_fused[kill_mask, p_idx, :] = np.nan
 
-                # Slash confidence by half
-                annotations_fused[valid_mask, p_idx, 2] *= 0.5
-
-                # Kill if confidence drops too low
-                kill_mask = annotations_fused[:, p_idx, 2] < 0.1
-                annotations_fused[kill_mask, p_idx, :] = np.nan
-
-    # Step 4: Update app state with final data
-    app_state.data.set_frame_annotations(frame_idx, annotations_fused)
-    app_state.data.set_frame_points3d(frame_idx, final_points3d)
+    app_state.data.set_frame_annotations(frame_idx, annots_fused)
+    app_state.data.set_frame_points3d(frame_idx, final_3d)
 
     return True
 
-def track_points(
-        app_state: 'AppState',
-        source_frames_gray: List[np.ndarray],
-        dest_frames_gray: List[np.ndarray],
-        source_frame_idx: int,
-        dest_frame_idx: int
-) -> np.ndarray:
-    """
-    Tracks points using LK + Forward-Backward Error + NCC Appearance Check.
-    """
+
+def track_points(app_state, src_gray, dst_gray, src_idx, dst_idx):
+    """LK Tracker logic."""
     with app_state.lock:
-        focus_mode = app_state.focus_selected_point
-        selected_idx = app_state.selected_point_idx
-        calibration = app_state.calibration
-        decay_rate = app_state.tracker_decay_rate
+        rig = app_state.rig
+        decay = app_state.tracker_decay_rate
 
-    annotations_source_full = app_state.data.get_frame_annotations(source_frame_idx, copy=True)
+    annots_src = app_state.data.get_frame_annotations(src_idx, copy=True)
+    out_annots = np.full_like(annots_src, np.nan)
 
-    p0_2d_all = annotations_source_full[..., :2]
-    num_cams, num_points, _ = annotations_source_full.shape
-    output_annotations = np.full((num_cams, num_points, 3), np.nan, dtype=np.float32)
+    if len(rig) == 0: return out_annots
 
-    if calibration.best_calibration is None:
-        return output_annotations
+    num_cams = annots_src.shape[0]
 
-    for cam_idx in range(num_cams):
-        src_gray = source_frames_gray[cam_idx]
-        dst_gray = dest_frames_gray[cam_idx]
+    for c in range(num_cams):
+        p0 = annots_src[c, :, :2]
+        valid = ~np.isnan(p0).any(axis=1)
+        if not np.any(valid): continue
 
-        p0_2d_src = p0_2d_all[cam_idx]
+        p0_active = p0[valid].reshape(-1, 1, 2)
+        idx_active = np.where(valid)[0]
 
-        # Filter valid points
-        track_mask = ~np.isnan(p0_2d_src).any(axis=1)
+        p1, st, _ = cv2.calcOpticalFlowPyrLK(src_gray[c], dst_gray[c], p0_active, None, **config.LK_PARAMS)
+        p0r, st_r, _ = cv2.calcOpticalFlowPyrLK(dst_gray[c], src_gray[c], p1, None, **config.LK_PARAMS)
 
-        if focus_mode:
-            is_valid = track_mask[selected_idx]
-            track_mask[:] = False
-            track_mask[selected_idx] = is_valid
+        for i, idx in enumerate(idx_active):
+            fb_err = np.linalg.norm(p0_active[i] - p0r[i])
+            if st[i] == 1 and st_r[i] == 1 and fb_err < config.FORWARD_BACKWARD_THRESHOLD:
+                ncc = compute_patch_ncc(src_gray[c], dst_gray[c], p0_active[i].flatten(), p1[i].flatten())
+                if ncc < config.NCC_THRESHOLD_KILL: continue
 
-        if not np.any(track_mask):
-            continue
+                old_conf = annots_src[c, idx, 2]
+                geom_q = (1.0 - fb_err / config.FORWARD_BACKWARD_THRESHOLD)
 
-        start_points = p0_2d_src[track_mask].reshape(-1, 1, 2)
-        point_indices = np.where(track_mask)[0]
-
-        # Forward flow: source -> dest
-        p1_forward, status_fwd, _ = cv2.calcOpticalFlowPyrLK(
-            src_gray, dst_gray, start_points, None, **config.LK_PARAMS
-        )
-
-        # Backward flow: dest -> source
-        p0_backward, status_bwd, _ = cv2.calcOpticalFlowPyrLK(
-            dst_gray, src_gray, p1_forward, None, **config.LK_PARAMS
-        )
-
-        for i, p_idx in enumerate(point_indices):
-            # Geometric check (forward-backward error)
-            fb_error = np.linalg.norm(start_points[i] - p0_backward[i])
-            is_geom_valid = (status_fwd[i] == 1 and status_bwd[i] == 1 and
-                             fb_error < config.FORWARD_BACKWARD_THRESHOLD)
-
-            if is_geom_valid:
-                # Appearance check (NCC)
-                ncc_score = compute_patch_ncc(
-                    src_gray, dst_gray,
-                    start_points[i].flatten(),
-                    p1_forward[i].flatten()
-                )
-
-                # Kill if terrible
-                if ncc_score < config.NCC_THRESHOLD_KILL:
-                    if config.VERBOSE:
-                        print(f"NCC CHECK: Killed point '{app_state.point_itn[p_idx]}' in "
-                              f"camera '{app_state.camera_itn[cam_idx]}' (NCC score = {ncc_score:.2f})")
-                    continue
-
-                # Confidence calculation
-                prev_conf = annotations_source_full[cam_idx, p_idx, 2]
-                if np.isnan(prev_conf):
-                    prev_conf = config.MAX_SINGLE_VIEW_CONFIDENCE
-
-                geom_quality = (1.0 - (fb_error / config.FORWARD_BACKWARD_THRESHOLD))
-
-                # Soft penalty for lower NCC scores
+                # Soft penalty
                 ncc_factor = 1.0
-                if ncc_score < config.NCC_THRESHOLD_WARNING:
-
-                    if config.VERBOSE:
-                        print(f"NCC CHECK: Penalty applied to '{app_state.point_itn[p_idx]}' in "
-                              f"camera '{app_state.camera_itn[cam_idx]}' (NCC score = {ncc_score:.2f})")
-
-                    ncc_factor = max(0.0, (ncc_score - config.NCC_THRESHOLD_KILL) / (
+                if ncc < config.NCC_THRESHOLD_WARNING:
+                    ncc_factor = max(0.0, (ncc - config.NCC_THRESHOLD_KILL) / (
                                 config.NCC_THRESHOLD_WARNING - config.NCC_THRESHOLD_KILL))
 
-                new_conf = prev_conf * geom_quality * ncc_factor * decay_rate
-
-                output_annotations[cam_idx, p_idx] = [*p1_forward[i].flatten(), new_conf]
+                new_conf = old_conf * geom_q * ncc_factor * decay
+                out_annots[c, idx] = [*p1[i].flatten(), new_conf]
 
     # Multi-view consensus upgrade
     for p_idx in range(app_state.num_points):
+        valid_cams = np.where(~np.isnan(out_annots[:, p_idx, 0]))[0]
+        if len(valid_cams) < 2: continue
 
-        # Find all cameras that have a valid track for this point
-        peer_cam_indices = [i for i, p in enumerate(output_annotations[:, p_idx]) if not np.isnan(p).any()]
+        # Triangulate hypothesis
+        obs = out_annots[valid_cams, p_idx, :2]  # (N_valid, 2)
+        obs_reshaped = obs[:, None, :]  # (C, 1, 2)
 
-        # if we have enough views for triangulation we can try to upgrade the confidence
-        if len(peer_cam_indices) >= 2:
+        cam_names = [rig.names[i] for i in valid_cams]
+        p3d = rig.triangulate(obs_reshaped, cameras=cam_names).flatten()  # (3,)
 
-            for cam_idx_to_check in peer_cam_indices:
-                point_to_check = output_annotations[cam_idx_to_check, p_idx, :2]
+        if np.isnan(p3d).any(): continue
 
-                # The consensus group is all the other cameras (that have a valid track)
-                consensus_peer_indices = [i for i in peer_cam_indices if i != cam_idx_to_check]
+        reproj = rig.project(p3d[None, :], cameras=cam_names).reshape(len(valid_cams), 2)
+        errs = np.linalg.norm(obs - reproj, axis=1)
 
-                if len(consensus_peer_indices) < 2:
-                    continue
+        for k, c_idx in enumerate(valid_cams):
+            mv_conf = max(0.0, 1.0 - (errs[k] / config.LK_CONFIDENCE_MAX_ERROR))
+            if mv_conf < out_annots[c_idx, p_idx, 2]:
+                out_annots[c_idx, p_idx, 2] = mv_conf
 
-                consensus_annots = output_annotations[consensus_peer_indices, p_idx, :2]
+    # Max confidence cap
+    mask = ~np.isnan(out_annots[..., 2])
+    out_annots[mask, 2] = np.fmin(out_annots[mask, 2], config.FUSION_MAX_AUTO_CONFIDENCE)
 
-                points_for_triangulation = consensus_annots.reshape(len(consensus_peer_indices), 1, 2)
-
-                point_3d_hypothesis = calibration.triangulate_subset(
-                    points_for_triangulation,
-                    np.array(consensus_peer_indices),
-                    weights=None
-                ).flatten()
-
-                if np.isnan(point_3d_hypothesis).any():
-                    continue
-
-                cam_name_to_check = app_state.camera_itn[cam_idx_to_check]
-                reprojected = calibration.reproject_to_one(
-                    point_3d_hypothesis.reshape(1, 3),
-                    cam_name_to_check
-                )
-
-                if reprojected.size == 0:
-                    continue
-
-                # Geometric error for this LK track
-                error = np.linalg.norm(point_to_check - reprojected.flatten())
-
-                # Convert error into confidence score
-                multi_view_confidence = max(0.0, 1.0 - (error / config.LK_CONFIDENCE_MAX_ERROR))
-
-                if multi_view_confidence < output_annotations[cam_idx_to_check, p_idx, 2]:
-                    output_annotations[cam_idx_to_check, p_idx, 2] = multi_view_confidence
-
-    # Ensure no automated track exceeds maximum
-    is_valid = ~np.isnan(output_annotations[..., 2])
-    output_annotations[is_valid, 2] = np.fmin(
-        output_annotations[is_valid, 2],
-        config.FUSION_MAX_AUTO_CONFIDENCE
-    )
-
-    return output_annotations
+    return out_annots
 
 
-def snap_annotation(
-        app_state: 'AppState',
-        target_cam_idx: int,
-        point_idx: int,
-        frame_idx: int,
-        user_click_pos: np.ndarray
-) -> Optional[np.ndarray]:
-    """
-    Snaps a new user click to a (maybe) more accurate position based
-    on the consensus of other existing annotations (weighted by confidence).
-    """
+def snap_annotation(app_state, target_cam_idx, point_idx, frame_idx, click_pos):
+    """Snap click to epipolar line intersection from other views."""
+    annots = app_state.data.get_point_annotations(frame_idx, point_idx)
+    rig = app_state.rig
 
-    annotations_for_point = app_state.data.get_point_annotations(frame_idx, point_idx)
-    calibration = app_state.calibration
+    valid_mask = ~np.isnan(annots[:, 0])
+    valid_mask[target_cam_idx] = False  # exclude self
 
-    if calibration.best_calibration is None:
-        return None
+    valid_cams = np.where(valid_mask)[0]
+    if len(valid_cams) < 2: return None
 
-    num_cams = annotations_for_point.shape[0]
-    cam_indices = np.arange(num_cams)
+    cam_names = [rig.names[i] for i in valid_cams]
+    obs = annots[valid_cams, :2][:, None, :]
+    weights = annots[valid_cams, 2][:, None]
 
-    is_not_target_cam = (cam_indices != target_cam_idx)
-    is_valid_annotation = ~np.isnan(annotations_for_point).any(axis=1)
-    final_mask = is_not_target_cam & is_valid_annotation
+    p3d = rig.triangulate(obs, weights=weights, cameras=cam_names).flatten()
 
-    valid_cam_indices = cam_indices[final_mask]
+    if np.isnan(p3d).any(): return None
 
-    if len(valid_cam_indices) < 2:
-        return None
+    reproj = rig[rig.names[target_cam_idx]].project(p3d).flatten()
 
-    valid_annotations = annotations_for_point[final_mask]
-    valid_annotations_2d = valid_annotations[:, :2]
-    valid_scores = valid_annotations[:, 2]
+    if np.linalg.norm(reproj - click_pos) > 20: return None
 
-    point_to_triangulate = valid_annotations_2d.reshape(len(valid_cam_indices), 1, 2)
-    weights_for_triangulation = valid_scores.reshape(len(valid_cam_indices), 1)
-
-    point_3d_single = calibration.triangulate_subset(
-        point_to_triangulate,
-        valid_cam_indices,
-        weights_for_triangulation
-    )
-
-    if np.isnan(point_3d_single).any():
-        return None
-
-    point_3d = point_3d_single.flatten()
-
-    cam_name = calibration.camera_itn[target_cam_idx]
-    reprojected_point_2d = calibration.reproject_to_one(
-        point_3d.reshape(1, 3),
-        cam_name
-    )
-
-    if reprojected_point_2d.size == 0:
-        return None
-
-    reprojected_point_2d = reprojected_point_2d.flatten()
-
-    # Only snap if the click is close enough
-    distance = np.linalg.norm(reprojected_point_2d - user_click_pos)
-    if distance > 20:
-        return None
-
-    return reprojected_point_2d
+    return reproj
 
 
 def fuse_annotations(
@@ -572,18 +322,7 @@ def fuse_annotations(
         model_annots: np.ndarray,
 ) -> np.ndarray:
     """
-    Fuses annotations from multiple sources with confidence-based weighting.
-
-    Finds the best source and boosts confidence if other sources agree.
-
-    Args:
-        existing_annots: Current state of annotations (C, P, 3). Used as 'Human' source if flag is set, or 'Prior' source otherwise.
-        human_flags: Boolean flags for human annotations (C, P)
-        lk_annots: Annotations from LK tracker (C, P, 3)
-        model_annots: Annotations from 3D skeleton reprojection (C, P, 3)
-
-    Returns:
-        Fused annotations (C, P, 3) with (x, y, confidence)
+    Fuses annotations from multiple sources.
     """
     num_cams, num_points, _ = existing_annots.shape
     final_annotations = np.full((num_cams, num_points, 3), np.nan, dtype=np.float32)
@@ -594,20 +333,12 @@ def fuse_annotations(
 
             # Check existing data (Source 1: Human or Source 2: prior auto track)
             if not np.isnan(existing_annots[c, p, 0]):
-                if human_flags[c, p]:
-                    # Human Annotation (highest priority)
-                    sources.append({
-                        'pos': existing_annots[c, p, :2],
-                        'conf': existing_annots[c, p, 2],
-                        'type': 'human'
-                    })
-                else:
-                    # Prior auto track
-                    sources.append({
-                        'pos': existing_annots[c, p, :2],
-                        'conf': existing_annots[c, p, 2],
-                        'type': 'prior'
-                    })
+                type_str = 'human' if human_flags[c, p] else 'prior'
+                sources.append({
+                    'pos': existing_annots[c, p, :2],
+                    'conf': existing_annots[c, p, 2],
+                    'type': type_str
+                })
 
             # Source 3: LK tracker
             if not np.isnan(lk_annots[c, p, 0]):
@@ -642,8 +373,8 @@ def fuse_annotations(
             final_conf = best_source['conf']
 
             # Weighted average of agreeing sources
-            sum_of_weights = best_source['conf']
-            weighted_sum_pos = best_source['pos'] * best_source['conf']
+            sum_weights = best_source['conf']
+            weighted_pos = best_source['pos'] * best_source['conf']
 
             # Check for agreement from other sources
             for other in other_sources:
@@ -659,28 +390,17 @@ def fuse_annotations(
                 # If sources agree spatially, we average them
                 # (this allows a strong 3D model to slightly shift a Human / Prior annotation)
                 if distance < config.FUSION_AGREEMENT_RADIUS:
-                    # Agreement found: add to average
-                    weighted_sum_pos += other['pos'] * other['conf']
-                    sum_of_weights += other['conf']
+                    weighted_pos += other['pos'] * other['conf']
+                    sum_weights += other['conf']
 
                     # Confidence bonus based on agreement quality
                     bonus = (1.0 - (distance / config.FUSION_AGREEMENT_RADIUS)) * config.FUSION_AGREEMENT_BONUS
                     final_conf += bonus
 
-            # Calculate final position from agreeing sources
-            final_pos = np.divide(
-                weighted_sum_pos,
-                sum_of_weights,
-                out=np.full(2, np.nan),
-                where=sum_of_weights > 1e-6
-            )
+            final_pos = weighted_pos / (sum_weights + 1e-6)
 
-            # Apply confidence ceiling
-            # Humans can go up to 1.0 (or whatever config says), automated tracks capped lower
-            if best_source['type'] == 'human':
-                max_conf = config.FUSION_HUMAN_CONFIDENCE
-            else:
-                max_conf = config.FUSION_MAX_AUTO_CONFIDENCE
+            max_conf = config.FUSION_HUMAN_CONFIDENCE if best_source[
+                                                             'type'] == 'human' else config.FUSION_MAX_AUTO_CONFIDENCE
             final_conf = min(final_conf, max_conf)
 
             final_annotations[c, p] = [*final_pos, final_conf]

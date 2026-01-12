@@ -4,22 +4,16 @@ All application state and communication queues are managed here.
 import queue
 import threading
 import multiprocessing
-import tomllib
 import numpy as np
-import pickle
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Dict, Any, Optional, Union, Tuple
+from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
 
 import config
 from state.data_manager import DataManager
-from mokap.utils.fileio import probe_video
-
-if TYPE_CHECKING:
-    from video import DiskCacheReader
-    from state.calibration_state import CalibrationState
-    from utils import CalibrationDict
+from lucida.utils import probe_video
+from lucida import CameraRig
 
 
 @dataclass
@@ -70,13 +64,12 @@ class AppState:
     def __init__(
         self,
         data_folder: Union[Path, str],
-        camera_names: List[str],
         video_paths: List[Union[Path, str]],
-        calib_state: 'CalibrationState',
+        rig: CameraRig,
         skeleton_config: Dict[str, Any]
     ):
-        if len(camera_names) != len(video_paths):
-            raise ValueError("Mismatch between number of camera names and video paths.")
+        if len(rig) != len(video_paths):
+            raise ValueError("Mismatch between number of cameras in rig and video paths.")
 
         self.data_folder = Path(data_folder)
         if hasattr(config, 'VIDEO_CACHE_FOLDER'):
@@ -87,27 +80,29 @@ class AppState:
         self.video_backend = None
 
         # Keep top-level lock for app-wide state coordination
-        # (DataManager has its own lock for data arrays)
         self.lock = threading.RLock()
-
-        # Cameras order and lookup accessors
-        self.camera_names = tuple(camera_names)
-        self.num_cameras = len(camera_names)
-        self.camera_nti = {name: i for i, name in enumerate(self.camera_names)}
-        self.camera_itn = {i: name for name, i in self.camera_nti.items()}
 
         # Video information (constant during runtime)
         self.video_paths: List[Path] = [Path(p).resolve() for p in video_paths]
         self.video_filenames: List[str] = [Path(p).name for p in video_paths]
-        self.num_videos = len(self.video_paths)
 
         # Probe videos for metadata
         self._video_metadata: Dict[str, Dict[str, Any]] = {}
-        for name, path in zip(camera_names, self.video_paths):
+        for name, path in zip(rig.names, self.video_paths):
             self._video_metadata[name] = probe_video(path)
 
+            # Update rig image sizes and scale K if mismatch (e.g. using proxies)
+            cam = rig[name]
+            vid_w = self._video_metadata[name]['width']
+            vid_h = self._video_metadata[name]['height']
+
+            # Check for explicit resolution mismatch vs what was loaded
+            if cam.intrinsics.width != vid_w or cam.intrinsics.height != vid_h:
+                print(f"Resizing camera '{name}' intrinsics from {cam.intrinsics.image_size} to {(vid_w, vid_h)}")
+                rig[name] = cam.resize((vid_w, vid_h))
+
         # Use first video as session reference
-        first_metadata = self._video_metadata[camera_names[0]]
+        first_metadata = self._video_metadata[rig.names[0]]
         self.video_metadata = first_metadata.copy()
         self.video_metadata['num_videos'] = len(video_paths)
 
@@ -116,35 +111,38 @@ class AppState:
         self.frame_height: int = first_metadata['height']
         self.num_frames: int = first_metadata['num_frames']
         self.video_duration: float = first_metadata['duration']
-        self.fps: float = first_metadata['fps'] or 30.0     # default to 30 if fps is missing
+        self.fps: float = first_metadata['fps'] or 30.0
 
         half_life_frames = config.TRACKER_HALF_LIFE_CONFIDENCE_DECAY * self.fps
         if half_life_frames > 0:
             self.tracker_decay_rate = 0.5 ** (1.0 / half_life_frames)
         else:
-            self.tracker_decay_rate = 0.0  # instant decay if half-life is 0
+            self.tracker_decay_rate = 0.0
         print(f"Tracker: Half-life {config.TRACKER_HALF_LIFE_CONFIDENCE_DECAY:.1f}s @ {self.fps:.2f} FPS "
               f"-> Decay rate per frame: {self.tracker_decay_rate:.4f}")
 
-        # State Objects
-        self.calibration: 'CalibrationState' = calib_state
-        self.cache_reader: Optional['DiskCacheReader'] = None
+        # State objects
+        self.rig: CameraRig = rig
+
+        # Additional calibration state not held in Lucida
+        self.calibration_frames: List[int] = []
+        self.best_fitness: float = float('inf')
 
         # Default scene bounds and centre
         self.volume_bounds = {'x': (-1e9, 1e9), 'y': (-1e9, 1e9), 'z': (-1e9, 1e9)}
         self.scene_centre = np.zeros(3)
 
-        # Keypoints order and lookup accessors (read-only after init)
+        # Keypoints order and lookup accessors
         self.point_names = tuple(skeleton_config['point_names'])
         self.point_nti = {name: i for i, name in enumerate(self.point_names)}
         self.point_itn = {i: name for name, i in self.point_nti.items()}
 
         self.skeleton = skeleton_config['skeleton']
-
-        # TODO: Use these sets everywhere possible
         self.all_points_set = set(self.point_names)
-        self.skeleton_points_set = {'s_small', 's_large'}
-        # Points that are tracked but NOT part of the skeleton graph (objects, props, etc)
+
+        # TODO: Derive skeleton_points_set from skeleton config (points that are part of the skeleton graph)
+        # TODO: Add GUI functionality to add/remove non-skeleton points for object tracking and scaffolding
+        self.skeleton_points_set = set(self.point_names) - {'s_small', 's_large'}
         self.non_skeleton_points_set = {'s_small', 's_large'}
 
         self.point_colors = skeleton_config['point_colors']
@@ -154,7 +152,7 @@ class AppState:
         # Centralised data manager
         self.data = DataManager(
             n_frames=self.num_frames,
-            n_cameras=len(camera_names),
+            n_cameras=len(rig),
             n_points=self.num_points
         )
 
@@ -164,7 +162,6 @@ class AppState:
         self.is_seeking: bool = False
 
         # UI State
-        self.current_grid_cols: int = 0
         self.selected_point_idx: int = 0
         self.focus_selected_point: bool = False
         self.show_cameras_in_3d: bool = True
@@ -179,8 +176,7 @@ class AppState:
         self.needs_3d_reconstruction: bool = True
         self.tracker_collision_stop: bool = True
 
-        # Transient UI Data
-
+        # Transient UI data
         # Frame cache for UI zoom (raw frames from current playback position)
         self.current_video_frames: Optional[List[np.ndarray]] = None
 
@@ -193,6 +189,7 @@ class AppState:
     def get_ga_snapshot(self) -> Dict[str, Any]:
         """
         Create snapshot of state needed by the GA worker.
+        Camera names and image sizes are derived from the rig.
         """
         with self.lock:
             with self.data.bulk_lock():
@@ -200,11 +197,9 @@ class AppState:
 
             return {
                 "annotations": annotations_copy,
-                "calibration_frames": list(self.calibration.calibration_frames),
-                "video_metadata": self.video_metadata.copy(),
-                "camera_names": list(self.camera_names),
-                "best_fitness": self.calibration.best_fitness,
-                "best_individual": self.calibration.best_calibration,
+                "calibration_frames": list(self.calibration_frames),
+                "best_fitness": self.best_fitness,
+                "best_individual": self.rig.to_dict(),
                 "generation": 0,
                 "scene_centre": self.scene_centre.copy()
             }
@@ -212,6 +207,7 @@ class AppState:
     def get_ba_snapshot(self) -> Dict[str, Any]:
         """
         Create a snapshot of state needed by the BA worker.
+        Camera names and image sizes are derived from the rig.
         """
         with self.lock:
             with self.data.bulk_lock():
@@ -219,10 +215,8 @@ class AppState:
 
             return {
                 "annotations": annotations_copy,
-                "calibration_frames": list(self.calibration.calibration_frames),
-                "video_metadata": self.video_metadata.copy(),
-                "camera_names": list(self.camera_names),
-                "best_individual": self.calibration.best_calibration,
+                "calibration_frames": list(self.calibration_frames),
+                "best_individual": self.rig.to_dict(),
             }
 
     # Persistence (Save / Load)
@@ -242,19 +236,9 @@ class AppState:
 
                 # Save calibration state
                 with open(folder / 'calibration_frames.json', 'w') as f:
-                    json.dump(self.calibration.calibration_frames, f)
+                    json.dump(self.calibration_frames, f)
 
-                if self.calibration.best_calibration is not None:
-                    with open(folder / 'catar_calibration.toml', 'w') as f:
-                        for cam_name, cam_data in self.calibration.best_calibration.items():
-                            f.write(f"[{cam_name}]\n")
-                            for key, value in cam_data.items():
-                                if isinstance(value, np.ndarray):
-                                    val_to_write = value.tolist()
-                                else:
-                                    val_to_write = value
-                                f.write(f"{key} = {json.dumps(val_to_write)}\n")
-                            f.write("\n")
+                self.rig.save(folder / 'rig.toml')
 
                 print("State saved successfully.")
             except Exception as e:
@@ -262,25 +246,16 @@ class AppState:
 
     def load_from_disk(self, folder: Path):
         """
-        Load persistent state from disk, supporting both legacy and new formats.
+        Load persistent state from disk.
         """
         print(f"Loading state from: '{folder}'")
 
         files_to_load = [
-            # (filename, file_type, attr_name)
             ('annotations.npy', 'numpy', 'annotations'),
             ('human_annotated.npy', 'numpy', 'human_annotated'),
             ('reconstructed_3d.npy', 'numpy', 'reconstructed_3d'),
-
-            # Fallback to legacy 3D filename
-            ('reconstructed_3d_points.npy', 'numpy', 'reconstructed_3d'),
-
-            # Calibration: try TOML first, then legacy pickle
-            ('catar_calibration.toml', 'toml', 'best_individual'),
-            ('best_individual.pkl', 'pickle', 'best_individual'),
-
             ('calibration_frames.json', 'json', 'calibration_frames'),
-            ('volume.toml', 'toml', 'volume_bounds'),
+            # Rig is loaded via CameraRig.load separately, checked below
         ]
 
         loaded_data = {}
@@ -290,172 +265,50 @@ class AppState:
             if not file_path.exists():
                 continue
 
-            # If we already loaded this attribute (e.g. found new 3d file), skip legacy one
-            if attr_name in loaded_data:
-                continue
-
             try:
                 if file_type == 'numpy':
                     loaded_data[attr_name] = np.load(file_path)
-                elif file_type == 'pickle':
-                    with file_path.open('rb') as f:
-                        loaded_data[attr_name] = pickle.load(f)
                 elif file_type == 'json':
                     with file_path.open('r') as f:
                         loaded_data[attr_name] = json.load(f)
-                elif file_type == 'toml':
-                    with file_path.open('rb') as f:
-                        loaded_data[attr_name] = tomllib.load(f)
                 print(f"  - Loaded '{filename}'")
             except Exception as e:
                 print(f"  - WARNING: Could not load '{filename}': {e}")
 
-        if not loaded_data:
-            print("No annotation/calibration state found. Starting fresh.")
-            return
+        # Load Rig
+        rig_path = folder / 'rig.toml'
+        if rig_path.exists():
+            try:
+                loaded_rig = CameraRig.load(rig_path)
 
-        if 'volume_bounds' in loaded_data:
-            # Expands bounds outwards to the next 0.5 just to be safe (e.g. 2.12 -> 2.50, -1.41 -> -1.50)
-            self.volume_bounds = {
-                axis: tuple(np.ceil(np.abs(data) * 2) / 2 * np.sign(data))
-                for axis, data in loaded_data['volume_bounds'].items()
-            }
-            self.scene_centre = np.vstack(list(self.volume_bounds.values())).mean(axis=1)
-
-            # TODO: should use mokap's rays_intersection_3d as a fallback to create the AABB
+                # Verify camera names match
+                if set(loaded_rig.names) == set(self.rig.names):
+                    self.rig = loaded_rig
+                    print("  - Loaded 'rig.toml'")
+                else:
+                    print("  - WARNING: Loaded rig camera names do not match current session.")
+            except Exception as e:
+                print(f"  - WARNING: Could not load rig.toml: {e}")
 
         with self.lock:
-            # Load into DataManager's arrays
+            # Load into DataManager arrays
             with self.data._lock:
-
-                # Load human annotation flags
                 if 'human_annotated' in loaded_data:
                     data = loaded_data['human_annotated']
-                    if data.shape != self.data.human_annotated.shape:
-                        print(f"  - WARNING: Shape mismatch for 'human_annotated'. "
-                              f"Disk: {data.shape}, Config: {self.data.human_annotated.shape}. Skipping.")
-                    else:
+                    if data.shape == self.data.human_annotated.shape:
                         self.data.human_annotated = data
 
-                # Load 3D reconstruction data
                 if 'reconstructed_3d' in loaded_data:
-                    loaded_pts = loaded_data['reconstructed_3d']
+                    data = loaded_data['reconstructed_3d']
+                    if data.shape[0] == self.num_frames and data.shape[1] == self.num_points:
+                         self.data.reconstructed_3d = data
 
-                    # Check frame/point count
-                    F_disk, P_disk = loaded_pts.shape[0], loaded_pts.shape[1]
-                    if F_disk != self.num_frames or P_disk != self.num_points:
-                        print(f"  - WARNING: Shape mismatch for 3D points. "
-                              f"Disk: {loaded_pts.shape}, Config: ({self.num_frames}, {self.num_points}, ...). Skipping.")
-                    else:
-                        # Handle legacy 3-channel data (old format was (N, 3))
-                        if loaded_pts.shape[-1] == 3:
-                            print("  - Converting legacy 3D points (N, 3) to (N, 4)...")
-                            new_pts = np.full((F_disk, P_disk, 4), np.nan, dtype=np.float32)
-                            new_pts[..., :3] = loaded_pts
-                            new_pts[..., 3] = np.nan  # No scores in legacy format
-                            self.data.reconstructed_3d = new_pts
-                        else:
-                            self.data.reconstructed_3d = loaded_pts
-
-                # Load annotation data
                 if 'annotations' in loaded_data:
                     annots = loaded_data['annotations']
+                    if annots.shape[0] == self.num_frames and annots.shape[1] == len(self.rig):
+                        self.data.annotations = annots
 
-                    # Check dimension consistency
-                    if annots.shape[0] != self.num_frames or \
-                       annots.shape[1] != self.num_videos or \
-                       annots.shape[2] != self.num_points:
-
-                        print(f"  - WARNING: Shape mismatch for annotations. "
-                              f"Disk: {annots.shape}, Config: ({self.num_frames}, {self.num_videos}, {self.num_points}). Skipping.")
-
-                    else:
-                        # Handle legacy 2-channel data (old format was (x, y) only)
-                        if annots.ndim == 4 and annots.shape[-1] == 2:
-                            print("  - Converting legacy 2D annotations to 3D (x, y, confidence)...")
-                            F, C, P, _ = annots.shape
-                            new_annots = np.full((F, C, P, 3), np.nan, dtype=np.float32)
-                            new_annots[..., :2] = annots
-
-                            # Add default confidence of 1.0 where points exist
-                            is_valid = ~np.isnan(annots[..., 0])
-                            new_annots[is_valid, 2] = 1.0
-
-                            old_order = ['avocado', 'coconut', 'banana', 'strawberry', 'blueberry']
-                            current_ranks = [self.camera_nti[key] for key in old_order]
-                            perm_indices = np.argsort(current_ranks)
-                            new_annots = new_annots[:, perm_indices, :]
-
-                            self.data.annotations = new_annots
-
-                        # Modern format with confidence
-                        elif annots.ndim == 4 and annots.shape[-1] == 3:
-                            self.data.annotations = annots
-                        else:
-                            print(f"  - WARNING: Loaded annotations have unsupported shape {annots.shape}. Skipping.")
-
-            # Load calibration data
             if 'calibration_frames' in loaded_data:
-                self.calibration.calibration_frames = loaded_data['calibration_frames']
-
-            if 'best_individual' in loaded_data:
-                loaded_calib = loaded_data['best_individual']
-
-                # Handle legacy CATAR calibration format (List[Dict] with old keys)
-                if isinstance(loaded_calib, list):
-                    if not self.camera_names:
-                        print("  - WARNING: Cannot convert legacy calibration without camera names. Skipping.")
-                        new_calib_dict = None
-
-                    elif len(loaded_calib) == len(self.camera_names):
-                        new_calib_dict: 'CalibrationDict' = {}
-
-                        for i, cam_name in enumerate(self.camera_names):
-                            old_params = loaded_calib[i]
-
-                            # Create K matrix from fx, fy, cx, cy (legacy keys)
-                            K = np.array([
-                                [old_params['fx'], 0.0, old_params['cx']],
-                                [0.0, old_params['fy'], old_params['cy']],
-                                [0.0, 0.0, 1.0]
-                            ], dtype=np.float32)
-
-                            # Map old keys to new keys
-                            new_params = {
-                                'camera_matrix': K,
-                                'dist_coeffs': old_params['dist'],
-                                'rvec': old_params['rvec'],
-                                'tvec': old_params['tvec'],
-                            }
-
-                            # Ensure all values are numpy arrays
-                            new_calib_dict[cam_name] = {
-                                k: np.asarray(v) if isinstance(v, (list, tuple)) else v
-                                for k, v in new_params.items()
-                            }
-
-                        print("  - Converted legacy calibration format (List[Dict] -> Dict[str, Dict]).")
-                    else:
-                        print(
-                            f"  - WARNING: Loaded calibration list length ({len(loaded_calib)}) "
-                            f"mismatch with video count ({len(self.camera_names)}). Skipping."
-                        )
-                        new_calib_dict = None
-
-                else:
-                    # Modern format (Dict) - Could be from Pickle (arrays) or TOML (lists)
-                    new_calib_dict = {}
-                    for cam_name, params in loaded_calib.items():
-                        new_params = {}
-                        for k, v in params.items():
-                            # Convert lists (from TOML) to numpy arrays
-                            if isinstance(v, list):
-                                new_params[k] = np.array(v)
-                            else:
-                                new_params[k] = v
-                        new_calib_dict[cam_name] = new_params
-
-                if new_calib_dict is not None:
-                    self.calibration.update_calibration(new_calib_dict)
+                self.calibration_frames = loaded_data['calibration_frames']
 
         print("State loading complete.")
