@@ -26,6 +26,28 @@ def toggle_tracker_collision_callback(sender, app_data, user_data):
         print(f"Tracker stops on collision: {status}")
 
 
+def set_tracking_algorithm_callback(sender, app_data, user_data):
+    """Callback to switch the tracking algorithm."""
+
+    queues = user_data["queues"]
+    selected_algo = app_data
+
+    algo_map = {
+        "Simple Kalman": "simple_kalman",
+        "IMM Kalman": "imm",
+        "Mokap": "mokap"
+    }
+
+    internal_id = algo_map.get(selected_algo, "simple_kalman")
+
+    print(f"Switching tracker to: {selected_algo}")
+
+    queues.tracking_command.put({
+        "action": "set_algorithm",
+        "algorithm": internal_id
+    })
+
+
 def batch_tracking_fwd_callback(sender, app_data, user_data):
     """Start forward batch tracking from current frame."""
 

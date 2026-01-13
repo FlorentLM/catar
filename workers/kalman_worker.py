@@ -3,7 +3,8 @@ import threading
 from typing import TYPE_CHECKING
 from video import BatchVideoReader
 
-from core.simple_tracker import SimpleTracker
+from core.trackers.tracker_kalman_simple import SimpleTracker
+from core.improved_tracker import create_tracker
 
 if TYPE_CHECKING:
     from state import AppState
@@ -14,6 +15,7 @@ class KalmanWorker(threading.Thread):
     def __init__(
             self,
             app_state: 'AppState',
+            bone_stats: 'BonesStats',
             video_backend: 'VideoBackend',
             reconstructor=None,
             tracker=None,
@@ -32,7 +34,7 @@ class KalmanWorker(threading.Thread):
         self.stop_batch_track_event = stop_batch_track
         self.shutdown_event = threading.Event()
 
-        self.simple_tracker = SimpleTracker(app_state)
+        self.tracker = create_tracker(app_state, True, bone_stats)
         self.prev_frames = None
         self.prev_frame_idx = -1
 
@@ -87,7 +89,7 @@ class KalmanWorker(threading.Thread):
             can_track = False
 
         if can_track:
-            self.simple_tracker.process_frame(
+            self.tracker.track_frame(
                 frame_idx=frame_idx,
                 prev_frame_idx=self.prev_frame_idx,
                 source_frames=self.prev_frames,
@@ -132,8 +134,8 @@ class KalmanWorker(threading.Thread):
         current_source_idx = start_frame
 
         # Re-init tracker for warm start
-        self.simple_tracker = SimpleTracker(self.app_state)
-        self.simple_tracker.initialize_tracks_from_frame(start_frame, direction=direction)
+        self.tracker = SimpleTracker(self.app_state)
+        self.tracker.initialize_tracks(start_frame, direction=direction)
 
         for i, dest_frame_idx in enumerate(frame_range):
             if self.stop_batch_track_event.is_set():
@@ -144,7 +146,7 @@ class KalmanWorker(threading.Thread):
             if not dest_frames:
                 break
 
-            self.simple_tracker.process_frame(
+            self.tracker.track_frame(
                 frame_idx=dest_frame_idx,
                 prev_frame_idx=current_source_idx,
                 source_frames=source_frames,

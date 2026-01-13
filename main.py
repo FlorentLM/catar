@@ -17,8 +17,8 @@ from gui import create_ui, update_ui, resize_video_widgets
 from gui.rendering import Viewer3D
 from utils import load_and_match_videos, compute_3d_scores
 from video import create_video_backend, DiskCacheBuilder, VideoReaderWorker
+
 from workers import GAWorker, BAWorker, TrackingWorker, RenderingWorker
-# from workers.kalman_worker import KalmanWorker
 
 from lucida import CameraRig
 
@@ -359,19 +359,9 @@ def main():
             frames_in_queue=queues.frames_for_tracking,
             progress_out_queue=queues.tracking_progress,
             command_queue=queues.tracking_command,
-            stop_batch_track=queues.stop_batch_track
+            stop_batch_track=queues.stop_batch_track,
+            bone_stats=bone_stats
         ),
-
-        # KalmanWorker(
-        #     app_state=app_state,
-        #     video_backend=video_backend,
-        #     reconstructor=reconstructor,
-        #     tracker=tracker,
-        #     frames_in_queue=queues.frames_for_tracking,
-        #     progress_out_queue=queues.tracking_progress,
-        #     command_queue=queues.tracking_command,
-        #     stop_batch_track=queues.stop_batch_track
-        # ),
 
         RenderingWorker(
             app_state,

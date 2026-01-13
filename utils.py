@@ -1,5 +1,4 @@
 import sys
-import tomllib
 from pathlib import Path
 from typing import List, Tuple
 
@@ -7,7 +6,8 @@ import Levenshtein
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from lucida import Intrinsics, Extrinsics, CameraModel, CameraRig
+from lucida import CameraRig
+from lucida.geometry.backend import xp
 
 
 def get_confidence_color(confidence: float) -> tuple:
@@ -206,3 +206,55 @@ def triangulate_and_score(
     points_4d[:, 3] = scores
 
     return points_4d
+
+# _______________________________________________________________
+
+# TODO: These might make their way into Lucida directly
+
+def robust_triangulate(rig, points_xp, cams_indices, max_reproj_error=15.0):
+    """
+    RANSAC-style triangulation.
+    """
+    current_cams = list(cams_indices)
+    current_pts_xp = list(points_xp)
+
+    while len(current_cams) >= 2:
+        pts_stack = xp.stack(current_pts_xp)
+        pts_in = pts_stack[:, None, :]  # (C, 1, 2)
+        cam_names = [rig.names[i] for i in current_cams]
+
+        pt_3d_xp = rig.triangulate(pts_in, cameras=cam_names).flatten()
+
+        if xp.isnan(pt_3d_xp).any():
+            break
+
+        reproj_xp = rig.project(pt_3d_xp.reshape(1, 3), cameras=cam_names).flatten().reshape(len(current_cams), 2)
+
+        errors = []
+        for i in range(len(current_cams)):
+            dist = xp.linalg.norm(reproj_xp[i] - current_pts_xp[i])
+            errors.append(float(dist))
+
+        if max(errors) < max_reproj_error:
+            return pt_3d_xp, current_cams
+
+        worst = np.argmax(errors)
+        current_cams.pop(worst)
+        current_pts_xp.pop(worst)
+
+    return None, []
+
+
+def snap_to_ray(rig, cam_idx, uv, target_point_3d):
+    """
+    Find point on ray closest to a 3D target.
+    """
+    cam = rig[rig.names[cam_idx]]
+    uv_xp = xp.asarray(uv)
+    origin_xp, dir_xp = cam.raycast(uv_xp)
+    dir_xp = dir_xp.flatten()
+    target_xp = xp.asarray(target_point_3d)
+
+    t = xp.dot(target_xp - origin_xp, dir_xp)
+    t = xp.maximum(t, 0.1)
+    return np.asarray(origin_xp + t * dir_xp)

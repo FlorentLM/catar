@@ -22,7 +22,8 @@ from gui.callbacks.tracking_callbacks import (
     toggle_realtime_tracking_callback,
     toggle_tracker_collision_callback,
     batch_tracking_fwd_callback,
-    batch_tracking_bwd_callback
+    batch_tracking_bwd_callback,
+    set_tracking_algorithm_callback
 )
 from gui.callbacks.general_callbacks import (
     toggle_epipolar_lines_callback,
@@ -281,6 +282,16 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues'):
     dpg.add_separator()
 
     with dpg.collapsing_header(label="Tracking", default_open=True):
+        dpg.add_text("Algorithm:")
+        dpg.add_combo(
+            items=["Simple Kalman", "IMM Kalman", "Mokap"],
+            default_value="Simple Kalman",
+            callback=set_tracking_algorithm_callback,
+            user_data=user_data,
+            width=-1
+        )
+        dpg.add_separator()
+
         dpg.add_checkbox(
             label="Stop on collision",
             default_value=app_state.tracker_collision_stop,

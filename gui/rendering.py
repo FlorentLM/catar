@@ -238,6 +238,9 @@ def update_annotation_overlays(app_state: 'AppState'):
         camera_colors = app_state.camera_colors
         p_idx = app_state.selected_point_idx
 
+        focus_mode = app_state.focus_selected_point
+        show_all_labels = app_state.show_all_labels
+
     all_annotations = app_state.data.get_frame_annotations(frame_idx)
     all_human = app_state.data.get_human_annotated_flags(frame_idx)
     selected_annots = app_state.data.get_point_annotations(frame_idx, p_idx)
@@ -287,7 +290,9 @@ def update_annotation_overlays(app_state: 'AppState'):
                 annotations=all_annotations,
                 human_annotated=all_human,
                 scale_x=scale_x, scale_y=scale_y,
-                layer_tag=layer_tag
+                layer_tag=layer_tag,
+                focus_mode=focus_mode,
+                show_all_labels=show_all_labels
             )
 
 
