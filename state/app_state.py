@@ -91,7 +91,6 @@ class AppState:
         for name, path in zip(rig.names, self.video_paths):
             self._video_metadata[name] = probe_video(path)
 
-            # Update rig image sizes and scale K if mismatch (e.g. using proxies)
             cam = rig[name]
             vid_w = self._video_metadata[name]['width']
             vid_h = self._video_metadata[name]['height']

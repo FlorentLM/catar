@@ -39,20 +39,14 @@ def prepare_refinement(rig: CameraRig, snapshot: Dict[str, Any]) -> Tuple[Dict[s
     points_2d = annots_subset[..., :2]
     visibility = ~np.isnan(points_2d[..., 0])
 
-    # Fill nans with 0 (masked by visibility anyway)
-    points_2d = np.nan_to_num(points_2d, nan=0.0)
-
-    # Initial triangulation to find outliers and nuke them
     C, P, N, _ = points_2d.shape
-
-    # Scaffolding mode so treat every frame's points as unique in time
-    points_2d_flat = points_2d.reshape(C, P * N, 2)
 
     print("[BA] Performing initialisation check...")
     metrics = rig.compute_metrics(
-        points2d=points_2d_flat,
+        points2d=points_2d,
+        weights=visibility.astype(np.float32),
         per_point=True,
-        commit=False  # don't overwrite yet
+        commit=False
     )
 
     # Initial 3D points
@@ -61,16 +55,25 @@ def prepare_refinement(rig: CameraRig, snapshot: Dict[str, Any]) -> Tuple[Dict[s
 
     # Points with high initial error are mislabeled or bad LK tracks
     outlier_threshold = 20.0  # pixels
-    valid_mask = mre_per_point < outlier_threshold
 
-    # Also ignore points that failed triangulation
-    valid_mask &= np.all(np.isfinite(points_3d_flat), axis=-1)
+    # Fill nans with 0 (masked by visibility anyway)
+    points_2d = np.nan_to_num(points_2d, nan=0.0)
 
-    num_outliers = (P * N) - np.sum(valid_mask)
-    if num_outliers > 0:
-        print(f"[BA] Init: Ignoring {num_outliers} outliers (Error > {outlier_threshold:.2f}px)")
-        mask_reshaped = valid_mask.reshape(1, P, N)
-        visibility &= mask_reshaped
+    # Find points that were actually triangulated (seen in >= 2 cameras)
+    successfully_triangulated = np.all(np.isfinite(points_3d_flat), axis=-1)
+
+    # Filter for high error ONLY on the points that exist
+    good_error = mre_per_point < outlier_threshold
+
+    # Combine masks
+    valid_mask = successfully_triangulated & good_error
+
+    # Reporting
+    num_high_error = np.sum(successfully_triangulated & ~good_error)
+
+    print(f"[BA] Init: {np.sum(valid_mask)} valid points ready for BA.")
+    if num_high_error > 0:
+        print(f"[BA] Rejected {num_high_error} outliers (Error > {outlier_threshold:.2f}px)")
 
     # Set invalid points to the centre of the valid cloud just to be safe for JAX
     if np.any(valid_mask):

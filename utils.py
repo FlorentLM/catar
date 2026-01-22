@@ -51,13 +51,13 @@ def load_and_match_videos(data_folder: Path, video_format: str) -> Tuple[
     if rig_file.exists():
         print(f"Loading Lucida rig from '{rig_file}'...")
         rig = CameraRig.load(rig_file)
-        toml_names = sorted(rig.names)
+        toml_names = rig.names
     else:
         print(f"ERROR: No calibration file ('rig.toml') found in '{data_folder}'")
         sys.exit(1)
 
     # Find video files
-    video_paths = sorted(data_folder.glob(video_format))
+    video_paths = sorted(data_folder.glob(f'*.{video_format.strip("*.")}'))
     if not video_paths:
         print(f"ERROR: No videos matching '{video_format}' found in '{data_folder}'")
         sys.exit(1)
