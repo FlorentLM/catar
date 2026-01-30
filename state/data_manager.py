@@ -115,7 +115,20 @@ class DataManager:
                 if p is not None:
                     self._cached_points3d[f, p] = [row['x'], row['y'], row['z'], row['confidence']]
 
-        self._numpy_cache_valid = True
+        if len(self._points2d) > 0:
+            manual_df = self._points2d.select(['frame', 'camera', 'keypoint', 'is_manual']
+                                              ).filter(pl.col('is_manual').is_not_null())
+            # Reset flags
+            self._manual_flags[:] = False
+
+            for row in manual_df.iter_rows(named=True):
+                f, c, p = row['frame'], self._cam_to_idx.get(row['camera']), self._kp_to_idx.get(row['keypoint'])
+                is_man = row['is_manual']
+
+                if c is not None and p is not None and is_man:
+                    self._manual_flags[f, c, p] = True
+
+            self._numpy_cache_valid = True
 
     # Public access
 
@@ -169,10 +182,7 @@ class DataManager:
             except ValueError:
                 raise ValueError(f"2D Data shape mismatch. {data.shape} cannot broadcast to {target_shape + (3,)}")
 
-        if isinstance(is_manual, (bool, np.bool_)):
-            is_manual_arr = np.full(target_shape, is_manual, dtype=bool)
-        else:
-            is_manual_arr = np.broadcast_to(np.asanyarray(is_manual, dtype=bool), target_shape)
+        is_manual_arr = np.broadcast_to(np.asanyarray(is_manual, dtype=bool), target_shape)
 
         with self.bulk_lock():
             c_names = [self.camera_names[i] for i in c_idx]
@@ -190,27 +200,20 @@ class DataManager:
                 grid_f, grid_c, grid_p = np.meshgrid(f_idx, c_names, p_names, indexing='ij')
 
                 new_df = pl.DataFrame({
-                    "frame": grid_f[valid_mask],
-                    "camera": grid_c[valid_mask],
-                    "keypoint": grid_p[valid_mask],
-                    "x": data[..., 0][valid_mask],
-                    "y": data[..., 1][valid_mask],
-                    "score": data[..., 2][valid_mask],
-                    "is_h": is_manual_arr[valid_mask]
+                    "frame": grid_f[valid_mask].flatten(),
+                    "camera": grid_c[valid_mask].flatten(),
+                    "keypoint": grid_p[valid_mask].flatten(),
+                    "x": data[..., 0][valid_mask].flatten(),
+                    "y": data[..., 1][valid_mask].flatten(),
+                    "score": data[..., 2][valid_mask].flatten(),
+                    "is_manual": is_manual_arr[valid_mask].flatten()
                 })
-
-                new_df = new_df.with_columns(
-                    pl.when(pl.col("is_h"))
-                    .then(pl.lit("catar_manual"))
-                    .otherwise(pl.lit("catar"))
-                    .alias("source")
-                ).drop("is_h")
 
                 new_df = add_optional_columns(new_df, 'Points2D')
                 cast_ops = [pl.col(c.name).cast(c.polars_dtype) for c in SCHEMAS['Points2D'] if c.name in new_df.columns]
                 self._points2d = pl.concat([self._points2d, new_df.with_columns(cast_ops)], how='diagonal')
 
-            # Cache & flag update
+            # Cache update
             target_slice = np.ix_(f_idx, c_idx, p_idx)
             if self._numpy_cache_valid:
                 self._cached_annotations[target_slice] = data
@@ -343,8 +346,6 @@ class DataManager:
                     schema_name='Tracks3D'
                 )
 
-            np.save(directory / f'{prefix}_manual_flags.npy', self._manual_flags)
-
     def load(self, directory: Path, prefix: str = 'catar'):
         """
         Load data from disk.
@@ -378,20 +379,5 @@ class DataManager:
                 )
             else:
                 self._points3d = empty_dataframe('Tracks3D')
-
-            # Load "is manual" flags
-            flags_path = directory / f'{prefix}_manual_flags.npy'
-            if flags_path.exists():
-                loaded_flags = np.load(flags_path)
-                if loaded_flags.shape == self._manual_flags.shape:
-                    self._manual_flags = loaded_flags
-
-                else:
-                    print(f'[WARN] Flag "manual" shape mismatch: {loaded_flags.shape} vs. {self._manual_flags.shape}')
-                    # Copy what we can
-                    min_f = min(loaded_flags.shape[0], self._manual_flags.shape[0])
-                    min_c = min(loaded_flags.shape[1], self._manual_flags.shape[1])
-                    min_p = min(loaded_flags.shape[2], self._manual_flags.shape[2])
-                    self._manual_flags[:min_f, :min_c, :min_p] = loaded_flags[:min_f, :min_c, :min_p]
 
             self._invalidate_cache()

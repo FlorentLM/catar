@@ -265,8 +265,7 @@ class AppState:
 
         data_files_exist = (
             (folder / 'catar_points2d.parquet').exists() or
-            (folder / 'catar_points3d.parquet').exists() or
-            (folder / 'catar_manual_flags.npy').exists()
+            (folder / 'catar_points3d.parquet').exists()
         )
 
         # Load data
