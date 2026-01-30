@@ -1,578 +1,397 @@
 """
-Centralized data access layer for annotations and 3D reconstructions.
+CATAR data manager for 2D annotations and 3D reconstructed points (wraps mokap's Polars backend).
 """
 import threading
+from pathlib import Path
+from typing import Optional, List, Union, Sequence
 import numpy as np
-from typing import Optional
+import polars as pl
+
+from mokap.mokap_io.schemas import SCHEMAS, add_optional_columns, empty_dataframe
+from mokap.mokap_io.loaders import load_dataframe
+from mokap.mokap_io.savers import save_dataframe
+
+IndexLike = Union[int, np.integer, str, slice, Sequence[Union[int, str]], None]
 
 
 class DataManager:
-    """
-    Centralized manager for all annotation and 3D point data.
-    All array indexing is validated.
-    """
+    def __init__(self, nb_frames: int, camera_names: List[str], keypoint_names: List[str]):
+        self.camera_names = list(camera_names)
+        self.keypoint_names = list(keypoint_names)
 
-    def __init__(self, n_frames: int, n_cameras: int, n_points: int):
-        """
-        Initialize data manager with empty arrays.
+        self.nb_frames = nb_frames
+        self.nb_cameras = len(camera_names)
+        self.nb_points = len(keypoint_names)
 
-        Args:
-            n_frames: Total number of frames in videos
-            n_cameras: Number of camera views
-            n_points: Number of keypoints per skeleton
-        """
-        self.n_frames = n_frames
-        self.n_cameras = n_cameras
-        self.n_points = n_points
+        self._cam_to_idx = {name: i for i, name in enumerate(camera_names)}
+        self._kp_to_idx = {name: i for i, name in enumerate(keypoint_names)}
 
-        # Core data arrays
-        # Shape (F, C, P, 3) where last dim is (x, y, confidence)
-        self.annotations = np.full(
-            (n_frames, n_cameras, n_points, 3),
-            np.nan,
-            dtype=np.float32
-        )
+        self._points2d: pl.DataFrame = empty_dataframe('Points2D')
+        self._points3d: pl.DataFrame = empty_dataframe('Tracks3D')
 
-        # Shape (F, P, 4) where last dim is (x, y, z, score/confidence)
-        self.reconstructed_3d = np.full(
-            (n_frames, n_points, 4),
-            np.nan,
-            dtype=np.float32
-        )
-
-        # Shape (F, C, P), boolean flags indicating human annotation
-        self.human_annotated = np.zeros(
-            (n_frames, n_cameras, n_points),
-            dtype=bool
-        )
+        self._manual_flags = np.zeros((nb_frames, self.nb_cameras, self.nb_points), dtype=bool)
 
         self._lock = threading.RLock()
 
-    # Context managers for lock control
+        self._numpy_cache_valid = False
+        self._cached_annotations = None
+        self._cached_points3d = None
+
+    # Context managers and resolvers
 
     class _ReadLock:
-        """Context manager for read operations."""
         def __init__(self, lock):
             self._lock = lock
-
         def __enter__(self):
             self._lock.acquire()
             return self
-
-        def __exit__(self, *args):
-            self._lock.release()
+        def __exit__(self, *args): self._lock.release()
 
     class _BulkLock:
-        """Context manager for bulk operations."""
-        def __init__(self, lock):
-            self._lock = lock
-
+        def __init__(self, manager: 'DataManager'):
+            self._manager = manager
         def __enter__(self):
-            self._lock.acquire()
+            self._manager._lock.acquire()
             return self
-
         def __exit__(self, *args):
-            self._lock.release()
+            self._manager._invalidate_cache()
+            self._manager._lock.release()
 
     def read_lock(self):
-        """
-        Context manager to use when multiple reads need to be consistent with each other.
-
-        Example:
-            with data.read_lock():
-                annots = data.get_frame_annotations(frame_idx)
-                points = data.get_3d_points(frame_idx)
-                # These are guaranteed to be from the same moment
-        """
         return self._ReadLock(self._lock)
 
     def bulk_lock(self):
+        return self._BulkLock(self)
+
+    def _resolve(self, val: IndexLike, max_len: int, name_map: Optional[dict] = None) -> np.ndarray:
+        """Turns indices into an array of integers for indexing."""
+
+        if val is None:
+            return np.arange(max_len)
+
+        if isinstance(val, (np.integer, int)):
+            return np.array([val])
+
+        if isinstance(val, str):
+            return np.array([name_map[val]])
+
+        if isinstance(val, slice):
+            return np.arange(*val.indices(max_len))
+
+        if isinstance(val, (list, tuple, np.ndarray, Sequence)):
+            # Flatten potential nested sequences
+            indices = []
+            for item in val:
+                indices.extend(self._resolve(item, max_len, name_map))
+            return np.array(indices)
+
+        raise TypeError(f"Unsupported type: {type(val)}")
+
+    def _invalidate_cache(self):
+
+        self._numpy_cache_valid = False
+        self._cached_annotations = None
+        self._cached_points3d = None
+
+    def _ensure_numpy_cache(self):
+
+        if self._numpy_cache_valid:
+            return
+
+        self._cached_annotations = np.full((self.nb_frames, self.nb_cameras, self.nb_points, 3), np.nan, dtype=np.float32)
+        self._cached_points3d = np.full((self.nb_frames, self.nb_points, 4), np.nan, dtype=np.float32)
+
+        if len(self._points2d) > 0:
+            for row in self._points2d.iter_rows(named=True):
+                f, c, p = row['frame'], self._cam_to_idx.get(row['camera']), self._kp_to_idx.get(row['keypoint'])
+
+                if c is not None and p is not None:
+                    self._cached_annotations[f, c, p] = [row['x'], row['y'], row['score']]
+
+        if len(self._points3d) > 0:
+            for row in self._points3d.iter_rows(named=True):
+                f, p = row['frame'], self._kp_to_idx.get(row['keypoint'])
+
+                if p is not None:
+                    self._cached_points3d[f, p] = [row['x'], row['y'], row['z'], row['confidence']]
+
+        self._numpy_cache_valid = True
+
+    # Public access
+
+    def get_2d(self, frame: IndexLike = None, camera: IndexLike = None, keypoint: IndexLike = None,
+               copy: bool = False) -> np.ndarray:
         """
-        Context manager for bulk operations (multiple writes or direct access).
+        2D point data getter.
 
-        Example:
-            with data.bulk_lock():
-                for i in range(10):
-                    data.set_annotation_2d_unsafe(frame, cam, i, xy, conf)
-                # Lock acquired once for all operations
+        Args:
+           frame, camera, keypoint: Identifiers (int, str, slice, sequence)
+           copy: Whether to copy the data
         """
-        return self._BulkLock(self._lock)
 
-    # Validation
+        with self._lock:
+            self._ensure_numpy_cache()
+            f_idx = self._resolve(frame, self.nb_frames)
+            c_idx = self._resolve(camera, self.nb_cameras, self._cam_to_idx)
+            p_idx = self._resolve(keypoint, self.nb_points, self._kp_to_idx)
 
-    def _validate_frame_idx(self, frame_idx: int):
-        """Validate frame index is in bounds."""
-        if not (0 <= frame_idx < self.n_frames):
-            raise IndexError(
-                f"Frame index {frame_idx} out of range [0, {self.n_frames})"
+            res = self._cached_annotations[np.ix_(f_idx, c_idx, p_idx)]
+            res = np.squeeze(res)
+            return res.copy() if copy else res
+
+    def set_2d(self, frame: IndexLike = None, camera: IndexLike = None, keypoint: IndexLike = None,
+               data: np.ndarray = None, is_manual: Union[bool, np.ndarray] = False):
+        """
+        2D point data setter.
+
+        Args:
+            frame, camera, keypoint: Identifiers (int, str, slice, sequence)
+            data: np.ndarray of shape (len(f), len(c), len(p), 2 or 3) or (2 or 3,) to broadcast
+            is_manual: bool or np.ndarray of shape (len(f), len(c), len(p)) or broadcastable
+        """
+        f_idx = self._resolve(frame, self.nb_frames)
+        c_idx = self._resolve(camera, self.nb_cameras, self._cam_to_idx)
+        p_idx = self._resolve(keypoint, self.nb_points, self._kp_to_idx)
+        target_shape = (len(f_idx), len(c_idx), len(p_idx))
+
+        if data is None:
+            data = np.full(target_shape + (3,), np.nan, dtype=np.float32)
+        else:
+            data = np.asanyarray(data, dtype=np.float32)
+
+            # Pad score if missing
+            if data.shape[-1] == 2:
+                padding = np.full(data.shape[:-1] + (1,), np.nan, dtype=np.float32)
+                data = np.concatenate([data, padding], axis=-1)
+
+            try:
+                data = np.broadcast_to(data, target_shape + (3,))
+            except ValueError:
+                raise ValueError(f"2D Data shape mismatch. {data.shape} cannot broadcast to {target_shape + (3,)}")
+
+        if isinstance(is_manual, (bool, np.bool_)):
+            is_manual_arr = np.full(target_shape, is_manual, dtype=bool)
+        else:
+            is_manual_arr = np.broadcast_to(np.asanyarray(is_manual, dtype=bool), target_shape)
+
+        with self.bulk_lock():
+            c_names = [self.camera_names[i] for i in c_idx]
+            p_names = [self.keypoint_names[i] for i in p_idx]
+
+            self._points2d = self._points2d.filter(
+                ~((pl.col('frame').is_in(f_idx)) &
+                  (pl.col('camera').is_in(c_names)) &
+                  (pl.col('keypoint').is_in(p_names)))
             )
 
-    def _validate_camera_idx(self, cam_idx: int):
-        """Validate camera index is in bounds."""
-        if not (0 <= cam_idx < self.n_cameras):
-            raise IndexError(
-                f"Camera index {cam_idx} out of range [0, {self.n_cameras})"
+            valid_mask = ~np.isnan(data[..., 0])
+
+            if np.any(valid_mask):
+                grid_f, grid_c, grid_p = np.meshgrid(f_idx, c_names, p_names, indexing='ij')
+
+                new_df = pl.DataFrame({
+                    "frame": grid_f[valid_mask],
+                    "camera": grid_c[valid_mask],
+                    "keypoint": grid_p[valid_mask],
+                    "x": data[..., 0][valid_mask],
+                    "y": data[..., 1][valid_mask],
+                    "score": data[..., 2][valid_mask],
+                    "is_h": is_manual_arr[valid_mask]
+                })
+
+                new_df = new_df.with_columns(
+                    pl.when(pl.col("is_h"))
+                    .then(pl.lit("catar_manual"))
+                    .otherwise(pl.lit("catar"))
+                    .alias("source")
+                ).drop("is_h")
+
+                new_df = add_optional_columns(new_df, 'Points2D')
+                cast_ops = [pl.col(c.name).cast(c.polars_dtype) for c in SCHEMAS['Points2D'] if c.name in new_df.columns]
+                self._points2d = pl.concat([self._points2d, new_df.with_columns(cast_ops)], how='diagonal')
+
+            # Cache & flag update
+            target_slice = np.ix_(f_idx, c_idx, p_idx)
+            if self._numpy_cache_valid:
+                self._cached_annotations[target_slice] = data
+
+            self._manual_flags[target_slice] = is_manual_arr
+
+    def get_3d(self, frame: IndexLike = None, keypoint: IndexLike = None, copy: bool = False) -> np.ndarray:
+        """
+        3D point data getter.
+
+        Args:
+            frame, keypoint: Identifiers (int, str, slice, sequence)
+            copy: Whether to copy the data
+        """
+
+        with self._lock:
+            self._ensure_numpy_cache()
+            f_idx = self._resolve(frame, self.nb_frames)
+            p_idx = self._resolve(keypoint, self.nb_points, self._kp_to_idx)
+            res = self._cached_points3d[np.ix_(f_idx, p_idx)]
+            res = np.squeeze(res)
+            return res.copy() if copy else res
+
+    def set_3d(self, frame: IndexLike = None, keypoint: IndexLike = None, data: np.ndarray = None):
+        """
+        3D point data setter.
+
+        Args:
+            frame, keypoint: Identifiers (int, str, slice, sequence)
+            data: np.ndarray of shape (len(f), len(c), len(p), 3 or 4) or (3 or 4,) to broadcast
+        """
+
+        f_idx = self._resolve(frame, self.nb_frames)
+        p_idx = self._resolve(keypoint, self.nb_points, self._kp_to_idx)
+        target_shape = (len(f_idx), len(p_idx))
+
+        if data is None:
+            data = np.full(target_shape + (4,), np.nan, dtype=np.float32)
+        else:
+            data = np.asanyarray(data, dtype=np.float32)
+
+            # Pad confidence if missing
+            if data.shape[-1] == 3:
+                padding = np.full(data.shape[:-1] + (1,), np.nan, dtype=np.float32)
+                data = np.concatenate([data, padding], axis=-1)
+
+            try:
+                data = np.broadcast_to(data, target_shape + (4,))
+            except ValueError:
+                raise ValueError(f"3D Data shape mismatch. {data.shape} cannot broadcast to {target_shape + (4,)}")
+
+        with self.bulk_lock():
+            p_names = [self.keypoint_names[i] for i in p_idx]
+
+            self._points3d = self._points3d.filter(
+                ~((pl.col('frame').is_in(f_idx)) & (pl.col('keypoint').is_in(p_names)))
             )
 
-    def _validate_point_idx(self, point_idx: int):
-        """Validate point index is in bounds."""
-        if not (0 <= point_idx < self.n_points):
-            raise IndexError(
-                f"Point index {point_idx} out of range [0, {self.n_points})"
-            )
+            valid_mask = ~np.isnan(data[..., 0])
+            if np.any(valid_mask):
+                grid_f, grid_p = np.meshgrid(f_idx, p_names, indexing='ij')
 
-    # Read operations - 2D annotations
+                new_df = pl.DataFrame({
+                    "frame": grid_f[valid_mask],
+                    "keypoint": grid_p[valid_mask],
+                    "x": data[..., 0][valid_mask],
+                    "y": data[..., 1][valid_mask],
+                    "z": data[..., 2][valid_mask],
+                    "confidence": data[..., 3][valid_mask],
+                    "track_id": 0
+                })
 
-    def get_annotation(
-        self,
-        frame_idx: int,
-        cam_idx: int,
-        point_idx: int,
-        copy: bool = False
-    ) -> np.ndarray:
+                new_df = add_optional_columns(new_df, 'Tracks3D')
+                cast_ops = [pl.col(c.name).cast(c.polars_dtype) for c in SCHEMAS['Tracks3D'] if
+                            c.name in new_df.columns]
+                self._points3d = pl.concat([self._points3d, new_df.with_columns(cast_ops)], how='diagonal')
+
+            # Cache sync
+            target_slice = np.ix_(f_idx, p_idx)
+            if self._numpy_cache_valid: self._cached_points3d[target_slice] = data
+
+
+    def is_manual(self, frame: IndexLike = None, camera: IndexLike = None,
+                     keypoint: IndexLike = None, value: Optional[bool] = None) -> Union[np.ndarray, None]:
         """
-        Get a single 2D annotation point.
+        Accessor for "manual annotation" flags.
 
         Args:
-            frame_idx: Frame index
-            cam_idx: Camera index
-            point_idx: Point/keypoint index
-            copy: If True, return a copy instead of view (default: False)
-
-        Returns:
-            Array of shape (3,) containing (x, y, confidence)
-            By default returns a view (zero-copy) for performance
+            frame, camera, keypoint: Identifiers (int, str, slice, sequence)
+            data: np.ndarray of shape (len(f), len(c), len(p), 3 or 4) or (3 or 4,) to broadcast
         """
-        self._validate_frame_idx(frame_idx)
-        self._validate_camera_idx(cam_idx)
-        self._validate_point_idx(point_idx)
+        f_idx = self._resolve(frame, self.nb_frames)
+        c_idx = self._resolve(camera, self.nb_cameras, self._cam_to_idx)
+        p_idx = self._resolve(keypoint, self.nb_points, self._kp_to_idx)
 
         with self._lock:
-            result = self.annotations[frame_idx, cam_idx, point_idx]
-            return result.copy() if copy else result
+            target_slice = np.ix_(f_idx, c_idx, p_idx)
+            if value is None:
+                return np.squeeze(self._manual_flags[target_slice])
 
-    def get_frame_annotations(self, frame_idx: int, copy: bool = False) -> np.ndarray:
+            self._manual_flags[target_slice] = value
+            return None
+
+    # Persistence
+
+    def save(self, directory: Path, prefix: str = 'catar'):
         """
-        Get all annotations for a single frame across all cameras.
+        Save data to disk.
 
-        Args:
-            frame_idx: Frame index
-            copy: If True, return a copy instead of view (default: False)
-
-        Returns:
-            Array of shape (C, P, 3), view into data array (zero-copy)
+        Creates:
+        - {prefix}_points2d.parquet (Points2D schema)
+        - {prefix}_points3d.parquet (Tracks3D schema)
+        - {prefix}_manual_flags.npy (numpy array)    # TODO: Might deprecate this
         """
-        self._validate_frame_idx(frame_idx)
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
 
         with self._lock:
-            result = self.annotations[frame_idx]
-            return result.copy() if copy else result
-
-    def get_camera_annotations(
-        self,
-        frame_idx: int,
-        cam_idx: int,
-        copy: bool = False
-    ) -> np.ndarray:
-        """
-        Get all annotations for a single camera view at a frame.
-
-        Args:
-            frame_idx: Frame index
-            cam_idx: Camera index
-            copy: If True, return a copy instead of view (default: False)
-
-        Returns:
-            Array of shape (P, 3), view into data array (zero-copy)
-        """
-        self._validate_frame_idx(frame_idx)
-        self._validate_camera_idx(cam_idx)
-
-        with self._lock:
-            result = self.annotations[frame_idx, cam_idx]
-            return result.copy() if copy else result
-
-    def get_point_annotations(
-        self,
-        frame_idx: int,
-        point_idx: int,
-        copy: bool = False
-    ) -> np.ndarray:
-        """
-        Get annotations for a single point across all cameras.
-
-        Args:
-            frame_idx: Frame index
-            point_idx: Point/keypoint index
-            copy: If True, return a copy instead of view (default: False)
-
-        Returns:
-            Array of shape (C, 3), view into data array (zero-copy)
-        """
-        self._validate_frame_idx(frame_idx)
-        self._validate_point_idx(point_idx)
-
-        with self._lock:
-            result = self.annotations[frame_idx, :, point_idx]
-            return result.copy() if copy else result
-
-    def get_annotation_range(
-        self,
-        start_frame: int,
-        end_frame: int,
-        copy: bool = False
-    ) -> np.ndarray:
-        """
-        Get annotations for a range of frames.
-
-        Args:
-            start_frame: First frame (inclusive)
-            end_frame: Last frame (inclusive)
-            copy: If True, return a copy instead of view (default: False)
-
-        Returns:
-            Array of shape (F, C, P, 3), view into data array (zero-copy)
-        """
-        self._validate_frame_idx(start_frame)
-        self._validate_frame_idx(end_frame)
-
-        if start_frame > end_frame:
-            raise ValueError(f"start_frame {start_frame} > end_frame {end_frame}")
-
-        with self._lock:
-            result = self.annotations[start_frame:end_frame+1]
-            return result.copy() if copy else result
-
-    # Read operations - 3D points
-
-    def get_point3d(
-        self,
-        frame_idx: int,
-        point_idx: int,
-        copy: bool = False
-    ) -> np.ndarray:
-        """
-        Get a single 3D reconstructed point.
-
-        Args:
-            frame_idx: Frame index
-            point_idx: Point/keypoint index
-            copy: If True, return a copy instead of view (default: False)
-
-        Returns:
-            Array of shape (4,), view into data array (zero-copy)
-        """
-        self._validate_frame_idx(frame_idx)
-        self._validate_point_idx(point_idx)
-
-        with self._lock:
-            result = self.reconstructed_3d[frame_idx, point_idx]
-            return result.copy() if copy else result
-
-    def get_frame_points3d(self, frame_idx: int, copy: bool = False) -> np.ndarray:
-        """
-        Get all 3D reconstructed points for a frame.
-
-        Args:
-            frame_idx: Frame index
-            copy: If True, return a copy instead of view (default: False)
-
-        Returns:
-            Array of shape (P, 4), view into data array (zero-copy)
-        """
-        self._validate_frame_idx(frame_idx)
-
-        with self._lock:
-            result = self.reconstructed_3d[frame_idx]
-            return result.copy() if copy else result
-
-    def get_points3d_range(
-        self,
-        start_frame: int,
-        end_frame: int,
-        copy: bool = False
-    ) -> np.ndarray:
-        """
-        Get 3D points for a range of frames.
-
-        Args:
-            start_frame: First frame (inclusive)
-            end_frame: Last frame (inclusive)
-            copy: If True, return a copy instead of view (default: False)
-
-        Returns:
-            Array of shape (F, P, 4), view into data array (zero-copy)
-        """
-        self._validate_frame_idx(start_frame)
-        self._validate_frame_idx(end_frame)
-
-        if start_frame > end_frame:
-            raise ValueError(f"start_frame {start_frame} > end_frame {end_frame}")
-
-        with self._lock:
-            result = self.reconstructed_3d[start_frame:end_frame+1]
-            return result.copy() if copy else result
-
-    # Read operations - Human annotation flags
-
-    def is_human_annotated(
-        self,
-        frame_idx: int,
-        cam_idx: int,
-        point_idx: int
-    ) -> bool:
-        """
-        Check if a specific annotation was created/modified by a human.
-
-        Args:
-            frame_idx: Frame index
-            cam_idx: Camera index
-            point_idx: Point/keypoint index
-
-        Returns:
-            True if this annotation is human-generated
-        """
-        self._validate_frame_idx(frame_idx)
-        self._validate_camera_idx(cam_idx)
-        self._validate_point_idx(point_idx)
-
-        with self._lock:
-            return bool(self.human_annotated[frame_idx, cam_idx, point_idx])
-
-    def get_human_annotated_flags(
-        self,
-        frame_idx: int,
-        copy: bool = False
-    ) -> np.ndarray:
-        """
-        Get all human annotation flags for a frame.
-
-        Args:
-            frame_idx: Frame index
-            copy: If True, return a copy instead of view (default: False)
-
-        Returns:
-            Array of shape (C, P), view into data array (zero-copy)
-        """
-        self._validate_frame_idx(frame_idx)
-
-        with self._lock:
-            result = self.human_annotated[frame_idx]
-            return result.copy() if copy else result
-
-    # Write operations - 2D annotations
-
-    def set_annotation(
-        self,
-        frame_idx: int,
-        cam_idx: int,
-        point_idx: int,
-        xy: np.ndarray,
-        confidence: float,
-        is_human: bool = False
-    ):
-        """
-        Set a single 2D annotation.
-
-        Args:
-            frame_idx: Frame index
-            cam_idx: Camera index
-            point_idx: Point/keypoint index
-            xy: Coordinates as array of shape (2,)
-            confidence: Confidence value (typically 0.0 to 1.0)
-            is_human: Whether this is a human annotation
-        """
-        self._validate_frame_idx(frame_idx)
-        self._validate_camera_idx(cam_idx)
-        self._validate_point_idx(point_idx)
-
-        if xy.shape != (2,):
-            raise ValueError(f"xy must have shape (2,), got {xy.shape}")
-
-        with self._lock:
-            self.annotations[frame_idx, cam_idx, point_idx, :2] = xy
-            self.annotations[frame_idx, cam_idx, point_idx, 2] = confidence
-            self.human_annotated[frame_idx, cam_idx, point_idx] = is_human
-
-    def set_annotation_unsafe(
-        self,
-        frame_idx: int,
-        cam_idx: int,
-        point_idx: int,
-        xy: np.ndarray,
-        confidence: float,
-        is_human: bool = False
-    ):
-        """
-        Set annotation WITHOUT acquiring lock.
-        Only call from within a bulk_lock() context!
-
-        Args:
-            frame_idx: Frame index
-            cam_idx: Camera index
-            point_idx: Point/keypoint index
-            xy: Coordinates as array of shape (2,)
-            confidence: Confidence value
-            is_human: Whether this is a human annotation
-        """
-        self._validate_frame_idx(frame_idx)
-        self._validate_camera_idx(cam_idx)
-        self._validate_point_idx(point_idx)
-
-        if xy.shape != (2,):
-            raise ValueError(f"xy must have shape (2,), got {xy.shape}")
-
-        # NO LOCK
-        self.annotations[frame_idx, cam_idx, point_idx, :2] = xy
-        self.annotations[frame_idx, cam_idx, point_idx, 2] = confidence
-        self.human_annotated[frame_idx, cam_idx, point_idx] = is_human
-
-    def clear_annotation(
-        self,
-        frame_idx: int,
-        cam_idx: int,
-        point_idx: int
-    ):
-        """
-        Clear a single 2D annotation (set to NaN).
-
-        Args:
-            frame_idx: Frame index
-            cam_idx: Camera index
-            point_idx: Point/keypoint index
-        """
-        self._validate_frame_idx(frame_idx)
-        self._validate_camera_idx(cam_idx)
-        self._validate_point_idx(point_idx)
-
-        with self._lock:
-            self.annotations[frame_idx, cam_idx, point_idx] = np.nan
-            self.human_annotated[frame_idx, cam_idx, point_idx] = False
-
-    def set_frame_annotations(
-        self,
-        frame_idx: int,
-        annotations: np.ndarray,
-        human_flags: Optional[np.ndarray] = None
-    ):
-        """
-        Set all annotations for a frame (in-place update).
-
-        Args:
-            frame_idx: Frame index
-            annotations: Array of shape (C, P, 3) with annotations
-            human_flags: Optional array of shape (C, P) with human flags
-        """
-        self._validate_frame_idx(frame_idx)
-
-        expected_shape = (self.n_cameras, self.n_points, 3)
-        if annotations.shape != expected_shape:
-            raise ValueError(
-                f"Annotations must have shape {expected_shape}, got {annotations.shape}"
-            )
-
-        if human_flags is not None:
-            expected_flags_shape = (self.n_cameras, self.n_points)
-            if human_flags.shape != expected_flags_shape:
-                raise ValueError(
-                    f"Human flags must have shape {expected_flags_shape}, "
-                    f"got {human_flags.shape}"
+            if len(self._points2d) > 0:
+                save_dataframe(
+                    self._points2d,
+                    directory / f'{prefix}_points2d.parquet',
+                    schema_name='Points2D'
                 )
 
-        with self._lock:
-            np.copyto(self.annotations[frame_idx], annotations)
-            if human_flags is not None:
-                np.copyto(self.human_annotated[frame_idx], human_flags)
+            if len(self._points3d) > 0:
+                save_dataframe(
+                    self._points3d,
+                    directory / f'{prefix}_points3d.parquet',
+                    schema_name='Tracks3D'
+                )
 
-    # Write operations - 3D points
+            np.save(directory / f'{prefix}_manual_flags.npy', self._manual_flags)
 
-    def set_point3d(
-        self,
-        frame_idx: int,
-        point_idx: int,
-        xyz_score: np.ndarray
-    ):
+    def load(self, directory: Path, prefix: str = 'catar'):
         """
-        Set a single 3D reconstructed point.
+        Load data from disk.
 
         Args:
-            frame_idx: Frame index
-            point_idx: Point/keypoint index
-            xyz_score: Array of shape (4,) containing (x, y, z, score)
+            directory: Directory containing saved files
+            prefix: File prefix used when saving
         """
-        self._validate_frame_idx(frame_idx)
-        self._validate_point_idx(point_idx)
-
-        if xyz_score.shape != (4,):
-            raise ValueError(f"xyz_score must have shape (4,), got {xyz_score.shape}")
+        directory = Path(directory)
 
         with self._lock:
-            self.reconstructed_3d[frame_idx, point_idx] = xyz_score
+            
+            # Load Points2D
+            points2d_path = directory / f'{prefix}_points2d.parquet'
+            if points2d_path.exists():
+                self._points2d = load_dataframe(
+                    points2d_path,
+                    schema_name='Points2D',
+                    validate=True
+                )
+            else:
+                self._points2d = empty_dataframe('Points2D')
 
-    def set_frame_points3d(self, frame_idx: int, points_3d: np.ndarray):
-        """
-        Set all 3D reconstructed points for a frame (in-place update).
+            # Load Tracks3D
+            points3d_path = directory / f'{prefix}_points3d.parquet'
+            if points3d_path.exists():
+                self._points3d = load_dataframe(
+                    points3d_path,
+                    schema_name='Tracks3D',
+                    validate=True
+                )
+            else:
+                self._points3d = empty_dataframe('Tracks3D')
 
-        Args:
-            frame_idx: Frame index
-            points_3d: Array of shape (P, 4) containing (x, y, z, score)
-        """
-        self._validate_frame_idx(frame_idx)
+            # Load "is manual" flags
+            flags_path = directory / f'{prefix}_manual_flags.npy'
+            if flags_path.exists():
+                loaded_flags = np.load(flags_path)
+                if loaded_flags.shape == self._manual_flags.shape:
+                    self._manual_flags = loaded_flags
 
-        expected_shape = (self.n_points, 4)
-        if points_3d.shape != expected_shape:
-            raise ValueError(
-                f"points_3d must have shape {expected_shape}, got {points_3d.shape}"
-            )
+                else:
+                    print(f'[WARN] Flag "manual" shape mismatch: {loaded_flags.shape} vs. {self._manual_flags.shape}')
+                    # Copy what we can
+                    min_f = min(loaded_flags.shape[0], self._manual_flags.shape[0])
+                    min_c = min(loaded_flags.shape[1], self._manual_flags.shape[1])
+                    min_p = min(loaded_flags.shape[2], self._manual_flags.shape[2])
+                    self._manual_flags[:min_f, :min_c, :min_p] = loaded_flags[:min_f, :min_c, :min_p]
 
-        with self._lock:
-            # In-place copy for performance
-            np.copyto(self.reconstructed_3d[frame_idx], points_3d)
-
-    def set_points3d_range(
-        self,
-        start_frame: int,
-        end_frame: int,
-        points_3d: np.ndarray
-    ):
-        """
-        Set 3D points for a range of frames (in-place update).
-
-        Args:
-            start_frame: First frame (inclusive)
-            end_frame: Last frame (inclusive)
-            points_3d: Array of shape (F, P, 4) for the frame range
-        """
-        self._validate_frame_idx(start_frame)
-        self._validate_frame_idx(end_frame)
-
-        if start_frame > end_frame:
-            raise ValueError(f"start_frame {start_frame} > end_frame {end_frame}")
-
-        num_frames_in_range = end_frame - start_frame + 1
-        expected_shape = (num_frames_in_range, self.n_points, 4)
-        if points_3d.shape != expected_shape:
-            raise ValueError(
-                f"points_3d must have shape {expected_shape}, got {points_3d.shape}"
-            )
-
-        with self._lock:
-            # In-place copy for performance
-            np.copyto(self.reconstructed_3d[start_frame:end_frame+1], points_3d)
-
-    # Bulk operations
-
-    def clear_frame(self, frame_idx: int):
-        """Clear all data for a frame (set to NaN/False)."""
-        self._validate_frame_idx(frame_idx)
-
-        with self._lock:
-            self.annotations[frame_idx] = np.nan
-            self.reconstructed_3d[frame_idx] = np.nan
-            self.human_annotated[frame_idx] = False
-
-    def clear_all(self):
-        with self._lock:
-            self.annotations.fill(np.nan)
-            self.reconstructed_3d.fill(np.nan)
-            self.human_annotated.fill(False)
+            self._invalidate_cache()

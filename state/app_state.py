@@ -7,13 +7,18 @@ import multiprocessing
 import numpy as np
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, TYPE_CHECKING
 from dataclasses import dataclass, field
 
 import config
+
 from state.data_manager import DataManager
+
 from lucida.utils import probe_video
 from lucida import CameraRig
+
+if TYPE_CHECKING:
+    from mokap.pose_reconstruction.skeleton import Skeleton
 
 
 @dataclass
@@ -66,7 +71,7 @@ class AppState:
         data_folder: Union[Path, str],
         video_paths: List[Union[Path, str]],
         rig: CameraRig,
-        skeleton_config: Dict[str, Any]
+        skeleton: Optional['Skeleton'] = None,
     ):
         if len(rig) != len(video_paths):
             raise ValueError("Mismatch between number of cameras in rig and video paths.")
@@ -125,34 +130,37 @@ class AppState:
 
         # Additional calibration state not held in Lucida
         self.calibration_frames: List[int] = []
-        self.best_fitness: float = float('inf')
+        self.ga_best_fitness: float = float('inf')
 
         # Default scene bounds and centre
         self.volume_bounds = {'x': (-1e9, 1e9), 'y': (-1e9, 1e9), 'z': (-1e9, 1e9)}
         self.scene_centre = np.zeros(3)
 
         # Keypoints order and lookup accessors
-        self.point_names = tuple(skeleton_config['point_names'])
-        self.point_nti = {name: i for i, name in enumerate(self.point_names)}
-        self.point_itn = {i: name for name, i in self.point_nti.items()}
-
-        self.skeleton = skeleton_config['skeleton']
-        self.all_points_set = set(self.point_names)
 
         # TODO: Derive skeleton_points_set from skeleton config (points that are part of the skeleton graph)
         # TODO: Add GUI functionality to add/remove non-skeleton points for object tracking and scaffolding
+
+        self.point_names = tuple(skeleton.keypoints)
+        self.point_nti = {name: i for i, name in enumerate(self.point_names)}
+        self.point_itn = {i: name for name, i in self.point_nti.items()}
+
+        self.skeleton = skeleton
+        self.all_points_set = set(self.point_names)
+
         self.skeleton_points_set = set(self.point_names) - {'s_small', 's_large'}
         self.non_skeleton_points_set = {'s_small', 's_large'}
 
-        self.point_colors = skeleton_config['point_colors']
+
+
         self.camera_colors = config.CAMERA_COLORS
         self.num_points = len(self.point_names)
 
-        # Centralised data manager
+
         self.data = DataManager(
-            n_frames=self.num_frames,
-            n_cameras=len(rig),
-            n_points=self.num_points
+            nb_frames=self.num_frames,
+            camera_names=list(rig.names),
+            keypoint_names=list(self.point_names),
         )
 
         # Playback State
@@ -191,13 +199,14 @@ class AppState:
         Camera names and image sizes are derived from the rig.
         """
         with self.lock:
-            with self.data.bulk_lock():
+            # Use the numpy compatibility layer
+            with self.data.read_lock():
                 annotations_copy = self.data.annotations.copy()
 
             return {
                 "annotations": annotations_copy,
                 "calibration_frames": list(self.calibration_frames),
-                "best_fitness": self.best_fitness,
+                "best_fitness": self.ga_best_fitness,
                 "best_individual": self.rig.to_dict(),
                 "generation": 0,
                 "scene_centre": self.scene_centre.copy()
@@ -209,7 +218,7 @@ class AppState:
         Camera names and image sizes are derived from the rig.
         """
         with self.lock:
-            with self.data.bulk_lock():
+            with self.data.read_lock():
                 annotations_copy = self.data.annotations.copy()
 
             return {
@@ -220,59 +229,66 @@ class AppState:
 
     # Persistence (Save / Load)
 
-    def save_to_disk(self, folder: Path):
+    def save(self, folder: Path):
         """
         Save all persistent state to disk.
         """
+        folder = Path(folder)
         print(f"Saving state to: '{folder}'")
 
         with self.lock:
             try:
-                with self.data._lock:
-                    np.save(folder / 'annotations.npy', self.data.annotations)
-                    np.save(folder / 'human_annotated.npy', self.data.human_annotated)
-                    np.save(folder / 'reconstructed_3d.npy', self.data.reconstructed_3d)
 
-                # Save calibration state
+                self.data.save(folder, prefix='catar')
+                print("  - Saved annotations and 3D points (Parquet format)")
+
+
                 with open(folder / 'calibration_frames.json', 'w') as f:
                     json.dump(self.calibration_frames, f)
+                print("  - Saved 'calibration_frames.json'")
 
                 self.rig.save(folder / 'rig.toml')
+                print("  - Saved 'rig.toml'")
 
                 print("State saved successfully.")
             except Exception as e:
                 print(f"Error saving state: {e}")
+                import traceback
+                traceback.print_exc()
 
-    def load_from_disk(self, folder: Path):
+    def load(self, folder: Path):
         """
         Load persistent state from disk.
         """
+        folder = Path(folder)
         print(f"Loading state from: '{folder}'")
 
-        files_to_load = [
-            ('annotations.npy', 'numpy', 'annotations'),
-            ('human_annotated.npy', 'numpy', 'human_annotated'),
-            ('reconstructed_3d.npy', 'numpy', 'reconstructed_3d'),
-            ('calibration_frames.json', 'json', 'calibration_frames'),
-            # Rig is loaded via CameraRig.load separately, checked below
-        ]
+        data_files_exist = (
+            (folder / 'catar_points2d.parquet').exists() or
+            (folder / 'catar_points3d.parquet').exists() or
+            (folder / 'catar_manual_flags.npy').exists()
+        )
 
-        loaded_data = {}
-
-        for filename, file_type, attr_name in files_to_load:
-            file_path = folder / filename
-            if not file_path.exists():
-                continue
-
+        # Load data
+        if data_files_exist:
+            print("  Loading data (Polars/Parquet format)...")
             try:
-                if file_type == 'numpy':
-                    loaded_data[attr_name] = np.load(file_path)
-                elif file_type == 'json':
-                    with file_path.open('r') as f:
-                        loaded_data[attr_name] = json.load(f)
-                print(f"  - Loaded '{filename}'")
+                self.data.load(folder, prefix='catar')
+                print("  - Loaded annotations and 3D points")
             except Exception as e:
-                print(f"  - WARNING: Could not load '{filename}': {e}")
+                print(f"  - WARNING: Could not load Parquet data: {e}")
+        else:
+            print("  No saved annotation data found.")
+
+        # Load calibration frames
+        calib_path = folder / 'calibration_frames.json'
+        if calib_path.exists():
+            try:
+                with calib_path.open('r') as f:
+                    self.calibration_frames = json.load(f)
+                print(f"  - Loaded 'calibration_frames.json' ({len(self.calibration_frames)} frames)")
+            except Exception as e:
+                print(f"  - WARNING: Could not load calibration_frames.json: {e}")
 
         # Load Rig
         rig_path = folder / 'rig.toml'
@@ -288,26 +304,5 @@ class AppState:
                     print("  - WARNING: Loaded rig camera names do not match current session.")
             except Exception as e:
                 print(f"  - WARNING: Could not load rig.toml: {e}")
-
-        with self.lock:
-            # Load into DataManager arrays
-            with self.data._lock:
-                if 'human_annotated' in loaded_data:
-                    data = loaded_data['human_annotated']
-                    if data.shape == self.data.human_annotated.shape:
-                        self.data.human_annotated = data
-
-                if 'reconstructed_3d' in loaded_data:
-                    data = loaded_data['reconstructed_3d']
-                    if data.shape[0] == self.num_frames and data.shape[1] == self.num_points:
-                         self.data.reconstructed_3d = data
-
-                if 'annotations' in loaded_data:
-                    annots = loaded_data['annotations']
-                    if annots.shape[0] == self.num_frames and annots.shape[1] == len(self.rig):
-                        self.data.annotations = annots
-
-            if 'calibration_frames' in loaded_data:
-                self.calibration_frames = loaded_data['calibration_frames']
 
         print("State loading complete.")

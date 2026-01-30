@@ -10,8 +10,8 @@ from gui.rendering import create_camera_visual, Object3D, Viewer3D
 
 if TYPE_CHECKING:
     from state import AppState
-    from mokap.reconstruction.reconstruction import Reconstructor
-    from mokap.reconstruction.tracking import MultiObjectTracker
+    from mokap.pose_reconstruction.soup import Reconstructor
+    from mokap.pose_reconstruction.assembly import MultiObjectTracker
 
 
 class RenderingWorker(threading.Thread):
@@ -99,7 +99,7 @@ class RenderingWorker(threading.Thread):
             point_colors = self.app_state.point_colors
             skeleton = self.app_state.skeleton
 
-        points_3d = self.app_state.data.get_frame_points3d(frame_idx)
+        points_3d = self.app_state.data.get_3d(frame=frame_idx)
 
         # Draw points
         for i, point in enumerate(points_3d):
@@ -113,6 +113,7 @@ class RenderingWorker(threading.Thread):
                 ))
 
                 # Draw skeleton connections
+                # TODO: Replace this
                 for connected_name in skeleton.get(point_names[i], []):
                     try:
                         j = self.app_state.point_nti[connected_name]

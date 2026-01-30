@@ -152,11 +152,11 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         fix_points = True  # trust points, move cameras
         fix_cameras = False
     elif mode == "refine_points_only":
+        fix_points = False
         fix_cameras = True  # trust cameras, move points
-        fix_points = False
     else:  # "full_ba"
-        fix_cameras = False
         fix_points = False
+        fix_cameras = False
 
     # Hydrate rig first so we can determine anchor
     rig = CameraRig.from_dict(initial_calib_dict)
@@ -171,9 +171,9 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     anchor_idx = ba_data["anchor_idx"]
     print(f"[BA] Starting optimisation engine (Mode: {mode})...")
 
-    K_init = np.array([c.intrinsics.K for c in rig])
-    D_init = np.array([c.intrinsics.D for c in rig])
-    T_c2w_init = np.array([c.extrinsics.T_c2w for c in rig])
+    K_init = rig.K.copy()
+    D_init = rig.D.copy()
+    T_c2w_init = rig.T_c2w.copy()
     images_sizes = np.array([c.image_size for c in rig])
 
     dist_model = rig.distortion_model
@@ -191,7 +191,6 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         # Note: fix_object_poses=True *and* object_poses=None triggers 'Scaffolding' mode
         # which treats 'object_points' as a cloud of independent world-space points
         # (size P*N) rather than a single rigid object (size N) transformed by P poses.
-
         object_poses=None,
         fix_object_poses=True,
 
@@ -206,7 +205,7 @@ def run_refinement(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         covariance_extrinsics=ba_data["covariance_extrinsics"],
 
         fix_aspect_ratio=False,
-        max_nfev=200,
+        max_nfev=500,
         f_scale=2.0
     )
 

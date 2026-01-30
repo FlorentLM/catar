@@ -1,7 +1,7 @@
 from dearpygui import dearpygui as dpg
 
 from gui.callbacks.annotation_callbacks import (
-    set_human_annotated_callback,
+    set_manual_annotation_callback,
     clear_future_annotations_callback
 )
 from gui.callbacks.calibration_callbacks import addremove_calib_frame_callback
@@ -59,7 +59,7 @@ def on_key_press(sender, app_data, user_data):
         case dpg.mvKey_Z:
             toggle_focus_mode_callback(sender, app_data, user_data)
         case dpg.mvKey_H:
-            set_human_annotated_callback(sender, app_data, user_data)
+            set_manual_annotation_callback(sender, app_data, user_data)
         case dpg.mvKey_D:
             clear_future_annotations_callback(sender, app_data, user_data)
 

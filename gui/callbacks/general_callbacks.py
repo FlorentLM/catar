@@ -60,9 +60,9 @@ def app_quit_callback(sender, app_data, user_data):
 
 
 def save_state_callback(sender, app_data, user_data):
-    user_data["app_state"].save_to_disk(config.DATA_FOLDER)
+    user_data["app_state"].save(config.DATA_FOLDER)
 
 
 def load_state_callback(sender, app_data, user_data):
-    user_data["app_state"].load_from_disk(config.DATA_FOLDER)
+    user_data["app_state"].load(config.DATA_FOLDER)
 

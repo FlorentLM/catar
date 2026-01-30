@@ -18,14 +18,16 @@ from gui.rendering import Viewer3D
 from utils import load_and_match_videos, compute_3d_scores
 from video import create_video_backend, DiskCacheBuilder, VideoReaderWorker
 
-from workers import GAWorker, BAWorker, TrackingWorker, RenderingWorker
+from workers import GAWorker, BAWorker, RenderingWorker
+from workers.tracking_worker import TrackingWorker  # Use updated version
 
 from lucida import CameraRig
 
-from mokap.reconstruction.config import PipelineConfig
-from mokap.reconstruction.anatomy import StatsBootstrapper
-from mokap.reconstruction.reconstruction import Reconstructor
-from mokap.reconstruction.tracking import SkeletonAssembler, MultiObjectTracker
+from mokap.pose_reconstruction.configs import TrackerConfig, AssemblerConfig
+from mokap.pose_reconstruction.skeleton import Skeleton, SkeletonStats
+
+from mokap.pose_reconstruction.soup import Reconstructor
+from mokap.pose_reconstruction.assembly import SkeletonAssembler, MultiObjectTracker
 
 
 def handle_rendered_frames(new_frames: dict, app_state: 'AppState', queues: 'Queues'):
@@ -157,7 +159,7 @@ def handle_ga_progress(ga_progress: dict, app_state: 'AppState'):
             with app_state.lock:
                 # Re-hydrate rig from dict
                 app_state.rig = CameraRig.from_dict(new_best_calib_dict)
-                app_state.best_fitness = ga_progress['best_fitness']
+                app_state.ga_best_fitness = ga_progress['best_fitness']
 
 
 def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
@@ -181,19 +183,18 @@ def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
             calib_indices = ba_result['calibration_frame_indices']
 
             with app_state.data.bulk_lock():
-                ba_annotations = app_state.data.annotations[calib_indices]
+                for i, frame_idx in enumerate(calib_indices):
+                    pts_3d = refined_3d_points[i]
 
-            for i, frame_idx in enumerate(calib_indices):
-                pts_3d = refined_3d_points[i]
-                frame_annots = ba_annotations[i]
+                    frame_annots = app_state.data.get_2d(frame=frame_idx, copy=True)
 
-                scores = compute_3d_scores(pts_3d, frame_annots, app_state.rig)
+                    scores = compute_3d_scores(pts_3d, frame_annots, app_state.rig)
 
-                pts_4d = np.full((pts_3d.shape[0], 4), np.nan, dtype=np.float32)
-                pts_4d[:, :3] = pts_3d
-                pts_4d[:, 3] = scores
+                    pts_4d = np.full((pts_3d.shape[0], 4), np.nan, dtype=np.float32)
+                    pts_4d[:, :3] = pts_3d
+                    pts_4d[:, 3] = scores
 
-                app_state.data.set_frame_points3d(frame_idx, pts_4d)
+                    app_state.data.set_3d(frame=frame_idx, data=pts_4d)
 
         app_state.needs_3d_reconstruction = True
 
@@ -270,9 +271,27 @@ def main():
         config.VIDEO_FORMAT
     )
 
+    # Load skeleton definition
+    skeleton = Skeleton.load(data_folder / 'messor_skeleton.toml')  # TODO: in config
+    print(f"  Skeleton: {skeleton.name} ({len(skeleton.keypoints)} keypoints, {len(skeleton.bones)} bones)")
+
+    # Load skeleton statistics
+    skeleton_stats = SkeletonStats.load(data_folder / 'skeleton_stats.json', skeleton)
+
+    if skeleton_stats.reference_bone:
+        print(f"  Reference bone: {skeleton_stats.reference_bone}")
+        print(f"  Reference length: {skeleton_stats.reference_length_world:.2f} {skeleton.metadata.units if skeleton.metadata else 'units'}")
+    else:
+        print("  No reference bone set (stats will be learned online)")
+
     # Create state objects
     print("Initialising application state...")
-    app_state = AppState(data_folder, video_paths, camera_rig, config.SKELETON_CONFIG)
+    app_state = AppState(
+        data_folder,
+        video_paths,
+        camera_rig,
+        skeleton=skeleton,
+    )
 
     print("Initialising video backend...")
 
@@ -297,44 +316,30 @@ def main():
     # Store backend in app_state for cache management callbacks
     app_state.video_backend = video_backend
 
-    print("Initialising mokap pipeline...")     # TODO: Maybe run a dummy tracking frame to warm up JAX compile
-    mokap_config = PipelineConfig()
+    print("Initialising mokap pipeline...")
 
-    bones_list = [(k, v_i) for k, v in config.SKELETON_CONFIG['skeleton'].items() for v_i in v]
+    app_state.load(config.DATA_FOLDER)
 
-    stats_output_file = config.DATA_FOLDER / 'bone_stats.json'
-    bootstrapper = StatsBootstrapper(
-        output_path=stats_output_file,
-        bones_list=bones_list,
-        symmetry_map=config.SKELETON_CONFIG['symmetry_map'],
-        bootstrap_data=None,
-        config=mokap_config.anatomy
-    )
-    try:
-        bone_stats = bootstrapper.get_initial_stats()
-        print(f"Loaded bone stats. Reference bone: {bone_stats['reference_bone']}")
-    except ValueError as e:
-        print(f"\n[ERROR] Could not get bone statistics: {e}")
-        sys.exit(1)
-
-    # Load saved data
-    app_state.load_from_disk(config.DATA_FOLDER)
 
     reconstructor = Reconstructor(
         rig=app_state.rig,
-        volume_bounds=app_state.volume_bounds,
-        config=mokap_config.reconstruction
+        keypoint_names=skeleton.keypoints,
+        min_views=2,
+        epipolar_threshold=10.0,
+        reprojection_threshold=5.0
     )
 
     assembler = SkeletonAssembler(
-        bones_list=bones_list,
-        bone_stats=bone_stats,
-        assembler_config=mokap_config.assembler,
-        tracker_config=mokap_config.tracker
+        skeleton=skeleton,
+        stats=skeleton_stats,
+        config=AssemblerConfig(),
     )
-    tracker = MultiObjectTracker(
+
+    mot_tracker = MultiObjectTracker(
         assembler=assembler,
-        config=mokap_config.tracker
+        skeleton=skeleton,
+        stats=skeleton_stats,
+        config=TrackerConfig()
     )
 
     print("Initialising workers...")
@@ -354,19 +359,22 @@ def main():
         TrackingWorker(
             app_state=app_state,
             video_backend=video_backend,
+
             reconstructor=reconstructor,
-            tracker=tracker,
+            mot_tracker=mot_tracker,
+            skeleton_stats=skeleton_stats,
+
             frames_in_queue=queues.frames_for_tracking,
             progress_out_queue=queues.tracking_progress,
+
             command_queue=queues.tracking_command,
             stop_batch_track=queues.stop_batch_track,
-            bone_stats=bone_stats
         ),
 
         RenderingWorker(
             app_state,
             reconstructor,
-            tracker,
+            mot_tracker,
             queues.frames_for_rendering,
             queues.results,
             open3d_viz

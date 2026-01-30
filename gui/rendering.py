@@ -46,6 +46,7 @@ class Viewer3D:
 
     def initialize(self):
         """Initialise Open3D window."""
+
         if self.is_initialized or self.init_failed:
             return
 
@@ -241,10 +242,11 @@ def update_annotation_overlays(app_state: 'AppState'):
         focus_mode = app_state.focus_selected_point
         show_all_labels = app_state.show_all_labels
 
-    all_annotations = app_state.data.get_frame_annotations(frame_idx)
-    all_human = app_state.data.get_human_annotated_flags(frame_idx)
-    selected_annots = app_state.data.get_point_annotations(frame_idx, p_idx)
-    point_3d = app_state.data.get_point3d(frame_idx, p_idx)
+    all_annotations = app_state.data.get_2d(frame=frame_idx)
+    all_manual_flags = app_state.data.is_manual(frame_idx)
+
+    selected_annots = app_state.data.get_2d(frame=frame_idx, keypoint=p_idx)
+    point_3d = app_state.data.get_3d(frame=frame_idx, keypoint=p_idx)
 
     for cam_idx, cam_name in enumerate(rig.names):
         layer_tag = f"annotation_layer_{cam_idx}"
@@ -288,7 +290,7 @@ def update_annotation_overlays(app_state: 'AppState'):
                 cam_idx=cam_idx,
                 selected_point_idx=p_idx,
                 annotations=all_annotations,
-                human_annotated=all_human,
+                manual_flags=all_manual_flags,
                 scale_x=scale_x, scale_y=scale_y,
                 layer_tag=layer_tag,
                 focus_mode=focus_mode,
@@ -297,26 +299,32 @@ def update_annotation_overlays(app_state: 'AppState'):
 
 
 def update_histogram(app_state: 'AppState'):
+
     with app_state.lock:
         focus_mode = app_state.focus_selected_point
         selected_idx = app_state.selected_point_idx
         point_name = app_state.point_itn[selected_idx]
         num_cams = len(app_state.rig)
 
-    with app_state.data.bulk_lock():
+    with app_state.data.read_lock():
+
+        # TODO: This hist is broken
+
         if focus_mode:
-            annots = app_state.data.annotations[:, :, selected_idx, :2]
-            counts = np.sum(np.all(~np.isnan(annots), axis=-1), axis=1)
+            annots = app_state.data.get_2d(frame=selected_idx, keypoint=selected_idx)
+            counts = [np.sum(~np.isnan(annots[..., 0]))]
+
             dpg.configure_item("histogram_y_axis", label=f"'{point_name}' Annots")
             dpg.set_axis_limits("histogram_y_axis", 0, num_cams)
         else:
-            annots = app_state.data.annotations[:, :, :, :2]
-            counts = np.sum(np.all(~np.isnan(annots), axis=-1), axis=(1, 2))
+            annots = app_state.data.get_2d(frame=selected_idx)
+            counts = np.sum(~np.isnan(annots[..., 0]), axis=1)
+
             dpg.configure_item("histogram_y_axis", label="Total Annots")
             if counts.max() > 0:
                 dpg.set_axis_limits_auto("histogram_y_axis")
 
-    dpg.set_value("annotation_histogram_series", [list(range(len(counts))), counts.tolist()])
+    dpg.set_value("annotation_histogram_series", [list(range(len(counts))), counts])
 
 
 def update_control_panel(app_state: 'AppState'):
@@ -332,7 +340,7 @@ def update_control_panel(app_state: 'AppState'):
         is_calib = app_state.frame_idx in app_state.calibration_frames
         dpg.configure_item("toggle_calib_frame_button", label="Remove (C)" if is_calib else "Add (C)")
         dpg.set_value("num_calib_frames_text", f"Calibration Frames: {len(app_state.calibration_frames)}")
-        dpg.set_value("fitness_text", f"Best Fitness: {app_state.best_fitness:.2f}")
+        dpg.set_value("fitness_text", f"Best Fitness: {app_state.ga_best_fitness:.2f}")
 
 
 def draw_epipolar_lines(
@@ -429,7 +437,7 @@ def draw_all_points(
         cam_idx: int,
         selected_point_idx: int,
         annotations: np.ndarray,
-        human_annotated: np.ndarray,
+        manual_flags: np.ndarray,
         scale_x: float,
         scale_y: float,
         layer_tag: str,
@@ -450,7 +458,7 @@ def draw_all_points(
 
         if i == selected_point_idx:
             color = (255, 255, 0)
-        elif human_annotated[cam_idx, i]:
+        elif manual_flags[cam_idx, i]:
             color = (255, 255, 255)
         else:
             color = get_confidence_color(pt[2])

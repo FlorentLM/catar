@@ -1,7 +1,5 @@
-import numpy as np
 
-
-def set_human_annotated_callback(sender, app_data, user_data):
+def set_manual_annotation_callback(sender, app_data, user_data):
     """Mark all previous frames as human-annotated for selected point."""
 
     app_state = user_data["app_state"]
@@ -13,8 +11,8 @@ def set_human_annotated_callback(sender, app_data, user_data):
 
         frame_idx = app_state.frame_idx
         p_idx = app_state.selected_point_idx
-        with app_state.data.bulk_lock():
-            app_state.data.human_annotated[:frame_idx + 1, :, p_idx] = True
+        app_state.data.is_manual(frame=slice(0, frame_idx), keypoint=p_idx, value=True)
+
         print(f"Marked previous frames as human-annotated for '{app_state.point_itn[p_idx]}'")
 
 
@@ -28,13 +26,10 @@ def clear_future_annotations_callback(sender, app_data, user_data):
             print("Enable Focus Mode (Z) to use this feature.")
             return
 
-        frame_idx = app_state.frame_idx
+        curr_frame_idx = app_state.frame_idx
         p_idx = app_state.selected_point_idx
 
-        # Clear x, y, and confidence
-        with app_state.data.bulk_lock():
-            app_state.data.annotations[frame_idx + 1:, :, p_idx] = np.nan
-            app_state.data.human_annotated[frame_idx + 1:, :, p_idx] = False
+        app_state.data.set_2d(frame=slice(curr_frame_idx + 1, -1), keypoint=p_idx, data=None)
 
         print(f"Cleared future annotations for '{app_state.point_itn[p_idx]}'")
 

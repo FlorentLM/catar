@@ -20,7 +20,7 @@ def image_mousedown_callback(sender, app_data, user_data):
         camera_name = app_state.rig.names[cam_idx]
         video_meta = app_state.get_video_metadata(camera_name)
 
-    annotations = app_state.data.get_camera_annotations(frame_idx, cam_idx)
+    annotations = app_state.data.get_2d(frame=frame_idx, camera=cam_idx)
 
     # Get mouse pos (image coordinates)
     container_pos = dpg.get_item_rect_min(drawlist_tag)
@@ -56,10 +56,10 @@ def image_mousedown_callback(sender, app_data, user_data):
 
     with app_state.lock:
         if app_data[0] == 0:  # left click
-            annotation_pos_for_drag = None
+
             if is_drag_start:
                 # Use existing point's position for the drag operation
-                annotation_pos_for_drag = app_state.data.get_annotation(frame_idx, cam_idx, p_idx)[:2].copy()
+                annotation_pos_for_drag = app_state.data.get_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, copy=True)
 
             else:
                 # Create a new point
@@ -67,15 +67,13 @@ def image_mousedown_callback(sender, app_data, user_data):
                 final_pos = snapped_pos if snapped_pos is not None else scaled_pos
 
                 # Assign the new annotation (x, y, confidence=1.0)
-                app_state.data.set_annotation(
-                    frame_idx, cam_idx, p_idx,
-                    final_pos, confidence=1.0, is_human=True
-                )
+                app_state.data.set_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, data=[*final_pos, 1.0], is_manual=True)
+
                 app_state.needs_3d_reconstruction = True
                 annotation_pos_for_drag = final_pos
 
             # Offset between the mouse and the point (to prevent 'stickiness')
-            drag_offset = scaled_pos - annotation_pos_for_drag
+            drag_offset = scaled_pos - annotation_pos_for_drag[:2]
 
             app_state.drag_state = {
                 "cam_idx": cam_idx,
@@ -93,7 +91,7 @@ def image_mousedown_callback(sender, app_data, user_data):
 
         elif app_data[0] == 1:  # right click = delete
             # Delete x, y, and confidence
-            app_state.data.clear_annotation(frame_idx, cam_idx, p_idx)
+            app_state.data.set_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, data=None)
             app_state.needs_3d_reconstruction = True
 
 
@@ -117,15 +115,15 @@ def image_mousedrag_callback(sender, app_data, user_data):
 
         current_frames = app_state.current_video_frames
 
-        # Lucida access
         rig = app_state.rig
 
         show_epipolar_lines = app_state.show_epipolar_lines
         temp_hide_overlays = app_state.temp_hide_overlays
         camera_colors = app_state.camera_colors
 
-    all_annotations = app_state.data.get_frame_annotations(frame_idx)
-    point_3d_selected = app_state.data.get_point3d(frame_idx, p_idx)
+    all_annotations = app_state.data.get_2d(frame=frame_idx)
+
+    point_3d_selected = app_state.data.get_3d(frame=frame_idx, keypoint=p_idx)
 
     if current_frames is None:
         return
@@ -160,8 +158,8 @@ def image_mousedrag_callback(sender, app_data, user_data):
             drag_state["slow_down_start_mouse_pos"] = current_scaled_pos.copy()
             with app_state.lock:
                 # get (x, y) coordinates
-                drag_state["slow_down_start_annotation_pos"] = app_state.data.get_annotation(frame_idx, cam_idx, p_idx)[
-                    :2].copy()
+                xy_coords = app_state.data.get_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, copy=True)[:2]
+                drag_state["slow_down_start_annotation_pos"] = xy_coords
 
         # Continue slow movement relative to the anchor point
         mouse_delta = current_scaled_pos - drag_state["slow_down_start_mouse_pos"]
@@ -181,10 +179,8 @@ def image_mousedrag_callback(sender, app_data, user_data):
 
     with app_state.lock:
         # Update the (x, y) and set confidence to 1.0 (it's a manual annotation)
-        app_state.data.set_annotation(
-            frame_idx, cam_idx, p_idx,
-            final_scaled_pos, confidence=1.0, is_human=True
-        )
+        app_state.data.set_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, data=[*final_scaled_pos, 1.0], is_manual=True)
+
         app_state.needs_3d_reconstruction = True
         app_state.drag_state = drag_state  # write updated state back
 

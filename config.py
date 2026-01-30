@@ -4,7 +4,6 @@ All constants and default values are defined here.
 """
 import cv2
 from pathlib import Path
-import numpy as np
 
 # Debug prints
 VERBOSE = True
@@ -105,61 +104,6 @@ GA_MUTATION_STRENGTH_INIT = 0.01 # Strength for seeding initial population
 # UI interaction
 ANNOTATION_DRAG_THRESHOLD = 15  # in pixels
 
-# Skeleton configuration
-SKELETON_CONFIG = {
-    "point_names": [
-        "thorax", "neck", "eye_L", "eye_R", "a_L0", "a_L1", "a_L2", "a_R0", "a_R1", "a_R2",
-        "leg_f_L0", "leg_f_L1", "leg_f_L2", "leg_f_R0", "leg_f_R1", "leg_f_R2",
-        "leg_m_L0", "leg_m_L1", "leg_m_L2", "leg_m_R0", "leg_m_R1", "leg_m_R2",
-        "m_L0", "m_L1", "m_R0", "m_R1", "s_small", "s_large"
-    ],
-    "skeleton": {
-        "thorax": ["neck", "leg_f_L0", "leg_f_R0", "leg_m_L0", "leg_m_R0"],
-        "neck": ["thorax", "a_R0", "a_L0", "eye_L", "eye_R", "m_L0", "m_R0"],
-        "eye_L": ["neck"], "eye_R": ["neck"],
-        "a_L0": ["neck", "a_L1"], "a_L1": ["a_L2", "a_L0"], "a_L2": ["a_L1"],
-        "a_R0": ["neck", "a_R1"], "a_R1": ["a_R2", "a_R0"], "a_R2": ["a_R1"],
-        "leg_f_L0": ["thorax", "leg_f_L1"], "leg_f_L1": ["leg_f_L2", "leg_f_L0"], "leg_f_L2": ["leg_f_L1"],
-        "leg_f_R0": ["thorax", "leg_f_R1"], "leg_f_R1": ["leg_f_R2", "leg_f_R0"], "leg_f_R2": ["leg_f_R1"],
-        "leg_m_L0": ["thorax", "leg_m_L1"], "leg_m_L1": ["leg_m_L2", "leg_m_L0"], "leg_m_L2": ["leg_m_L1"],
-        "leg_m_R0": ["thorax", "leg_m_R1"], "leg_m_R1": ["leg_m_R2", "leg_m_R0"], "leg_m_R2": ["leg_m_R1"],
-        "m_L0": ["neck", "m_L1"], "m_L1": ["m_L0"],
-        "m_R0": ["neck", "m_R1"], "m_R1": ["m_R0"],
-        "s_small": ["s_large"], "s_large": []
-    },
-    "symmetry_map": [('a_L1', 'a_R1'),
-                     ('a_L2', 'a_R2'),
-                     ('a_L1', 'a_R1'),
-                     ('a_L2', 'a_R2'),
-                     ('leg_f_L1', 'leg_f_R1'),
-                     ('leg_f_L2', 'leg_f_R2'),
-                     ('leg_f_L1', 'leg_f_R1'),
-                     ('leg_f_L2', 'leg_f_R2'),
-                     ('leg_m_L1', 'leg_m_R1'),
-                     ('leg_m_L2', 'leg_m_R2'),
-                     ('leg_m_L1', 'leg_m_R1'),
-                     ('leg_m_L2', 'leg_m_R2'),
-                     ('a_R0', 'a_L0'),
-                     ('a_R0', 'a_L0'),
-                     ('leg_f_R0', 'leg_f_L0'),
-                     ('leg_f_R0', 'leg_f_L0'),
-                     ('leg_m_R0', 'leg_m_L0'),
-                     ('leg_m_R0', 'leg_m_L0'),
-                     ('eye_L', 'eye_R'),
-                     ('eye_L', 'eye_R'),
-                     ('m_L0', 'm_R0'),
-                     ('m_L0', 'm_R0'),
-                     ('m_L1', 'm_R1'),
-                     ('m_L1', 'm_R1')],
-    "point_colors": np.array([
-        [255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255], [255, 0, 255],
-        [192, 192, 192], [255, 128, 0], [128, 0, 255], [255, 128, 128], [128, 128, 0],
-        [0, 128, 128], [128, 0, 128], [192, 128, 128], [128, 192, 128], [128, 128, 192],
-        [192, 192, 128], [192, 128, 192], [128, 192, 192], [255, 255, 255], [0, 0, 0],
-        [128, 128, 128], [255, 128, 64], [128, 64, 255], [210, 105, 30], [128, 255, 64],
-        [128, 64, 0], [64, 128, 255]
-    ], dtype=np.uint8)
-}
 
 # Camera visualisation colors
 CAMERA_COLORS = [

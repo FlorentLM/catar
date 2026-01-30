@@ -21,10 +21,12 @@ class OverlapStats(NamedTuple):
 def compute_comparison_stats(points_a, points_b, conflict_threshold, safe_threshold):
     valid_a = ~np.isnan(points_a[..., 0])
     valid_b = ~np.isnan(points_b[..., 0])
+
     overlap = valid_a & valid_b
     total = np.sum(overlap)
 
-    if total == 0: return None
+    if total == 0:
+        return None
 
     dists = np.linalg.norm(points_a[overlap, :2] - points_b[overlap, :2], axis=1)
 
@@ -55,13 +57,13 @@ def detect_track_collision(existing_annots, new_predictions, rig: 'CameraRig', d
 
     check_type = "2D"
     if np.any(valid_3d_mask):
+
         # Reproject expectations
         p3d = existing_3d[:, :3]
-        if p3d.ndim == 1: p3d = p3d[None, :]
+        if p3d.ndim == 1:
+            p3d = p3d[None, :]
 
         reproj = rig.project(p3d)  # (C, P, 2)
-
-        # Handle shape mismatch if rig subset (unlikely with full rig)
         if reproj.shape[:-1] != new_predictions[..., :2].shape[:-1]:
             return False  # cant compare mismatched shapes
 
@@ -81,33 +83,36 @@ def detect_track_collision(existing_annots, new_predictions, rig: 'CameraRig', d
 
 def snap_annotation(app_state, target_cam_idx, point_idx, frame_idx, click_pos):
     """Snap click to epipolar line intersection from other views."""
-    annots = app_state.data.get_point_annotations(frame_idx, point_idx)
+
+    annots = app_state.data.get_2d(frame=frame_idx, keypoint=point_idx)
+
     rig = app_state.rig
+    target_camera = rig.get_name(target_cam_idx)
 
     valid_mask = ~np.isnan(annots[:, 0])
     valid_mask[target_cam_idx] = False  # exclude self
 
     valid_cams = np.where(valid_mask)[0]
-    if len(valid_cams) < 2: return None
+    if len(valid_cams) < 2:
+        return None
 
-    cam_names = [rig.names[i] for i in valid_cams]
-    obs = annots[valid_cams, :2][:, None, :]
-    weights = annots[valid_cams, 2][:, None]
+    cam_names = [rig.names[i] for i in valid_cams]  # This *needs* to be in order # TODO: Fix that in Lucida
 
-    p3d = rig.triangulate(obs, weights=weights, cameras=cam_names).flatten()
+    p3d = rig.triangulate(annots[:, :2], weights=annots[:, 2], cameras=cam_names).flatten()
+    if np.isnan(p3d).any():
+        return None
 
-    if np.isnan(p3d).any(): return None
+    reproj = rig[target_camera].project(p3d).flatten()
 
-    reproj = rig[rig.names[target_cam_idx]].project(p3d).flatten()
-
-    if np.linalg.norm(reproj - click_pos) > 20: return None
+    if np.linalg.norm(reproj - click_pos) > 20:
+        return None
 
     return reproj
 
 
 def fuse_annotations(
         existing_annots: np.ndarray,
-        human_flags: np.ndarray,
+        manual_flags: np.ndarray,
         lk_annots: np.ndarray,
         model_annots: np.ndarray,
 ) -> np.ndarray:
@@ -123,7 +128,7 @@ def fuse_annotations(
 
             # Check existing data (Source 1: Human or Source 2: prior auto track)
             if not np.isnan(existing_annots[c, p, 0]):
-                type_str = 'human' if human_flags[c, p] else 'prior'
+                type_str = 'human' if manual_flags[c, p] else 'prior'
                 sources.append({
                     'pos': existing_annots[c, p, :2],
                     'conf': existing_annots[c, p, 2],

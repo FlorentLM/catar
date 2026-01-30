@@ -10,7 +10,7 @@ from gui.rendering import resize_video_widgets
 from gui.callbacks.annotation_callbacks import (
     set_selected_point_callback,
     clear_future_annotations_callback,
-    set_human_annotated_callback
+    set_manual_annotation_callback
 )
 from gui.callbacks.calibration_callbacks import (
     addremove_calib_frame_callback,
@@ -269,8 +269,8 @@ def create_control_panel(app_state: 'AppState', queues: 'Queues'):
             tag="point_combo"
         )
         dpg.add_button(
-            label="Set as Human annotated (H)",
-            callback=set_human_annotated_callback,
+            label="Set as Human-annotated (H)",
+            callback=set_manual_annotation_callback,
             user_data=user_data,
         )
         dpg.add_button(
