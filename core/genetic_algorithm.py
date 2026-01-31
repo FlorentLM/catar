@@ -96,14 +96,14 @@ def compute_fitness(
 
     points_3d = np.array(points_3d_per_frame)  # shape (F_valid, P, 3)
 
-    num_frames, num_points, _ = points_3d.shape
+    nb_frames, num_points, _ = points_3d.shape
     points_3d_flat = points_3d.reshape(-1, 3)  # shape (F*P, 3)
 
     # Project all points into all cameras
     reprojected_flat = individual.project(points_3d_flat)  # (C, F*P, 2)
 
     # Reshape back to match annotation structure
-    reprojected_unflat = reprojected_flat.reshape(num_cams, num_frames, num_points, 2)
+    reprojected_unflat = reprojected_flat.reshape(num_cams, nb_frames, num_points, 2)
     reprojected_final = np.transpose(reprojected_unflat, (1, 0, 2, 3))  # shape (F, C, P, 2)
 
     # Calculate error

@@ -1,17 +1,14 @@
 import queue
 import threading
-from typing import TYPE_CHECKING, List, Optional
-
+from typing import TYPE_CHECKING, List
 import cv2
 import numpy as np
 
 import config
-from gui.rendering import create_camera_visual, Object3D, Viewer3D
+from gui.rendering import create_camera_visual, Object3D
 
 if TYPE_CHECKING:
     from state import AppState
-    from mokap.pose_reconstruction.soup import Reconstructor
-    from mokap.pose_reconstruction.assembly import MultiObjectTracker
 
 
 class RenderingWorker(threading.Thread):
@@ -20,26 +17,20 @@ class RenderingWorker(threading.Thread):
     def __init__(
         self,
         app_state: 'AppState',
-        reconstructor: 'Reconstructor',
-        tracker: 'MultiObjectTracker',
-        frames_in_queue: queue.Queue,
-        results_out_queue: queue.Queue,
-        viewer_3d: Optional['Viewer3D'],
+        in_queue: queue.Queue,
+        results_queue: queue.Queue,
     ):
         super().__init__(daemon=True, name="RenderingWorker")
         self.app_state = app_state
-        self.viewer_3d = viewer_3d
-        self.reconstructor = reconstructor
-        self.tracker = tracker
-        self.frames_in_queue = frames_in_queue
-        self.results_out_queue = results_out_queue
+        self.frames_queue = in_queue
+        self.results_queue = results_queue
         self.shutdown_event = threading.Event()
 
     def run(self):
         print("Rendering worker started.")
         while not self.shutdown_event.is_set():
             try:
-                data = self.frames_in_queue.get(timeout=1.0)
+                data = self.frames_queue.get(timeout=1.0)
                 if data.get("action") == "shutdown":
                     self.shutdown_event.set()
                     break
@@ -61,17 +52,17 @@ class RenderingWorker(threading.Thread):
 
         with self.app_state.lock:
             # Cache the raw video frames for the loupe tool
-            self.app_state.current_video_frames = data["raw_frames"]
+            self.app_state.current_frames_data = data["frames"]
 
-        if not config.DISABLE_3D_VIEW and self.viewer_3d is not None:
+        if self.app_state.viewer_3d is not None:
             scene = self._build_3d_scene()
-            self.viewer_3d.queue_update(scene)
+            self.app_state.viewer_3d.queue_update(scene)
 
         # Resize all frames to display size
-        video_frames = [
-            cv2.resize(frame, (config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT))
-            for frame in data["raw_frames"]
-        ]
+        video_frames = {
+                cam_name: cv2.resize(frame, (config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT))
+                for cam_name, frame in data["frames"].items()
+            }
 
         # Send to GUI for display
         self._send_results({
@@ -85,13 +76,9 @@ class RenderingWorker(threading.Thread):
         scene = []
 
         with self.app_state.lock:
-            rig = self.app_state.rig
-
             if self.app_state.show_cameras_in_3d:
-                for cam_name in rig.names:
-                    scene.extend(
-                        create_camera_visual(rig, cam_name, self.app_state.scene_centre)
-                    )
+                for camera in self.app_state.rig:
+                    scene.extend(create_camera_visual(camera, self.app_state.scene_centre))
 
             # Add reconstructed points and skeleton
             frame_idx = self.app_state.frame_idx
@@ -126,15 +113,14 @@ class RenderingWorker(threading.Thread):
                             ))
                     except ValueError:
                         pass
-
         return scene
 
     def _send_results(self, results: dict):
         """Sends rendered results to GUI and clears old data."""
 
-        while not self.results_out_queue.empty():
+        while not self.results_queue.empty():
             try:
-                self.results_out_queue.get_nowait()
+                self.results_queue.get_nowait()
             except queue.Empty:
                 break
-        self.results_out_queue.put(results)
+        self.results_queue.put(results)

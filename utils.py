@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Union
 
 import Levenshtein
 import numpy as np
@@ -36,61 +36,49 @@ def get_confidence_color(confidence: float) -> tuple:
     return r, g, b
 
 
-def load_and_match_videos(data_folder: Path, video_format: str) -> Tuple[
-    List[str], List[str], List[str], CameraRig]:
+def load_and_match_videos(
+        rig_path: Union[str, Path],
+        videos_folder: Union[str, Path],
+        video_format: str
+    ) -> Tuple[CameraRig, List[Path]]:
     """
     Load videos and calibration with smart names matching.
-
-    Returns:
-        Tuple of (video_paths, video_filenames, camera_names, camera_rig)
     """
 
-    # Fallback to Lucida specific file if parameters.toml doesn't exist
-    rig_file = data_folder / 'rig.toml'
+    rig_path = Path(rig_path)
+    videos_folder = Path(videos_folder)
 
-    if rig_file.exists():
-        print(f"Loading Lucida rig from '{rig_file}'...")
-        rig = CameraRig.load(rig_file)
-        toml_names = rig.names
+    if rig_path.is_file():
+        rig = CameraRig.load(rig_path)
+        print(f"Loaded camera rig from '{rig_path}'")
     else:
-        print(f"ERROR: No calibration file ('rig.toml') found in '{data_folder}'")
+        print(f"ERROR: Calibration file '{rig_path}' not found.")
         sys.exit(1)
 
-    # Find video files
-    video_paths = sorted(data_folder.glob(f'*.{video_format.strip("*.")}'))
+    video_paths = sorted(videos_folder.glob(f'*.{video_format.strip("*.")}'))
     if not video_paths:
-        print(f"ERROR: No videos matching '{video_format}' found in '{data_folder}'")
+        print(f"ERROR: No videos matching '{video_format}' found in '{videos_folder}'")
         sys.exit(1)
 
-    video_filenames = [p.name for p in video_paths]
+    nb_cameras = len(rig)
+    nb_videos = len(video_paths)
 
-    if len(toml_names) != len(video_paths):
-        print(f"ERROR: Number of cameras in calibration ({len(toml_names)}) "
-              f"doesn't match number of videos ({len(video_paths)})")
+    if nb_cameras != nb_videos:
+        print(f"ERROR: Number of cameras in calibration ({nb_cameras}) doesn't match number of videos ({nb_videos})")
         sys.exit(1)
+    print(f"Found {nb_videos} videos in {videos_folder}")
 
     # Match with Levenshtein distance
-    n = len(toml_names)
-    cost_matrix = np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            cost_matrix[i, j] = Levenshtein.distance(toml_names[i], video_filenames[j])
+    cost_matrix = np.zeros((nb_cameras, nb_cameras))
+    for i in range(nb_cameras):
+        for j in range(nb_cameras):
+            cost_matrix[i, j] = Levenshtein.distance(rig.names[i], video_paths[j].name)
+    rig_indices, video_indices = linear_sum_assignment(cost_matrix)
 
-    toml_indices, video_indices = linear_sum_assignment(cost_matrix)
+    rtv_map = dict(zip(rig_indices, video_indices))
+    ordered_paths = [video_paths[rtv_map[i]] for i in range(nb_cameras)]
 
-    ordered_paths = ["" for _ in range(n)]
-    ordered_filenames = ["" for _ in range(n)]
-    ordered_toml_names = toml_names
-
-    # Create a map from the toml_index (from the assignment) back to the video_index
-    toml_to_video_map = {ti: vi for ti, vi in zip(toml_indices, video_indices)}
-
-    for i in range(n):  # i is the index in the sorted toml_names list
-        matched_video_idx = toml_to_video_map[i]
-        ordered_paths[i] = str(video_paths[matched_video_idx])
-        ordered_filenames[i] = video_filenames[matched_video_idx]
-
-    return ordered_paths, ordered_filenames, ordered_toml_names, rig
+    return rig, ordered_paths
 
 
 def line_box_intersection(a: float, b: float, c: float, box_x: float, box_y: float, box_w: float, box_h: float) -> list:

@@ -2,23 +2,38 @@
 All application state and communication queues are managed here.
 """
 import queue
+import sys
 import threading
 import multiprocessing
+
 import numpy as np
 import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass, field
 
 import config
+from gui.rendering import Viewer3D
 
 from state.data_manager import DataManager
 
 from lucida.utils import probe_video
 from lucida import CameraRig
 
-if TYPE_CHECKING:
-    from mokap.pose_reconstruction.skeleton import Skeleton
+from utils import load_and_match_videos
+
+from mokap.pose_reconstruction.skeleton import Skeleton, SkeletonStats
+
+from video import DiskCacheBuilder, create_video_backend
+
+
+@dataclass
+class VideoInfo:
+    path: Path
+    width: int
+    height: int
+    frame_count: int
+    fps: float
 
 
 @dataclass
@@ -66,67 +81,107 @@ class AppState:
     Thread-safe container for application state.
     """
 
-    def __init__(
-        self,
-        data_folder: Union[Path, str],
-        video_paths: List[Union[Path, str]],
-        rig: CameraRig,
-        skeleton: Optional['Skeleton'] = None,
-    ):
-        if len(rig) != len(video_paths):
-            raise ValueError("Mismatch between number of cameras in rig and video paths.")
+    def __init__(self):
 
-        self.data_folder = Path(data_folder)
-        if hasattr(config, 'VIDEO_CACHE_FOLDER'):
-            self.video_cache_dir = Path(config.VIDEO_CACHE_FOLDER)
-        else:
-            self.video_cache_dir = self.data_folder / 'video_cache'
-
-        self.video_backend = None
-
-        # Keep top-level lock for app-wide state coordination
         self.lock = threading.RLock()
 
-        # Video information (constant during runtime)
-        self.video_paths: List[Path] = [Path(p).resolve() for p in video_paths]
-        self.video_filenames: List[str] = [Path(p).name for p in video_paths]
+        # Load config values # TODO: Use an actual config file
+        data_folder = Path(config.DATA_FOLDER) if hasattr(config, 'DATA_FOLDER') else Path.cwd() / 'data'
+        rig_path = Path(config.CAMERA_RIG_TOML) if hasattr(config, 'CAMERA_RIG_TOML') else data_folder / 'rig.toml'
+        skel_path = Path(config.SKELETON_FILE) if hasattr(config, 'SKELETON_FILE') else data_folder / 'messor_skeleton.toml'
+        skel_stats_path = Path(config.SKELETON_STATS_FILE) if hasattr(config, 'SKELETON_STATS_FILE') else data_folder / 'skeleton_stats.json'
+        vid_folder = Path(config.VIDEOS_PATH) if hasattr(config, 'VIDEOS_PATH') else data_folder
+        vid_fmt = config.VIDEO_FORMAT if hasattr(config, 'VIDEO_FORMAT') else 'mp4'
+        vid_cache = Path(config.VIDEO_CACHE_FOLDER) if hasattr(config, 'VIDEO_CACHE_FOLDER') else data_folder / 'video_cache'
+        disable_viwer_3d = config.DISABLE_3D_VIEW if hasattr(config, 'DISABLE_3D_VIEW') else False
 
-        # Probe videos for metadata
-        self._video_metadata: Dict[str, Dict[str, Any]] = {}
-        for name, path in zip(rig.names, self.video_paths):
-            self._video_metadata[name] = probe_video(path)
 
-            cam = rig[name]
-            vid_w = self._video_metadata[name]['width']
-            vid_h = self._video_metadata[name]['height']
+        # Create data folder if first launch
+        if not data_folder.is_dir():
+            data_folder.mkdir(parents=True)
+            print(f"Created '{data_folder}' directory. Please add videos and calibration.")
+            sys.exit(0)
+        else:
+            self.data_folder = data_folder
 
-            # Check for explicit resolution mismatch vs what was loaded
-            if cam.intrinsics.width != vid_w or cam.intrinsics.height != vid_h:
-                print(f"Resizing camera '{name}' intrinsics from {cam.intrinsics.image_size} to {(vid_w, vid_h)}")
-                rig[name] = cam.resize((vid_w, vid_h))
+        # Load camera rig and match video files
+        camera_rig, ordered_video_paths = load_and_match_videos(
+            rig_path=rig_path,
+            videos_folder=vid_folder,
+            video_format=vid_fmt
+        )
+        self.rig = camera_rig
+        self.video_paths: Dict[str, Path] = dict(zip(camera_rig.names, ordered_video_paths))
 
-        # Use first video as session reference
-        first_metadata = self._video_metadata[rig.names[0]]
-        self.video_metadata = first_metadata.copy()
-        self.video_metadata['num_videos'] = len(video_paths)
+        # Videos information
+        self.video_info: Dict[str, VideoInfo] = {}
+        for cam_name, path in self.video_paths.items():
+            m = probe_video(path)
+            self.video_info[cam_name] = VideoInfo(
+                path=path,
+                width=m['width'],
+                height=m['height'],
+                frame_count=m['num_frames'],
+                fps=m['fps']
+            )
 
-        # Video metadata
-        self.frame_width: int = first_metadata['width']
-        self.frame_height: int = first_metadata['height']
-        self.num_frames: int = first_metadata['num_frames']
-        self.video_duration: float = first_metadata['duration']
-        self.fps: float = first_metadata['fps'] or 30.0
+        fps_vals = [v.fps for v in self.video_info.values()]
+        nbframes_vals = [m.frame_count for m in self.video_info.values()]
 
+        # All framerates should be identidal (whithin smol tolerance)
+        for fps in fps_vals:
+            if abs(fps - fps_vals[0]) > 0.01:
+                raise ValueError(f"Inconsistent framerates detected. All cameras must have synchronized framerates.")
+
+        self.fps = fps_vals[0]  # all the same, take any
+        self.frame_count = min(nbframes_vals)  # take the one with fewer frames just in case # TODO: could alternatively get the readers to retrn blakc frames for shorted videos
+
+        print("Initialising video backend...")
+        self.video_cache_dir = vid_cache
+        builder = DiskCacheBuilder(
+            video_paths=self.video_paths,
+            cache_dir=self.video_cache_dir
+        )
+        cache_exists, cache_metadata = builder.check_cache_exists()
+
+        video_backend = create_video_backend(
+            video_paths=self.video_paths,
+            video_metadata=self.video_info,
+            cache_dir=builder.cache_dir if cache_exists else None,
+            backend_type='auto',
+            ram_budget_gb=config.RAM_MAX_BUDGET_GB
+        )
+        print(f"Using backend: {type(video_backend).__name__}")
+        self.video_backend = video_backend
+
+
+        # Tracking params
         half_life_frames = config.TRACKER_HALF_LIFE_CONFIDENCE_DECAY * self.fps
         if half_life_frames > 0:
             self.tracker_decay_rate = 0.5 ** (1.0 / half_life_frames)
         else:
             self.tracker_decay_rate = 0.0
-        print(f"Tracker: Half-life {config.TRACKER_HALF_LIFE_CONFIDENCE_DECAY:.1f}s @ {self.fps:.2f} FPS "
-              f"-> Decay rate per frame: {self.tracker_decay_rate:.4f}")
 
-        # State objects
-        self.rig: CameraRig = rig
+        # Load skeleton definition and stats
+        self.skeleton = Skeleton.load(skel_path)
+        self.skeleton_stats = SkeletonStats.load(skel_stats_path, self.skeleton)
+
+        if self.skeleton_stats.reference_bone:
+            print(f"  Reference bone: {self.skeleton_stats.reference_bone}")
+            print(
+                f"  Reference length: {self.skeleton_stats.reference_length_world:.2f}"
+                f" {self.skeleton.metadata.units if self.skeleton.metadata else 'units'}")
+        else:
+            print("  No reference bone set (stats will be learned online)")
+
+        # Keypoints order and lookup accessors
+
+        self.point_nti = {name: i for i, name in enumerate(self.skeleton.keypoints)}
+        self.point_itn = {i: name for name, i in self.point_nti.items()}
+
+        # TODO: Derive skeleton_points_set from skeleton config (points that are part of the skeleton graph)
+        # TODO: Add GUI functionality to add/remove non-skeleton points for object tracking and scaffolding
+        self.non_skeleton_points = ('s_small', 's_large')
 
         # Additional calibration state not held in Lucida
         self.calibration_frames: List[int] = []
@@ -136,78 +191,62 @@ class AppState:
         self.volume_bounds = {'x': (-1e9, 1e9), 'y': (-1e9, 1e9), 'z': (-1e9, 1e9)}
         self.scene_centre = np.zeros(3)
 
-        # Keypoints order and lookup accessors
-
-        # TODO: Derive skeleton_points_set from skeleton config (points that are part of the skeleton graph)
-        # TODO: Add GUI functionality to add/remove non-skeleton points for object tracking and scaffolding
-
-        self.point_names = tuple(skeleton.keypoints)
-        self.point_nti = {name: i for i, name in enumerate(self.point_names)}
-        self.point_itn = {i: name for name, i in self.point_nti.items()}
-
-        self.skeleton = skeleton
-        self.all_points_set = set(self.point_names)
-
-        self.skeleton_points_set = set(self.point_names) - {'s_small', 's_large'}
-        self.non_skeleton_points_set = {'s_small', 's_large'}
-
-
-
         self.camera_colors = config.CAMERA_COLORS
-        self.num_points = len(self.point_names)
 
-
+        # Initialise 2D and 3D data manager
         self.data = DataManager(
-            nb_frames=self.num_frames,
-            camera_names=list(rig.names),
-            keypoint_names=list(self.point_names),
+            nb_frames=self.frame_count,
+            camera_names=self.rig.names,
+            keypoint_names=self.skeleton.keypoints,
         )
 
-        # Playback State
-        self.frame_idx: int = 0
-        self.paused: bool = True
-        self.is_seeking: bool = False
+        # Initialise viewer 3D
+        self.viewer_3d = Viewer3D() if not disable_viwer_3d else None
 
         # UI State
-        self.selected_point_idx: int = 0
-        self.focus_selected_point: bool = False
-        self.show_cameras_in_3d: bool = True
+        self.frame_idx: int = 0
+        self.selected_keypoint: str = self.point_names[0]
+        self.focus_mode: bool = False
+
+        self.paused: bool = True
+        self.is_seeking: bool = False
         self.drag_state: Dict[str, Any] = {}
+
+        self.show_cameras_in_3d: bool = True
         self.show_reprojection_error: bool = True
         self.show_all_labels: bool = False
         self.show_epipolar_lines: bool = True
         self.temp_hide_overlays: bool = False
 
-        # Feature Flags
-        self.keypoint_tracking_enabled: bool = False
-        self.needs_3d_reconstruction: bool = True
+        # Feature flags
+        self.live_tracking_enabled: bool = False
+        self.needs_reconstruction: bool = True
         self.tracker_collision_stop: bool = True
 
         # Transient UI data
         # Frame cache for UI zoom (raw frames from current playback position)
-        self.current_video_frames: Optional[List[np.ndarray]] = None
+        self.current_frames_data: Optional[List[np.ndarray]] = None     # TODO: this needs to be a dict
 
-    def get_video_metadata(self, camera_name: str) -> Dict[str, Any]:
-        """Get metadata for a specific camera's video."""
-        return self._video_metadata[camera_name]
+    @property
+    def point_names(self):
+        return list(self.skeleton.keypoints) + list(self.non_skeleton_points)
+
+    @property
+    def num_points(self):
+        return len(self.point_names)
 
     # Snapshot Methods (for GA and BA workers)
 
     def get_ga_snapshot(self) -> Dict[str, Any]:
         """
         Create snapshot of state needed by the GA worker.
-        Camera names and image sizes are derived from the rig.
         """
         with self.lock:
-            # Use the numpy compatibility layer
-            with self.data.read_lock():
-                annotations_copy = self.data.annotations.copy()
-
             return {
-                "annotations": annotations_copy,
+                "annotations": self.data.get_2d(copy=True),
                 "calibration_frames": list(self.calibration_frames),
                 "best_fitness": self.ga_best_fitness,
-                "best_individual": self.rig.to_dict(),
+                "best_calibration": self.rig.to_dict(),
                 "generation": 0,
                 "scene_centre": self.scene_centre.copy()
             }
@@ -215,30 +254,28 @@ class AppState:
     def get_ba_snapshot(self) -> Dict[str, Any]:
         """
         Create a snapshot of state needed by the BA worker.
-        Camera names and image sizes are derived from the rig.
         """
         with self.lock:
-            with self.data.read_lock():
-                annotations_copy = self.data.annotations.copy()
-
             return {
-                "annotations": annotations_copy,
+                "annotations": self.data.get_2d(copy=True),
                 "calibration_frames": list(self.calibration_frames),
-                "best_individual": self.rig.to_dict(),
+                "best_calibration": self.rig.to_dict(),
             }
 
-    # Persistence (Save / Load)
+    # Persistence
 
-    def save(self, folder: Path):
+    def save(self, folder: Optional[Union[str, Path]] = None):
         """
         Save all persistent state to disk.
         """
-        folder = Path(folder)
+        if folder is None:
+            folder = self.data_folder
+        else:
+            folder = Path(folder)
         print(f"Saving state to: '{folder}'")
 
         with self.lock:
             try:
-
                 self.data.save(folder, prefix='catar')
                 print("  - Saved annotations and 3D points (Parquet format)")
 
@@ -256,11 +293,14 @@ class AppState:
                 import traceback
                 traceback.print_exc()
 
-    def load(self, folder: Path):
+    def load(self, folder: Optional[Union[str, Path]] = None):
         """
         Load persistent state from disk.
         """
-        folder = Path(folder)
+        if folder is None:
+            folder = self.data_folder
+        else:
+           folder = Path(folder)
         print(f"Loading state from: '{folder}'")
 
         data_files_exist = (
@@ -268,7 +308,7 @@ class AppState:
             (folder / 'catar_points3d.parquet').exists()
         )
 
-        # Load data
+        # Load point data
         if data_files_exist:
             print("  Loading data (Polars/Parquet format)...")
             try:

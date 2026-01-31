@@ -11,16 +11,17 @@ def image_mousedown_callback(sender, app_data, user_data):
     """Handle mouse click on video view (for annotating)."""
 
     app_state = user_data["app_state"]
-    cam_idx = user_data["cam_idx"]
-    drawlist_tag = f"drawlist_{cam_idx}"
+    camera_name = user_data["camera_name"]
+    drawlist_tag = f"drawlist_{camera_name}"
 
     with app_state.lock:
         frame_idx = app_state.frame_idx
-        p_idx = app_state.selected_point_idx
-        camera_name = app_state.rig.names[cam_idx]
-        video_meta = app_state.get_video_metadata(camera_name)
+        keypoint = app_state.selected_keypoint
+        keypoint_idx = app_state.point_nti[keypoint]
+        w = app_state.video_info[camera_name].width
+        h = app_state.video_info[camera_name].height
 
-    annotations = app_state.data.get_2d(frame=frame_idx, camera=cam_idx)
+    annotations = app_state.data.get_2d(frame=frame_idx, camera=camera_name)
 
     # Get mouse pos (image coordinates)
     container_pos = dpg.get_item_rect_min(drawlist_tag)
@@ -35,20 +36,20 @@ def image_mousedown_callback(sender, app_data, user_data):
     )
     scaled_pos = np.array(
         (
-            local_pos[0] * video_meta['width'] / container_size[0],
-            local_pos[1] * video_meta['height'] / container_size[1]
+            local_pos[0] * w / container_size[0],
+            local_pos[1] * h / container_size[1]
         ),
         dtype=np.float32
     )
 
     # Check if near existing point
-    existing_point = annotations[p_idx, :2]  # only check x, y
+    existing_point = annotations[keypoint_idx, :2]  # only check x, y
     is_drag_start = False
 
     if not np.isnan(existing_point).any():
         existing_local = (
-            existing_point[0] * container_size[0] / video_meta['width'],
-            existing_point[1] * container_size[1] / video_meta['height']
+            existing_point[0] * container_size[0] / w,
+            existing_point[1] * container_size[1] / h
         )
         dist = np.linalg.norm(np.array(local_pos) - np.array(existing_local))
         if dist < config.ANNOTATION_DRAG_THRESHOLD:
@@ -59,25 +60,25 @@ def image_mousedown_callback(sender, app_data, user_data):
 
             if is_drag_start:
                 # Use existing point's position for the drag operation
-                annotation_pos_for_drag = app_state.data.get_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, copy=True)
+                annotation_pos_for_drag = app_state.data.get_2d(frame=frame_idx, camera=camera_name, keypoint=keypoint, copy=True)
 
             else:
                 # Create a new point
-                snapped_pos = snap_annotation(app_state, cam_idx, p_idx, frame_idx, scaled_pos)
+                snapped_pos = snap_annotation(app_state, camera_name, keypoint, frame_idx, scaled_pos)
                 final_pos = snapped_pos if snapped_pos is not None else scaled_pos
 
                 # Assign the new annotation (x, y, confidence=1.0)
-                app_state.data.set_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, data=[*final_pos, 1.0], is_manual=True)
+                app_state.data.set_2d(frame=frame_idx, camera=camera_name, keypoint=keypoint, data=[*final_pos, 1.0], is_manual=True)
 
-                app_state.needs_3d_reconstruction = True
+                app_state.needs_reconstruction = True
                 annotation_pos_for_drag = final_pos
 
             # Offset between the mouse and the point (to prevent 'stickiness')
             drag_offset = scaled_pos - annotation_pos_for_drag[:2]
 
             app_state.drag_state = {
-                "cam_idx": cam_idx,
-                "p_idx": p_idx,
+                "camera_name": camera_name,
+                "keypoint": keypoint,
                 "active": True,
                 "drag_offset": drag_offset,
                 "is_slowing_down": False,
@@ -91,8 +92,8 @@ def image_mousedown_callback(sender, app_data, user_data):
 
         elif app_data[0] == 1:  # right click = delete
             # Delete x, y, and confidence
-            app_state.data.set_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, data=None)
-            app_state.needs_3d_reconstruction = True
+            app_state.data.set_2d(frame=frame_idx, camera=camera_name, keypoint=keypoint, data=None)
+            app_state.needs_reconstruction = True
 
 
 def image_mousedrag_callback(sender, app_data, user_data):
@@ -104,18 +105,17 @@ def image_mousedrag_callback(sender, app_data, user_data):
         if not app_state.drag_state.get("active"):
             return
 
-        cam_idx = app_state.drag_state["cam_idx"]
-        p_idx = app_state.drag_state["p_idx"]
-        frame_idx = app_state.frame_idx
-
-        camera_name = app_state.rig.names[cam_idx]
-        video_meta = app_state.get_video_metadata(camera_name)
-        video_w = video_meta['width']
-        video_h = video_meta['height']
-
-        current_frames = app_state.current_video_frames
-
         rig = app_state.rig
+
+        camera_name = app_state.drag_state["camera_name"]
+        camera_idx = rig.get_index(camera_name)   # TODO: avoid this
+        keypoint = app_state.drag_state["keypoint"]
+        keypoint_idx = app_state.point_nti[keypoint]  # TODO: avoid this
+        frame_idx = app_state.frame_idx
+        w = app_state.video_info[camera_name].width
+        h = app_state.video_info[camera_name].height
+
+        current_frames = app_state.current_frames_data
 
         show_epipolar_lines = app_state.show_epipolar_lines
         temp_hide_overlays = app_state.temp_hide_overlays
@@ -123,15 +123,15 @@ def image_mousedrag_callback(sender, app_data, user_data):
 
     all_annotations = app_state.data.get_2d(frame=frame_idx)
 
-    point_3d_selected = app_state.data.get_3d(frame=frame_idx, keypoint=p_idx)
+    point_3d_selected = app_state.data.get_3d(frame=frame_idx, keypoint=keypoint)
 
     if current_frames is None:
         return
 
-    video_frame = current_frames[cam_idx]
+    video_frame = current_frames[camera_name]
 
     # Calculate mouse pos
-    drawlist_tag = f"drawlist_{cam_idx}"
+    drawlist_tag = f"drawlist_{camera_name}"
     container_pos = dpg.get_item_rect_min(drawlist_tag)
     container_size = dpg.get_item_rect_size(drawlist_tag)
     if container_size[0] == 0:
@@ -140,7 +140,7 @@ def image_mousedrag_callback(sender, app_data, user_data):
     mouse_pos = dpg.get_mouse_pos(local=False)
     local_pos = (mouse_pos[0] - container_pos[0], mouse_pos[1] - container_pos[1])
     current_scaled_pos = np.array(
-        (local_pos[0] * video_w / container_size[0], local_pos[1] * video_h / container_size[1]),
+        (local_pos[0] * w / container_size[0], local_pos[1] * h / container_size[1]),
         dtype=np.float32
     )
 
@@ -158,7 +158,7 @@ def image_mousedrag_callback(sender, app_data, user_data):
             drag_state["slow_down_start_mouse_pos"] = current_scaled_pos.copy()
             with app_state.lock:
                 # get (x, y) coordinates
-                xy_coords = app_state.data.get_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, copy=True)[:2]
+                xy_coords = app_state.data.get_2d(frame=frame_idx, camera=camera_name, keypoint=keypoint, copy=True)[:2]
                 drag_state["slow_down_start_annotation_pos"] = xy_coords
 
         # Continue slow movement relative to the anchor point
@@ -174,14 +174,14 @@ def image_mousedrag_callback(sender, app_data, user_data):
         final_scaled_pos = current_scaled_pos - drag_state["drag_offset"]
 
     # Clamp position to be in video boundaries
-    final_scaled_pos[0] = np.clip(final_scaled_pos[0], 0, video_w - 1)
-    final_scaled_pos[1] = np.clip(final_scaled_pos[1], 0, video_h - 1)
+    final_scaled_pos[0] = np.clip(final_scaled_pos[0], 0, w - 1)
+    final_scaled_pos[1] = np.clip(final_scaled_pos[1], 0, h - 1)
 
     with app_state.lock:
         # Update the (x, y) and set confidence to 1.0 (it's a manual annotation)
-        app_state.data.set_2d(frame=frame_idx, camera=cam_idx, keypoint=p_idx, data=[*final_scaled_pos, 1.0], is_manual=True)
+        app_state.data.set_2d(frame=frame_idx, camera=camera_name, keypoint=keypoint, data=[*final_scaled_pos, 1.0], is_manual=True)
 
-        app_state.needs_3d_reconstruction = True
+        app_state.needs_reconstruction = True
         app_state.drag_state = drag_state  # write updated state back
 
     # Update loupe background texture with subpixel accuracy
@@ -196,8 +196,8 @@ def image_mousedrag_callback(sender, app_data, user_data):
     patch_size = (int(src_patch_width), int(src_patch_width))
 
     # Handle edge cases for crop
-    if (center_coords[0] < 0 or center_coords[0] >= video_w or
-            center_coords[1] < 0 or center_coords[1] >= video_h):
+    if (center_coords[0] < 0 or center_coords[0] >= w or
+            center_coords[1] < 0 or center_coords[1] >= h):
         patch = np.zeros((patch_size[1], patch_size[0], 3), dtype=np.uint8)
     else:
         patch = cv2.getRectSubPix(video_frame, patch_size, center_coords)
@@ -213,22 +213,21 @@ def image_mousedrag_callback(sender, app_data, user_data):
     layer_tag = "loupe_overlay_layer"
 
     def to_loupe_coords(p):
-        return ((p[0] - src_x) * zoom_factor, (p[1] - src_y) * zoom_factor)
+        return (p[0] - src_x) * zoom_factor, (p[1] - src_y) * zoom_factor
 
     # Draw epipolar lines for selected point
     if show_epipolar_lines and not temp_hide_overlays and len(rig) > 1:
-        target_cam_name = rig.names[cam_idx]
 
         for from_cam_idx in range(len(current_frames)):
-            if cam_idx == from_cam_idx:
+            if camera_idx == from_cam_idx:
                 continue
 
-            point_2d = all_annotations[from_cam_idx, p_idx, :2]
+            point_2d = all_annotations[from_cam_idx, keypoint_idx, :2]
             if np.isnan(point_2d).any():
                 continue
 
             from_cam_name = rig.names[from_cam_idx]
-            F = rig.F_between(from_cam_name, target_cam_name)
+            F = rig.F_between(from_cam_name, camera_name)
 
             p_hom = np.array([point_2d[0], point_2d[1], 1.0])
             line = F @ p_hom
@@ -243,9 +242,8 @@ def image_mousedrag_callback(sender, app_data, user_data):
 
     # Draw reprojection for selected point
     if not temp_hide_overlays and len(rig) > 0 and not np.isnan(point_3d_selected[:3]).any():
-        cam = rig[rig.names[cam_idx]]
 
-        reprojected = cam.project(point_3d_selected[:3].reshape(1, 3)).flatten()
+        reprojected = rig[camera_name].project(point_3d_selected[:3]).flatten()
 
         if reprojected.size > 0 and not np.isnan(reprojected).any():
             reproj_loupe_coords = to_loupe_coords(reprojected)
@@ -357,6 +355,6 @@ def histogram_leftclick(sender, app_data, user_data):
     if mouse_pos:
         clicked_frame = int(mouse_pos[0])
         with app_state.lock:
-            if 0 <= clicked_frame < app_state.video_metadata['num_frames']:
+            if 0 <= clicked_frame < app_state.frame_count:
                 app_state.frame_idx = clicked_frame
                 app_state.paused = True

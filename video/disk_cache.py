@@ -1,6 +1,3 @@
-"""
-Video caching system for fast random access to multi-view video frames.
-"""
 import os
 import json
 import time
@@ -19,16 +16,26 @@ import config
 
 
 class DiskCacheBuilder:
-    """Builds compressed frame cache for multi-view videos."""
+    """
+    Builds compressed frame cache for multi-view videos.
+    """
 
     def __init__(
         self,
-        video_paths: List[Union[Path, str]],
+        video_paths: Dict[str, Union[Path, str]],
         cache_dir: Optional[Union[Path, str]] = None,
         ram_budget_gb: float = 0.5
     ):
-        # Preserve order!!! order must match calibration
-        self.video_paths = tuple([Path(v) for v in video_paths])
+        """
+        Initialise cache builder.
+
+        Args:
+            video_paths: Dict mapping camera_name -> video path
+            cache_dir: Directory to store cache files
+            ram_budget_gb: RAM budget per chunk during building
+        """
+        self.video_paths: Dict[str, Path] = {name: Path(p) for name, p in video_paths.items()}
+        self.camera_names: Tuple[str, ...] = tuple(sorted(self.video_paths.keys()))
 
         if cache_dir is None:
             if hasattr(config, 'VIDEO_CACHE_FOLDER'):
@@ -39,17 +46,20 @@ class DiskCacheBuilder:
                 self.cache_dir = Path.cwd() / 'data' / 'video_cache'
         else:
             self.cache_dir = Path(cache_dir)
+
         self.ram_budget_gb = ram_budget_gb
         self.metadata_file = self.cache_dir / 'cache_metadata.json'
 
     def compute_video_set_hash(self) -> str:
-        """Create a hash from video paths and their modification times."""
-
+        """
+        Create a hash from video paths and their modification times.
+        """
         hash_input = []
-        for vp in self.video_paths:
+        for cam_name in self.camera_names:
+            vp = self.video_paths[cam_name]
             mtime = os.path.getmtime(vp)
             size = os.path.getsize(vp)
-            hash_input.append(f"{vp}:{mtime}:{size}")
+            hash_input.append(f"{cam_name}:{vp}:{mtime}:{size}")
         hash_str = "|".join(hash_input)
         return hashlib.md5(hash_str.encode()).hexdigest()
 
@@ -70,9 +80,15 @@ class DiskCacheBuilder:
                 if metadata.get('video_set_hash') != current_hash:
                     return False, None
 
+            # Verify camera names match
+            cached_cameras = set(metadata.get('camera_names', []))
+            if cached_cameras != set(self.camera_names):
+                print(f"Cache camera mismatch: cached={cached_cameras}, current={set(self.camera_names)}")
+                return False, None
+
             # Verify all chunk files exist
-            for video in metadata['videos']:
-                for chunk_file in video['chunk_files']:
+            for cam_name, cam_data in metadata['videos'].items():
+                for chunk_file in cam_data['chunk_files']:
                     if not Path(chunk_file).is_file():
                         return False, None
 
@@ -82,14 +98,19 @@ class DiskCacheBuilder:
             print(f"Error checking cache existence: {e}")
             return False, None
 
-    def gather_video_info(self) -> List[Dict]:
-        """Extract metadata from all videos."""
+    def gather_video_info(self) -> Dict[str, Dict]:
+        """
+        Extract metadata from all videos.
+        """
+        # TODO: redundant with probe_video, but maybe safer to keep here
 
-        video_info = []
+        video_info = {}
 
-        for video_path in self.video_paths:
+        for cam_name in self.camera_names:
+            video_path = self.video_paths[cam_name]
             cap = cv2.VideoCapture(video_path.as_posix())
-            info = {
+            video_info[cam_name] = {
+                'camera_name': cam_name,
                 'path': video_path,
                 'frame_count': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
                 'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
@@ -97,36 +118,37 @@ class DiskCacheBuilder:
                 'fps': cap.get(cv2.CAP_PROP_FPS),
             }
             cap.release()
-            video_info.append(info)
 
         # Verify consistency
-        ref = video_info[0]
-        for i, info in enumerate(video_info[1:], 1):
+        ref_cam = self.camera_names[0]
+        ref = video_info[ref_cam]
+        for cam_name in self.camera_names[1:]:
+            info = video_info[cam_name]
             if (info['frame_count'] != ref['frame_count'] or
                     info['width'] != ref['width'] or
                     info['height'] != ref['height']):
-                print(f"WARNING: Video {i} has different properties than video 0")
+                print(f"WARNING: Video '{cam_name}' has different properties than '{ref_cam}'")
 
         return video_info
 
     @staticmethod
-    def _chunk_video_worker(args) -> Dict:
+    def _chunk_video_worker(args_list) -> Dict:
         """Worker function to chunk a single video."""
 
-        video_idx, video_path, frame_count, width, height, frames_per_chunk, chunk_dir, progress_q, cancel_event = args
+        (camera_name, video_path, frame_count, width, height,
+         frames_per_chunk, chunk_dir, progress_q, cancel_event) = args_list
 
-        # Just to be super safe
         chunk_dir = Path(chunk_dir)
-        video_path = Path(video_path)
 
-        cap = cv2.VideoCapture(video_path.as_posix())
+        cap = cv2.VideoCapture(str(video_path))
         chunk_files = []
         compressed_sizes = []
+
         for chunk_idx, start in enumerate(range(0, frame_count, frames_per_chunk)):
 
             if cancel_event and cancel_event.is_set():
                 cap.release()
-                return {'cancelled': True, 'video_idx': video_idx}
+                return {'cancelled': True, 'camera_name': camera_name}
 
             frames_in_chunk = min(frames_per_chunk, frame_count - start)
             chunk_array = np.empty((frames_in_chunk, height, width, 3), dtype=np.uint8)
@@ -147,41 +169,40 @@ class DiskCacheBuilder:
                 chunk_array.tobytes(), typesize=1, cname='lz4', clevel=5, shuffle=blosc.SHUFFLE
             )
 
-            chunk_filepath = chunk_dir / f'video{video_idx}_chunk_{chunk_idx}.blosc'
+            safe_cam_name = camera_name.replace('/', '_').replace('\\', '_')
+            chunk_filepath = chunk_dir / f'{safe_cam_name}_chunk_{chunk_idx}.blosc'
             with chunk_filepath.open(mode='wb') as f:
                 f.write(compressed)
 
-            chunk_files.append(str(chunk_filepath))     # as str because it's only returned for dumping into json
+            chunk_files.append(str(chunk_filepath))
             compressed_sizes.append(len(compressed))
 
             # Report progress
             if progress_q:
                 progress_pct = ((start + frames_in_chunk) / frame_count) * 100
-                progress_q.put((video_idx, progress_pct))
+                progress_q.put((camera_name, progress_pct))
 
         cap.release()
         if progress_q:
-            progress_q.put((video_idx, 100.0))
+            progress_q.put((camera_name, 100.0))
+
         return {
-            'video_idx': video_idx,
+            'camera_name': camera_name,
             'chunk_files': chunk_files,
             'compressed_sizes': compressed_sizes,
             'total_compressed_bytes': sum(compressed_sizes),
         }
 
-    def build_cache(self, progress_callback=None, video_progress_callback=None, cancel_event: Optional[Event] = None,
-                    manager=None) -> Dict:
+    def build_cache(self, progress_callback=None, video_progress_callback=None, cancel_event: Optional[Event] = None, manager=None) -> Dict:
         """Build the video cache."""
 
         if manager is None:
-
             from multiprocessing import Manager
             with Manager() as managed_context:
                 return self._build_cache_internal(
                     progress_callback, video_progress_callback, cancel_event, managed_context
                 )
         else:
-            # if a manager is provided use it directly
             return self._build_cache_internal(
                 progress_callback, video_progress_callback, cancel_event, manager
             )
@@ -196,31 +217,31 @@ class DiskCacheBuilder:
         self.delete_cache()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        frame_count = video_info[0]['frame_count']
-        width = video_info[0]['width']
-        height = video_info[0]['height']
-        fps = video_info[0]['fps']
+        # Use first camera as reference for dimensions
+        ref_cam = self.camera_names[0]
+        frame_count = video_info[ref_cam]['frame_count']
+        width = video_info[ref_cam]['width']
+        height = video_info[ref_cam]['height']
+        fps = video_info[ref_cam]['fps']
 
         frame_size_bytes = width * height * 3
-        # Default builder RAM budget is 0.5GB per chunk (uncompressed)
         frames_per_chunk = max(1, int((self.ram_budget_gb * (1024 ** 3)) // frame_size_bytes))
 
         print(f"Frames per chunk: {frames_per_chunk}")
 
-        # Use the passed-in manager to create the queue
         video_progress_q = manager.Queue()
 
         args_list = [
-            (idx, info['path'], info['frame_count'], info['width'], info['height'],
+            (cam_name, info['path'], info['frame_count'], info['width'], info['height'],
              frames_per_chunk, self.cache_dir, video_progress_q, cancel_event)
-            for idx, info in enumerate(video_info)
+            for cam_name, info in video_info.items()
         ]
 
-        num_workers = min(len(self.video_paths), cpu_count())
+        num_workers = min(len(self.camera_names), cpu_count())
 
         time_start = time.time()
         total_frames = frame_count * len(video_info)
-        video_progress = {i: 0.0 for i in range(len(video_info))}
+        video_progress = {cam_name: 0.0 for cam_name in self.camera_names}
 
         with Pool(num_workers) as pool:
             async_results = pool.map_async(self._chunk_video_worker, args_list)
@@ -231,11 +252,11 @@ class DiskCacheBuilder:
                     pool.join()
                     raise InterruptedError("Cache build was cancelled.")
                 try:
-                    v_idx, pct = video_progress_q.get(timeout=0.1)
-                    video_progress[v_idx] = pct
+                    cam_name, pct = video_progress_q.get(timeout=0.1)
+                    video_progress[cam_name] = pct
 
                     if video_progress_callback:
-                        video_progress_callback(v_idx, pct)
+                        video_progress_callback(cam_name, pct)
 
                     current_total_pct = sum(video_progress.values()) / len(video_info)
                     completed_frames = int(total_frames * (current_total_pct / 100.0))
@@ -258,22 +279,30 @@ class DiskCacheBuilder:
         print("Cache build complete!")
         print(f"  Build time: {elapsed:.1f}s, Cache size: {total_compressed / 1024 ** 3:.1f} GB")
 
+        # Build metadata keyed by camera name
+        videos_metadata = {}
+        for r in results:
+            cam_name = r['camera_name']
+            videos_metadata[cam_name] = {
+                'camera_name': cam_name,
+                'path': str(video_info[cam_name]['path']),
+                'chunk_files': r['chunk_files'],
+                'num_chunks': len(r['chunk_files']),
+                'total_compressed_bytes': r['total_compressed_bytes']
+            }
+
         metadata = {
-            'version': '1.0',
+            'version': '2.0',  # Bumped version for name-based format
             'creation_time': time.strftime('%Y-%m-%d %H:%M:%S'),
             'video_set_hash': self.compute_video_set_hash(),
-            'frame_count': frame_count, 'width': width, 'height': height, 'fps': fps,
+            'camera_names': list(self.camera_names),  # Canonical order
+            'frame_count': frame_count,
+            'width': width,
+            'height': height,
+            'fps': fps,
             'frames_per_chunk': frames_per_chunk,
             'compression': {'algorithm': 'blosc-lz4', 'clevel': 5, 'shuffle': True},
-            'videos': [
-                {
-                    'index': r['video_idx'],
-                    'path': str(video_info[r['video_idx']]['path']),
-                    'chunk_files': r['chunk_files'],
-                    'num_chunks': len(r['chunk_files']),
-                    'total_compressed_bytes': r['total_compressed_bytes']
-                } for r in sorted(results, key=lambda x: x['video_idx'])
-            ]
+            'videos': videos_metadata
         }
 
         with self.metadata_file.open(mode='w') as f:
@@ -293,12 +322,15 @@ class DiskCacheReader:
     """
     Fast random-access reader for cached multi-view video data.
     Thread-safe for concurrent reads with background prefetching.
+
+    Frames are accessed by camera name, not index.
     """
 
-    def __init__(self,
-                 cache_dir: Optional[Union[Path, str]] = None,
-                 ram_budget_gb: float = 2.0
-        ):
+    def __init__(
+        self,
+        cache_dir: Optional[Union[Path, str]] = None,
+        ram_budget_gb: float = 2.0
+    ):
         if cache_dir is None:
             if hasattr(config, 'VIDEO_CACHE_FOLDER'):
                 self.cache_dir = Path(config.VIDEO_CACHE_FOLDER)
@@ -312,9 +344,8 @@ class DiskCacheReader:
         self._lock = threading.Lock()
 
         # Background loader
-        # Blosc releases GIL, so thread pool works well for parallel decompression
         self._executor = ThreadPoolExecutor(max_workers=min(4, cpu_count()))
-        self._loading_futures: Dict[Tuple[int, int], Future] = {}
+        self._loading_futures: Dict[Tuple[str, int], Future] = {}
 
         # Load metadata
         if not self.metadata_file.is_file():
@@ -326,44 +357,45 @@ class DiskCacheReader:
         with self.metadata_file.open(mode='r') as f:
             self.metadata = json.load(f)
 
+        # Handle version differences
+        version = self.metadata.get('version', '1.0')
+        if version.startswith('1.'):
+            raise ValueError(
+                f"Cache version {version} uses index-based format. "
+                f"Please rebuild cache with the new name-based builder."
+            )
+
         # Extract properties
         self.frame_count = self.metadata['frame_count']
         self.width = self.metadata['width']
         self.height = self.metadata['height']
         self.fps = self.metadata['fps']
         self.frames_per_chunk = self.metadata['frames_per_chunk']
-        self.num_views = len(self.metadata['videos'])
+        self.camera_names: Tuple[str, ...] = tuple(self.metadata['camera_names'])
+        self.num_views = len(self.camera_names)
 
-        # Build chunk index
-        self._chunk_index: Dict[Tuple[int, int], Path] = {}
+        # Build chunk index: (camera_name, chunk_idx) -> Path
+        self._chunk_index: Dict[Tuple[str, int], Path] = {}
 
-        for video in self.metadata['videos']:
-            for chunk_idx, chunk_file in enumerate(video['chunk_files']):
-
-                self._chunk_index[(video['index'], chunk_idx)] = Path(chunk_file)
+        for cam_name, cam_data in self.metadata['videos'].items():
+            for chunk_idx, chunk_file in enumerate(cam_data['chunk_files']):
+                self._chunk_index[(cam_name, chunk_idx)] = Path(chunk_file)
 
         # LRU cache for chunks
-        self._chunk_cache: Dict[Tuple[int, int], np.ndarray] = {}
+        self._chunk_cache: Dict[Tuple[str, int], np.ndarray] = {}
+        self._cache_access_order: List[Tuple[str, int]] = []
 
-        # Calculate size of one decompressed chunk in RAM
-        # Frame bytes = W * H * 3
+        # Calculate cache size limit
         chunk_bytes = self.width * self.height * 3 * self.frames_per_chunk
-
-        # Calculate how many chunks fit in the memory budget
         budget_bytes = ram_budget_gb * (1024 ** 3)
         calculated_limit = int(budget_bytes // chunk_bytes)
-
-        # Ensure we have at least 2 chunks per video in memory for smooth scrolling
         self._cache_size_limit = max(self.num_views * 2, calculated_limit)
 
-        print(f"VideoCacheReader initialized: {self.num_views} views, "
+        print(f"DiskCacheReader initialized: {self.num_views} views ({', '.join(self.camera_names)}), "
               f"{self.frame_count} frames, {self.width}x{self.height}")
-
         print(f"Cache RAM Budget: {ram_budget_gb:.1f} GB. "
               f"Chunk size: {chunk_bytes/1024**2:.1f} MB. "
               f"Keeping max {self._cache_size_limit} chunks in RAM.")
-
-        self._cache_access_order: List[Tuple[int, int]] = []
 
     def _get_chunk_index(self, frame_idx: int) -> int:
         """Convert frame index to chunk index."""
@@ -373,14 +405,14 @@ class DiskCacheReader:
         """Get frame position within its chunk."""
         return frame_idx % self.frames_per_chunk
 
-    def _load_chunk_from_disk_internal(self, video_idx: int, chunk_idx: int) -> np.ndarray:
+    def _load_chunk_from_disk_internal(self, camera_name: str, chunk_idx: int) -> np.ndarray:
         """Actual disk I/O and decompression logic (stateless)."""
 
-        cache_key = (video_idx, chunk_idx)
+        cache_key = (camera_name, chunk_idx)
         chunk_file = self._chunk_index.get(cache_key)
 
         if chunk_file is None:
-            raise ValueError(f"Chunk not found: video {video_idx}, chunk {chunk_idx}")
+            raise ValueError(f"Chunk not found: camera '{camera_name}', chunk {chunk_idx}")
 
         if not chunk_file.is_file():
             raise FileNotFoundError(f"Chunk file missing: {chunk_file}")
@@ -388,10 +420,8 @@ class DiskCacheReader:
         with chunk_file.open(mode='rb') as f:
             compressed = f.read()
 
-        # Decompress (expensive operation)
         decompressed = blosc.decompress(compressed)
 
-        # Determine chunk size
         start_frame = chunk_idx * self.frames_per_chunk
         frames_in_chunk = min(self.frames_per_chunk, self.frame_count - start_frame)
 
@@ -402,61 +432,53 @@ class DiskCacheReader:
 
         return chunk_array
 
-    def _load_chunk(self, video_idx: int, chunk_idx: int) -> np.ndarray:
+    def _load_chunk(self, camera_name: str, chunk_idx: int) -> np.ndarray:
         """
         Get a chunk from cache, or load it.
         If a background load is pending for this chunk, wait for it.
         """
-        cache_key = (video_idx, chunk_idx)
+        cache_key = (camera_name, chunk_idx)
 
-        # Check existing cache (fast)
+        # Check existing cache
         with self._lock:
             if cache_key in self._chunk_cache:
-                # Update LRU
                 if cache_key in self._cache_access_order:
                     self._cache_access_order.remove(cache_key)
                 self._cache_access_order.append(cache_key)
                 return self._chunk_cache[cache_key]
 
-            # Check if currently loading in background
             future = self._loading_futures.get(cache_key)
 
-        # If loading, wait for it (outside lock)
+        # If loading, wait for it
         if future:
             try:
                 chunk_array = future.result()
-                # Cleanup future
                 with self._lock:
                     if cache_key in self._loading_futures:
                         del self._loading_futures[cache_key]
-
-                    # Cache the result
                     self._add_to_cache_safe(cache_key, chunk_array)
                 return chunk_array
             except Exception as e:
                 print(f"Error in background chunk load: {e}")
-                # Fallthrough to synchronous load on error
 
-        # Synchronous load (slow fallback)
-        chunk_array = self._load_chunk_from_disk_internal(video_idx, chunk_idx)
+        # Synchronous load
+        chunk_array = self._load_chunk_from_disk_internal(camera_name, chunk_idx)
 
         with self._lock:
             self._add_to_cache_safe(cache_key, chunk_array)
 
         return chunk_array
 
-    def _add_to_cache_safe(self, key: Tuple[int, int], data: np.ndarray):
-        """Internal helper to add to cache and enforce limits."""
-        # Assumes lock is held by caller
+    def _add_to_cache_safe(self, key: Tuple[str, int], data: np.ndarray):
+        """Internal helper to add to cache and enforce limits. Assumes lock is held."""
+
         self._chunk_cache[key] = data
         if key in self._cache_access_order:
             self._cache_access_order.remove(key)
         self._cache_access_order.append(key)
 
-        # Enforce size limit
         while len(self._cache_access_order) > self._cache_size_limit:
             oldest_key = self._cache_access_order.pop(0)
-            # Don't evict if it's the one we just added (edge case with tiny cache)
             if oldest_key == key and len(self._cache_access_order) > 0:
                 self._cache_access_order.append(key)
                 oldest_key = self._cache_access_order.pop(0)
@@ -464,7 +486,6 @@ class DiskCacheReader:
             if oldest_key in self._chunk_cache:
                 del self._chunk_cache[oldest_key]
 
-            # Also cancel any pending future for evicted key to save CPU
             if oldest_key in self._loading_futures:
                 self._loading_futures[oldest_key].cancel()
                 del self._loading_futures[oldest_key]
@@ -475,58 +496,58 @@ class DiskCacheReader:
         chunk_idx = self._get_chunk_index(frame_idx)
         frame_in_chunk = self._get_frame_in_chunk(frame_idx)
 
-        # If we are past 60% of the chunk, verify next chunk is loading
         if frame_in_chunk > (self.frames_per_chunk * 0.6):
             next_chunk_idx = chunk_idx + 1
 
-            # Determine max chunks
-            # We assume all videos have same chunks
-            total_chunks = self.metadata['videos'][0]['num_chunks']
+            # Use first camera to determine total chunks
+            first_cam = self.camera_names[0]
+            total_chunks = self.metadata['videos'][first_cam]['num_chunks']
 
             if next_chunk_idx >= total_chunks:
                 return
 
             with self._lock:
-                for view_idx in range(self.num_views):
-                    next_key = (view_idx, next_chunk_idx)
+                for cam_name in self.camera_names:
+                    next_key = (cam_name, next_chunk_idx)
 
-                    # Skip if already cached or already loading
                     if next_key in self._chunk_cache or next_key in self._loading_futures:
                         continue
 
-                    # Submit to background thread
-                    future = self._executor.submit(self._load_chunk_from_disk_internal, view_idx, next_chunk_idx)
+                    future = self._executor.submit(self._load_chunk_from_disk_internal, cam_name, next_chunk_idx)
                     self._loading_futures[next_key] = future
 
-    def get_frame(self, frame_idx: int, views: Optional[List[int]] = None) -> List[np.ndarray]:
+    def get_frame(
+        self,
+        frame_idx: int,
+        cameras: Optional[List[str]] = None
+    ) -> Dict[str, np.ndarray]:
         """
-        Get a single frame from all views (or specified views).
+        Get a single frame from specified cameras.
 
         Args:
             frame_idx: Frame index (0 to frame_count-1)
-            views: List of view indices. If None, get all views.
+            cameras: List of camera names. If None, get all cameras.
 
         Returns:
-            List of numpy arrays (H, W, 3) BGR format
+            Dict mapping camera_name -> numpy array (H, W, 3) BGR format
         """
-
         if frame_idx < 0 or frame_idx >= self.frame_count:
             raise ValueError(f"Frame index {frame_idx} out of range")
 
-        # Trigger background loading of next chunk if needed
         self._trigger_prefetch(frame_idx)
 
-        if views is None:
-            views = list(range(self.num_views))
+        if cameras is None:
+            cameras = list(self.camera_names)
 
         chunk_idx = self._get_chunk_index(frame_idx)
         frame_in_chunk = self._get_frame_in_chunk(frame_idx)
 
-        frames = []
-        for view_idx in views:
-            chunk = self._load_chunk(view_idx, chunk_idx)
-            # frames.append(chunk[frame_in_chunk].copy())
-            frames.append(chunk[frame_in_chunk]) # much faster without copy, but consumers should never touch the data
+        frames = {}
+        for cam_name in cameras:
+            if cam_name not in self.camera_names:
+                raise ValueError(f"Unknown camera: '{cam_name}'")
+            chunk = self._load_chunk(cam_name, chunk_idx)
+            frames[cam_name] = chunk[frame_in_chunk]
 
         return frames
 
@@ -542,34 +563,35 @@ class DiskCacheReader:
         """Get info about the cache."""
 
         total_size = sum(
-            video['total_compressed_bytes']
-            for video in self.metadata['videos']
+            cam_data['total_compressed_bytes']
+            for cam_data in self.metadata['videos'].values()
         )
         return {
-            'cache_dir': self.cache_dir,
+            'cache_dir': str(self.cache_dir),
             'total_size_bytes': total_size,
             'total_size_gb': total_size / (1024 ** 3),
-            'num_videos': self.num_views,
+            'video_count': self.num_views,
+            'camera_names': list(self.camera_names),
             'frame_count': self.frame_count,
             'frames_per_chunk': self.frames_per_chunk,
-            'total_chunks': sum(video['num_chunks'] for video in self.metadata['videos']),
+            'total_chunks': sum(cam_data['num_chunks'] for cam_data in self.metadata['videos'].values()),
             'chunks_in_ram': len(self._chunk_cache),
             'ram_limit_chunks': self._cache_size_limit,
             'creation_time': self.metadata.get('creation_time', 'Unknown'),
         }
 
     def get_loaded_chunk_ranges(self) -> List[Tuple[int, int]]:
-        """
-        Get list of frame ranges currently loaded in RAM.
-        """
+        """Get list of frame ranges currently loaded in RAM."""
+
         with self._lock:
             if not self._chunk_cache:
                 return []
 
-            # Get all chunk indices currently in cache (just first view for simplicity)
+            # Get chunk indices from first camera for simplicity
+            first_cam = self.camera_names[0]
             chunk_indices = sorted(set(
-                chunk_idx for (view_idx, chunk_idx) in self._chunk_cache.keys()
-                if view_idx == 0
+                chunk_idx for (cam_name, chunk_idx) in self._chunk_cache.keys()
+                if cam_name == first_cam
             ))
 
             if not chunk_indices:
@@ -593,6 +615,6 @@ class DiskCacheReader:
 
     def __repr__(self) -> str:
         return (
-            f"VideoCacheReader(views={self.num_views}, frames={self.frame_count}, "
+            f"DiskCacheReader(cameras={list(self.camera_names)}, frames={self.frame_count}, "
             f"resolution={self.width}x{self.height})"
         )

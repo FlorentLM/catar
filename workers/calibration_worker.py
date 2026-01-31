@@ -14,8 +14,7 @@ from core.refinement import run_refinement
 class GAWorker(multiprocessing.Process):
     """Runs genetic algorithm for camera calibration in separate process."""
 
-    def __init__(
-        self,
+    def __init__(self,
         command_queue: multiprocessing.Queue,
         progress_queue: multiprocessing.Queue
     ):
@@ -78,8 +77,7 @@ class GAWorker(multiprocessing.Process):
 class BAWorker(multiprocessing.Process):
     """Runs bundle adjustment in a separate process."""
 
-    def __init__(
-        self,
+    def __init__(self,
         command_queue: multiprocessing.Queue,
         results_queue: multiprocessing.Queue,
         stop_event: multiprocessing.Event

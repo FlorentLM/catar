@@ -25,7 +25,6 @@ class Viewer3D:
     """
     Hardware-accelerated 3D visualisation with Open3D.
     """
-
     def __init__(self, window_name: str = "3D Reconstruction"):
         self.window_name = window_name
         self.vis = None
@@ -237,23 +236,23 @@ def update_annotation_overlays(app_state: 'AppState'):
         show_reproj = app_state.show_reprojection_error
         temp_hide = app_state.temp_hide_overlays
         camera_colors = app_state.camera_colors
-        p_idx = app_state.selected_point_idx
+        keypoint = app_state.selected_keypoint
 
-        focus_mode = app_state.focus_selected_point
+        focus_mode = app_state.focus_mode
         show_all_labels = app_state.show_all_labels
 
     all_annotations = app_state.data.get_2d(frame=frame_idx)
     all_manual_flags = app_state.data.is_manual(frame_idx)
 
-    selected_annots = app_state.data.get_2d(frame=frame_idx, keypoint=p_idx)
-    point_3d = app_state.data.get_3d(frame=frame_idx, keypoint=p_idx)
+    selected_annots = app_state.data.get_2d(frame=frame_idx, keypoint=keypoint)
+    point_3d = app_state.data.get_3d(frame=frame_idx, keypoint=keypoint)
 
     for cam_idx, cam_name in enumerate(rig.names):
-        layer_tag = f"annotation_layer_{cam_idx}"
+        layer_tag = f"annotation_layer_{cam_name}"
         dpg.delete_item(layer_tag, children_only=True)
 
         # Get widget size for scaling
-        widget_size = dpg.get_item_rect_size(f"drawlist_{cam_idx}")
+        widget_size = dpg.get_item_rect_size(f"drawlist_{cam_name}")
         if widget_size[0] == 0:
             continue
 
@@ -288,7 +287,7 @@ def update_annotation_overlays(app_state: 'AppState'):
             draw_all_points(
                 app_state=app_state,
                 cam_idx=cam_idx,
-                selected_point_idx=p_idx,
+                selected_keypoint=keypoint,
                 annotations=all_annotations,
                 manual_flags=all_manual_flags,
                 scale_x=scale_x, scale_y=scale_y,
@@ -301,9 +300,9 @@ def update_annotation_overlays(app_state: 'AppState'):
 def update_histogram(app_state: 'AppState'):
 
     with app_state.lock:
-        focus_mode = app_state.focus_selected_point
-        selected_idx = app_state.selected_point_idx
-        point_name = app_state.point_itn[selected_idx]
+        focus_mode = app_state.focus_mode
+        frame_idx = app_state.frame_idx
+        keypoint = app_state.selected_keypoint
         num_cams = len(app_state.rig)
 
     with app_state.data.read_lock():
@@ -311,13 +310,13 @@ def update_histogram(app_state: 'AppState'):
         # TODO: This hist is broken
 
         if focus_mode:
-            annots = app_state.data.get_2d(frame=selected_idx, keypoint=selected_idx)
+            annots = app_state.data.get_2d(frame=frame_idx, keypoint=keypoint)
             counts = [np.sum(~np.isnan(annots[..., 0]))]
 
-            dpg.configure_item("histogram_y_axis", label=f"'{point_name}' Annots")
+            dpg.configure_item("histogram_y_axis", label=f"'{keypoint}' Annots")
             dpg.set_axis_limits("histogram_y_axis", 0, num_cams)
         else:
-            annots = app_state.data.get_2d(frame=selected_idx)
+            annots = app_state.data.get_2d(frame=frame_idx)
             counts = np.sum(~np.isnan(annots[..., 0]), axis=1)
 
             dpg.configure_item("histogram_y_axis", label="Total Annots")
@@ -334,8 +333,8 @@ def update_control_panel(app_state: 'AppState'):
         dpg.set_value("frame_slider", app_state.frame_idx)
         dpg.set_value("current_frame_line", float(app_state.frame_idx))
         dpg.configure_item("play_pause_button", label="Play" if app_state.paused else "Pause")
-        dpg.set_value("point_combo", app_state.point_itn[app_state.selected_point_idx])
-        dpg.set_value("focus_text", f"Focus Mode: {'Enabled' if app_state.focus_selected_point else 'Disabled'}")
+        dpg.set_value("point_combo", app_state.selected_keypoint)
+        dpg.set_value("focus_text", f"Focus Mode: {'Enabled' if app_state.focus_mode else 'Disabled'}")
 
         is_calib = app_state.frame_idx in app_state.calibration_frames
         dpg.configure_item("toggle_calib_frame_button", label="Remove (C)" if is_calib else "Add (C)")
@@ -435,7 +434,7 @@ def draw_reprojection_errors(
 def draw_all_points(
         app_state: 'AppState',
         cam_idx: int,
-        selected_point_idx: int,
+        selected_keypoint: str,
         annotations: np.ndarray,
         manual_flags: np.ndarray,
         scale_x: float,
@@ -446,8 +445,11 @@ def draw_all_points(
 ):
     """Draws all keypoints and their labels."""
 
-    for i in range(app_state.num_points):
-        if focus_mode and i != selected_point_idx:
+    keypoint_names = app_state.skeleton.keypoints
+
+    for i, keypoint in enumerate(keypoint_names):
+
+        if focus_mode and keypoint != selected_keypoint:
             continue
 
         pt = annotations[cam_idx, i]
@@ -456,7 +458,7 @@ def draw_all_points(
 
         cx, cy = pt[0] * scale_x, pt[1] * scale_y
 
-        if i == selected_point_idx:
+        if keypoint == selected_keypoint:
             color = (255, 255, 0)
         elif manual_flags[cam_idx, i]:
             color = (255, 255, 255)
@@ -465,7 +467,7 @@ def draw_all_points(
 
         dpg.draw_circle(center=(cx, cy), radius=2, color=color, fill=color, parent=layer_tag)
 
-        if show_all_labels or i == selected_point_idx:
+        if show_all_labels or keypoint == selected_keypoint:
             dpg.draw_text(pos=(cx + 8, cy - 8), text=f"{app_state.point_itn[i]} ({pt[2]:.2f})", color=color, size=12,
                           parent=layer_tag)
 
@@ -490,9 +492,9 @@ def resize_video_widgets(sender, app_data, user_data):
 
     # Use first camera aspect ratio
     first_cam = app_state.rig.names[0]
-    meta = app_state.get_video_metadata(first_cam)
-    ar = meta['width'] / meta['height']
-    item_height = item_width / ar
+    w = app_state.video_info[first_cam].width
+    h = app_state.video_info[first_cam].height
+    item_height = item_width / (w / h)
 
     for i in range(len(app_state.rig)):
         if dpg.does_item_exist(f"drawlist_{i}"):
@@ -501,22 +503,21 @@ def resize_video_widgets(sender, app_data, user_data):
             dpg.configure_item(f"video_border_{i}", pmax=(item_width, item_height))
 
 
-def create_camera_visual(rig: CameraRig, camera_name: str, scene_centre: np.ndarray) -> List[Object3D]:
+def create_camera_visual(camera: CameraModel, scene_centre: np.ndarray) -> List[Object3D]:
     """Generates 3D visual for a camera frustum."""
 
-    cam = rig[camera_name]
-    apex = cam.center  # world coords
+    apex = camera.center  # world coords
 
     # Scale based on distance to scene centre
     dist = np.linalg.norm(apex - scene_centre)
     scale = dist * 0.15
 
     # Get frustum corners at depth 'scale'
-    frustum = cam.frustum_points(depth=scale)
+    frustum = camera.frustum_points(depth=scale)
     tl, tr, bl, br, apex = frustum
 
     color = (255, 255, 0)
-    objs = [Object3D('point', apex, color, camera_name)]
+    objs = [Object3D('point', apex, color, camera.name)]
 
     # Edges from apex
     for corner in [tl, tr, bl, br]:

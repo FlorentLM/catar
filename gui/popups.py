@@ -178,7 +178,7 @@ def cache_manager_callback(sender, app_data, user_data):
         try:
             new_backend = create_video_backend(
                 video_paths=app_state.video_paths,
-                video_metadata=app_state.video_metadata,
+                video_metadata=app_state.video_info,
                 cache_dir=cache_dir,
                 backend_type='cached'
             )
@@ -335,7 +335,7 @@ class CacheManagerDialog:
             metadata = probe_video(self.video_paths[0])
             dpg.add_text("Video information:", color=(200, 200, 255), parent=self.dialog_tag)
             dpg.add_text(f"  Videos found: {len(self.video_paths)}", indent=10, parent=self.dialog_tag)
-            dpg.add_text(f"  Frames per video: {metadata['num_frames']}", indent=10, parent=self.dialog_tag)
+            dpg.add_text(f"  Frames per video: {metadata['nb_frames']}", indent=10, parent=self.dialog_tag)
             dpg.add_text(f"  Resolution: {metadata['width']}x{metadata['height']}", indent=10,
                          parent=self.dialog_tag)
         except Exception as e:
@@ -443,7 +443,7 @@ class CacheManagerDialog:
         # Switch to direct backend
         new_backend = create_video_backend(
             video_paths=self.app_state.video_paths,
-            video_metadata=self.app_state.video_metadata,
+            video_metadata=self.app_state.video_info,
             cache_reader=None,
             backend_type='direct',
             ram_budget_gb=1.5
@@ -594,10 +594,10 @@ class CacheManagerDialog:
                         "status_text": f"Processing: {completed}/{total} frames ({progress * 100:.1f}%)"
                     })
 
-            def on_video_progress(video_idx, pct):
+            def on_video_progress(camera_name, pct):
                 self.queues.cache_progress.put({
                     "type": "video",
-                    "video_idx": video_idx,
+                    "camera_name": camera_name,
                     "progress_pct": pct,
                     "total_videos": len(self.video_paths)
                 })

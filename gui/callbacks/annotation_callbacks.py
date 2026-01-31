@@ -5,15 +5,15 @@ def set_manual_annotation_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
 
     with app_state.lock:
-        if not app_state.focus_selected_point:
+        if not app_state.focus_mode:
             print("Enable Focus Mode (Z) to use this feature.")
             return
 
         frame_idx = app_state.frame_idx
-        p_idx = app_state.selected_point_idx
-        app_state.data.is_manual(frame=slice(0, frame_idx), keypoint=p_idx, value=True)
+        keypoint = app_state.selected_keypoint
+        app_state.data.is_manual(frame=slice(0, frame_idx), keypoint=keypoint, value=True)
 
-        print(f"Marked previous frames as human-annotated for '{app_state.point_itn[p_idx]}'")
+        print(f"Marked previous frames as human-annotated for '{keypoint}'")
 
 
 def clear_future_annotations_callback(sender, app_data, user_data):
@@ -22,16 +22,16 @@ def clear_future_annotations_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
 
     with app_state.lock:
-        if not app_state.focus_selected_point:
+        if not app_state.focus_mode:
             print("Enable Focus Mode (Z) to use this feature.")
             return
 
         curr_frame_idx = app_state.frame_idx
-        p_idx = app_state.selected_point_idx
+        keypoint = app_state.selected_keypoint
 
-        app_state.data.set_2d(frame=slice(curr_frame_idx + 1, -1), keypoint=p_idx, data=None)
+        app_state.data.set_2d(frame=slice(curr_frame_idx + 1, -1), keypoint=keypoint, data=None)
 
-        print(f"Cleared future annotations for '{app_state.point_itn[p_idx]}'")
+        print(f"Cleared future annotations for '{keypoint}'")
 
 
 def set_selected_point_callback(sender, app_data, user_data):
@@ -39,4 +39,4 @@ def set_selected_point_callback(sender, app_data, user_data):
 
     app_state = user_data["app_state"]
     with app_state.lock:
-        app_state.selected_point_idx = app_state.point_nti[app_data]
+        app_state.selected_keypoint = app_data

@@ -2,38 +2,31 @@
 Main entry point for CATAR.
 """
 import queue
-import sys
-from typing import Optional
-
 import cv2
 import multiprocessing
 import numpy as np
-from pathlib import Path
 import dearpygui.dearpygui as dpg
 
 import config
 from state import AppState, Queues
 from gui import create_ui, update_ui, resize_video_widgets
-from gui.rendering import Viewer3D
-from utils import load_and_match_videos, compute_3d_scores
-from video import create_video_backend, DiskCacheBuilder, VideoReaderWorker
-
+from utils import compute_3d_scores
+from video import create_video_backend, VideoReaderWorker
 from workers import GAWorker, BAWorker, RenderingWorker
-from workers.tracking_worker import TrackingWorker  # Use updated version
+from workers.tracking_worker import TrackingWorker
 
 from lucida import CameraRig
 
 from mokap.pose_reconstruction.configs import TrackerConfig, AssemblerConfig
 from mokap.pose_reconstruction.skeleton import Skeleton, SkeletonStats
-
 from mokap.pose_reconstruction.soup import Reconstructor
 from mokap.pose_reconstruction.assembly import SkeletonAssembler, MultiObjectTracker
 
 
 def handle_rendered_frames(new_frames: dict, app_state: 'AppState', queues: 'Queues'):
-    for i, frame_bgr in enumerate(new_frames['video_frames_bgr']):
+    for cam_name, frame_bgr in new_frames['video_frames_bgr'].items():
         rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA).astype(np.float32) / 255.0
-        dpg.set_value(f"video_texture_{i}", rgba.ravel())
+        dpg.set_value(f"video_texture_{cam_name}", rgba.ravel())
 
 
 def handle_cache_progress(progress: dict, app_state: 'AppState', queues: 'Queues'):
@@ -52,15 +45,13 @@ def handle_cache_progress(progress: dict, app_state: 'AppState', queues: 'Queues
 
     # Handle per-video progress
     elif msg_type == "video":
-        video_idx = progress['video_idx']
-        total_videos = progress['total_videos']
-        bar_tag = f"video_progress_bar_{video_idx}"
-        text_tag = f"video_progress_text_{video_idx}"
+        cam_name = progress['camera_name']
+        bar_tag = f"video_progress_bar_{cam_name}"
+        text_tag = f"video_progress_text_{cam_name}"
 
         if not dpg.does_item_exist(bar_tag) and dpg.does_item_exist("video_progress_container"):
-
             with dpg.group(parent="video_progress_container", horizontal=False):
-                dpg.add_text(f"Video {video_idx + 1}/{total_videos}:", tag=text_tag)
+                dpg.add_text(f"{cam_name}:", tag=text_tag)
                 dpg.add_progress_bar(tag=bar_tag, width=-1, default_value=0.0)
                 dpg.add_spacer(height=2)
 
@@ -68,7 +59,7 @@ def handle_cache_progress(progress: dict, app_state: 'AppState', queues: 'Queues
             dpg.configure_item(bar_tag, default_value=progress['progress_pct'] / 100.0)
 
         if dpg.does_item_exist(text_tag):
-            dpg.set_value(text_tag, f"Video {video_idx + 1}/{total_videos}: {progress['progress_pct']:.0f}%")
+            dpg.set_value(text_tag, f"{cam_name}: {progress['progress_pct']:.0f}%")
 
     # Handle completion
     elif msg_type == "complete":
@@ -94,7 +85,7 @@ def handle_cache_progress(progress: dict, app_state: 'AppState', queues: 'Queues
             try:
                 new_backend = create_video_backend(
                     video_paths=app_state.video_paths,
-                    video_metadata=app_state.video_metadata,
+                    video_metadata=app_state.video_info,
                     cache_dir=cache_dir,
                     backend_type='cached',
                     ram_budget_gb=config.RAM_MAX_BUDGET_GB
@@ -196,13 +187,13 @@ def handle_ba_results(ba_result: dict, app_state: 'AppState', queues: 'Queues'):
 
                     app_state.data.set_3d(frame=frame_idx, data=pts_4d)
 
-        app_state.needs_3d_reconstruction = True
+        app_state.needs_reconstruction = True
 
     elif ba_result['status'] == 'error':
         print(f"BA ERROR: {ba_result['message']}")
 
 
-def main_loop(app_state: 'AppState', queues: 'Queues', viewer_3d: Optional['Viewer3D']):
+def main_loop(app_state: 'AppState', queues: 'Queues'):
     """Main GUI update loop."""
 
     initial_resize_counter = 3
@@ -213,8 +204,8 @@ def main_loop(app_state: 'AppState', queues: 'Queues', viewer_3d: Optional['View
             initial_resize_counter -= 1
 
         # 3D visualisation updates
-        if viewer_3d is not None:
-            viewer_3d.process_updates()
+        if app_state.viewer_3d is not None:
+            app_state.viewer_3d.process_updates()
 
         # Process rendered frames
         try:
@@ -259,161 +250,85 @@ def main_loop(app_state: 'AppState', queues: 'Queues', viewer_3d: Optional['View
 def main():
     """Main entry point."""
 
-    data_folder = config.DATA_FOLDER if hasattr(config, 'DATA_FOLDER') else Path.cwd() / 'data'
-    if not data_folder.is_dir():
-        data_folder.mkdir(parents=True)
-        print(f"Created '{data_folder}' directory. Please add videos and calibration.")
-        sys.exit(0)
+    app_state = AppState()
+    app_state.load()    # defaults to data folder
 
-    print("Loading videos and calibration...")
-    video_paths, _, _, camera_rig = load_and_match_videos(
-        data_folder,
-        config.VIDEO_FORMAT
-    )
-
-    # Load skeleton definition
-    skeleton = Skeleton.load(data_folder / 'messor_skeleton.toml')  # TODO: in config
-    print(f"  Skeleton: {skeleton.name} ({len(skeleton.keypoints)} keypoints, {len(skeleton.bones)} bones)")
-
-    # Load skeleton statistics
-    skeleton_stats = SkeletonStats.load(data_folder / 'skeleton_stats.json', skeleton)
-
-    if skeleton_stats.reference_bone:
-        print(f"  Reference bone: {skeleton_stats.reference_bone}")
-        print(f"  Reference length: {skeleton_stats.reference_length_world:.2f} {skeleton.metadata.units if skeleton.metadata else 'units'}")
-    else:
-        print("  No reference bone set (stats will be learned online)")
-
-    # Create state objects
-    print("Initialising application state...")
-    app_state = AppState(
-        data_folder,
-        video_paths,
-        camera_rig,
-        skeleton=skeleton,
-    )
-
-    print("Initialising video backend...")
-
-    # Check for disk cache
-    builder = DiskCacheBuilder(
-        video_paths=app_state.video_paths,
-        cache_dir=app_state.video_cache_dir
-    )
-    cache_exists, cache_metadata = builder.check_cache_exists()
-
-    # Create the video backend
-    video_backend = create_video_backend(
-        video_paths=app_state.video_paths,
-        video_metadata=app_state.video_metadata,
-        cache_dir=builder.cache_dir if cache_exists else None,
-        backend_type='auto',
-        ram_budget_gb=config.RAM_MAX_BUDGET_GB
-    )
-
-    print(f"Using backend: {type(video_backend).__name__}")
-
-    # Store backend in app_state for cache management callbacks
-    app_state.video_backend = video_backend
-
-    print("Initialising mokap pipeline...")
-
-    app_state.load(config.DATA_FOLDER)
-
-
-    reconstructor = Reconstructor(
-        rig=app_state.rig,
-        keypoint_names=skeleton.keypoints,
-        min_views=2,
-        epipolar_threshold=10.0,
-        reprojection_threshold=5.0
-    )
-
-    assembler = SkeletonAssembler(
-        skeleton=skeleton,
-        stats=skeleton_stats,
-        config=AssemblerConfig(),
-    )
-
-    mot_tracker = MultiObjectTracker(
-        assembler=assembler,
-        skeleton=skeleton,
-        stats=skeleton_stats,
-        config=TrackerConfig()
-    )
-
-    print("Initialising workers...")
+    # print("Initialising mokap pipeline...")
+    # reconstructor = Reconstructor(
+    #     rig=app_state.rig,
+    #     keypoint_names=app_state.skeleton.keypoints,
+    #     min_views=2,
+    #     epipolar_threshold=10.0,
+    #     reprojection_threshold=5.0
+    # )
+    #
+    # assembler = SkeletonAssembler(
+    #     skeleton=app_state.skeleton,
+    #     stats=app_state.skeleton_stats,
+    #     config=AssemblerConfig(),
+    # )
+    #
+    # mot_tracker = MultiObjectTracker(
+    #     assembler=assembler,
+    #     skeleton=app_state.skeleton,
+    #     stats=app_state.skeleton_stats,
+    #     config=TrackerConfig()
+    # )
 
     queues = Queues()
-    open3d_viz = Viewer3D() if not config.DISABLE_3D_VIEW else None
 
     workers = [
-
         VideoReaderWorker(
             app_state=app_state,
-            video_backend=video_backend,
             command_queue=queues.command,
             output_queues=[queues.frames_for_tracking, queues.frames_for_rendering]
         ),
 
-        TrackingWorker(
-            app_state=app_state,
-            video_backend=video_backend,
-
-            reconstructor=reconstructor,
-            mot_tracker=mot_tracker,
-            skeleton_stats=skeleton_stats,
-
-            frames_in_queue=queues.frames_for_tracking,
-            progress_out_queue=queues.tracking_progress,
-
-            command_queue=queues.tracking_command,
-            stop_batch_track=queues.stop_batch_track,
-        ),
+        # TrackingWorker(
+        #     app_state=app_state,
+        #     reconstructor=reconstructor,
+        #     mot_tracker=mot_tracker,
+        #     in_queue=queues.frames_for_tracking,
+        #     progress_queue=queues.tracking_progress,
+        #     command_queue=queues.tracking_command,
+        #     stop_event=queues.stop_batch_track,
+        # ),
 
         RenderingWorker(
-            app_state,
-            reconstructor,
-            mot_tracker,
-            queues.frames_for_rendering,
-            queues.results,
-            open3d_viz
+            app_state=app_state,
+            in_queue=queues.frames_for_rendering,
+            results_queue=queues.results
         ),
 
         GAWorker(
-            queues.ga_command,
-            queues.ga_progress
+            command_queue=queues.ga_command,
+            progress_queue=queues.ga_progress
         ),
 
         BAWorker(
-            queues.ba_command,
-            queues.ba_results,
-            queues.stop_bundle_adjustment
+            command_queue=queues.ba_command,
+            results_queue=queues.ba_results,
+            stop_event=queues.stop_bundle_adjustment
         )
     ]
 
-    # Start workers
     for worker in workers:
         worker.start()
 
-    # Create UI
     create_ui(app_state, queues)
 
     # Run main loop
     try:
-        main_loop(app_state, queues, open3d_viz)
+        main_loop(app_state, queues)
+
     finally:
         print("Shutting down...")
+
         queues.shutdown_all()
-
-        # Close video backend
-        video_backend.close()
-
+        app_state.video_backend.close()
         for worker in workers:
             worker.join(timeout=2)
-
         dpg.destroy_context()
-        print("Shutdown complete")
 
 
 if __name__ == "__main__":

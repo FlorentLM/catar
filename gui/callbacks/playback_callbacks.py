@@ -13,8 +13,8 @@ def next_frame_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
     with app_state.lock:
         app_state.paused = True
-        num_frames = app_state.video_metadata['num_frames']
-        if app_state.frame_idx < num_frames - 1:
+        nb_frames = app_state.frame_count
+        if app_state.frame_idx < nb_frames - 1:
             app_state.frame_idx += 1
 
 
@@ -38,6 +38,6 @@ def set_frame_callback(sender, app_data, user_data):
     with app_state.lock:
         app_state.is_seeking = True
         app_state.paused = True
-        num_frames = app_state.video_metadata['num_frames']
-        if 0 <= new_frame_idx < num_frames:
+        nb_frames = app_state.frame_count
+        if 0 <= new_frame_idx < nb_frames:
             app_state.frame_idx = int(new_frame_idx)

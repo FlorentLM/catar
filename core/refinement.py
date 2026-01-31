@@ -5,17 +5,6 @@ from lucida import CameraRig
 from lucida.calibration import bundle_adjustment
 
 
-def _get_anchor_index(rig: CameraRig) -> int:
-    """
-    The anchor camera is held fixed during optimisation
-    """
-    anchor_cam = rig.anchor_camera
-    if anchor_cam is not None:
-        return rig.get_index(anchor_cam.name)
-    # if no explicit anchor, default to first camera
-    return 0
-
-
 def prepare_refinement(rig: CameraRig, snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
     """
     Prepares data for Bundle Adjustment.
@@ -26,7 +15,11 @@ def prepare_refinement(rig: CameraRig, snapshot: Dict[str, Any]) -> Tuple[Dict[s
     calib_frames = snapshot["calibration_frames"]
 
     # Determine anchor camera index
-    anchor_idx = _get_anchor_index(rig)
+    if rig.anchor_camera is not None:
+        anchor_idx = rig.get_index(rig.anchor_camera.name)
+    else:
+        anchor_idx = 0
+
     print(f"[BA] Using camera '{rig.names[anchor_idx]}' (index {anchor_idx}) as anchor")
 
     # Prepare 2D observations

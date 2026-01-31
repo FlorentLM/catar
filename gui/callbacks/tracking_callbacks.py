@@ -7,8 +7,8 @@ def toggle_realtime_tracking_callback(sender, app_data, user_data):
     app_state = user_data["app_state"]
 
     with app_state.lock:
-        app_state.keypoint_tracking_enabled = not app_state.keypoint_tracking_enabled
-        is_enabled = app_state.keypoint_tracking_enabled
+        app_state.live_tracking_enabled = not app_state.live_tracking_enabled
+        is_enabled = app_state.live_tracking_enabled
 
     if is_enabled:
         dpg.bind_item_theme("keypoint_tracking_button", "tracking_button_theme")

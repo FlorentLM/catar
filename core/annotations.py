@@ -81,13 +81,13 @@ def detect_track_collision(existing_annots, new_predictions, rig: 'CameraRig', d
     return False
 
 
-def snap_annotation(app_state, target_cam_idx, point_idx, frame_idx, click_pos):
+def snap_annotation(app_state, target_cam_name, keypoint_name, frame_idx, click_pos):
     """Snap click to epipolar line intersection from other views."""
 
-    annots = app_state.data.get_2d(frame=frame_idx, keypoint=point_idx)
+    annots = app_state.data.get_2d(frame=frame_idx, keypoint=keypoint_name)
 
     rig = app_state.rig
-    target_camera = rig.get_name(target_cam_idx)
+    target_cam_idx = rig.get_index(target_cam_name)
 
     valid_mask = ~np.isnan(annots[:, 0])
     valid_mask[target_cam_idx] = False  # exclude self
@@ -102,7 +102,7 @@ def snap_annotation(app_state, target_cam_idx, point_idx, frame_idx, click_pos):
     if np.isnan(p3d).any():
         return None
 
-    reproj = rig[target_camera].project(p3d).flatten()
+    reproj = rig[target_cam_name].project(p3d).flatten()
 
     if np.linalg.norm(reproj - click_pos) > 20:
         return None

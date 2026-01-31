@@ -1,4 +1,6 @@
 """
+Video reader workers for frame distribution.
+
 This worker is responsible for:
 - Managing the video backend (cached or direct)
 - Distributing frames to downstream workers (tracking, rendering)
@@ -8,7 +10,7 @@ This worker is responsible for:
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Dict
 
 import numpy as np
 
@@ -20,16 +22,14 @@ if TYPE_CHECKING:
 class VideoReaderWorker(threading.Thread):
     """
     Reads video frames using a VideoBackend and distributes them to processing workers.
-
-    The backend can be hot-swapped at runtime (e.g., when cache becomes available).
+    The backend can be hot-swapped at runtime (e.g. when cache becomes available).
     """
 
     def __init__(
-            self,
-            app_state: 'AppState',
-            video_backend: 'VideoBackend',
-            command_queue: queue.Queue,
-            output_queues: List[queue.Queue],
+        self,
+        app_state: 'AppState',
+        command_queue: queue.Queue,
+        output_queues: List[queue.Queue],
     ):
         """
         Initialize VideoReaderWorker.
@@ -42,7 +42,7 @@ class VideoReaderWorker(threading.Thread):
         """
         super().__init__(daemon=True, name="VideoReaderWorker")
         self.app_state = app_state
-        self.backend = video_backend
+        self.backend = app_state.video_backend
         self.command_queue = command_queue
         self.output_queues = output_queues
         self.shutdown_event = threading.Event()
@@ -68,7 +68,7 @@ class VideoReaderWorker(threading.Thread):
 
         # Get FPS from metadata to limit playback speed
         default_fps = 60.0
-        fps = self.app_state.video_metadata.get('fps', default_fps)
+        fps = self.app_state.fps if self.app_state.fps is not None else default_fps
         if fps <= 0:
             fps = default_fps
         target_frame_duration = 1.0 / fps
@@ -84,7 +84,7 @@ class VideoReaderWorker(threading.Thread):
                 current_frame_idx = self.app_state.frame_idx
                 is_paused = self.app_state.paused
                 is_seeking = self.app_state.is_seeking
-                num_frames = self.app_state.video_metadata['num_frames']
+                num_frames = self.app_state.frame_count
 
             # Don't read during seek operations
             if is_seeking:
@@ -93,11 +93,11 @@ class VideoReaderWorker(threading.Thread):
 
             # Read and distribute frames if index changed
             if current_frame_idx != prev_frame_idx:
-                # Determine adjacency for tracking (needs to know if we moved by 1 frame)
                 is_adjacent = abs(current_frame_idx - prev_frame_idx) == 1
                 was_sequential_forward = (current_frame_idx == prev_frame_idx + 1)
 
                 try:
+                    # get_frame returns Dict[camera_name, np.ndarray]
                     frames = self.backend.get_frame(current_frame_idx)
 
                     if not frames:
@@ -108,7 +108,7 @@ class VideoReaderWorker(threading.Thread):
 
                     frame_data = {
                         "frame_idx": current_frame_idx,
-                        "raw_frames": frames,
+                        "frames": frames,  # Dict[camera_name, np.ndarray]
                         "was_sequential": was_sequential_forward,
                         "is_adjacent": is_adjacent
                     }
@@ -135,7 +135,6 @@ class VideoReaderWorker(threading.Thread):
                 if sleep_duration > 0:
                     time.sleep(sleep_duration)
             else:
-                # If paused, sleep to save CPU
                 time.sleep(0.01)
 
     def _process_commands(self):
@@ -149,15 +148,10 @@ class VideoReaderWorker(threading.Thread):
                 self.shutdown_event.set()
 
             elif action == "update_backend":
-                # Hotswap backend
                 new_backend = command.get("backend")
                 if new_backend is not None:
                     print("VideoReaderWorker: Updating backend...")
-
-                    # Close old backend
                     self.backend.close()
-
-                    # Switch to new backend
                     self.backend = new_backend
                     print(f"VideoReaderWorker: Backend updated to {type(new_backend).__name__}")
 
@@ -177,10 +171,9 @@ class VideoReaderWorker(threading.Thread):
         Send frame data to all output queues, clearing old data.
 
         Args:
-            frame_data: Dictionary containing frame info and raw frames
+            frame_data: Dictionary containing frame info and frames dict
         """
         for q in self.output_queues:
-            # Clear any stale frames
             while not q.empty():
                 try:
                     q.get_nowait()
@@ -198,23 +191,27 @@ class VideoReaderWorker(threading.Thread):
 class BatchVideoReader:
     """
     Helper class for batch processing with VideoBackend.
-
-    Provides efficient sequential or random access for batch tracking operations.
-    Used by TrackingWorker for batch tracking.
     """
 
-    def __init__(self, backend: 'VideoBackend'):
+    def __init__(
+        self,
+        backend: 'VideoBackend',
+        camera_names: Optional[List[str]] = None
+    ):
         """
         Initialize batch reader.
 
         Args:
             backend: VideoBackend instance to use
+            camera_names: Optional list of camera names to read (for ordering).
+                         If None, uses backend's canonical order.
         """
         self.backend = backend
-        self.cache = {}  # Simple cache for recently read frames
+        self.camera_names = camera_names or list(backend.camera_names)
+        self.cache: Dict[int, Dict[str, np.ndarray]] = {}
         self.max_cache_size = 10
 
-    def read_frame(self, frame_idx: int) -> Optional[List[np.ndarray]]:
+    def read_frame(self, frame_idx: int) -> Optional[Dict[str, np.ndarray]]:
         """
         Read a frame with simple caching.
 
@@ -222,21 +219,17 @@ class BatchVideoReader:
             frame_idx: Frame index to read
 
         Returns:
-            List of frames (one per view) or None on error
+            Dict mapping camera_name -> frame array, or None on error
         """
-        # Check cache first
         if frame_idx in self.cache:
             return self.cache[frame_idx]
 
         try:
-            frames = self.backend.get_frame(frame_idx)
+            frames = self.backend.get_frame(frame_idx, self.camera_names)
 
-            # Add to cache
             self.cache[frame_idx] = frames
 
-            # Enforce cache size
             if len(self.cache) > self.max_cache_size:
-                # Remove oldest
                 oldest_key = min(self.cache.keys())
                 del self.cache[oldest_key]
 

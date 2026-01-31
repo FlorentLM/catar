@@ -1,65 +1,65 @@
 import queue
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from video import BatchVideoReader
-from utils import triangulate_and_score  # Used for on-demand recon
+from utils import triangulate_and_score
+
 from core.trackers.trackers_commons import create_tracker
 
 if TYPE_CHECKING:
     from state import AppState
-    from video import VideoBackend
-    from mokap.reconstruction.reconstruction import Reconstructor
-    from mokap.reconstruction.tracking import MultiObjectTracker
+    from mokap.pose_reconstruction.soup import Reconstructor
+    from mokap.pose_reconstruction.assembly import MultiObjectTracker
+    from mokap.pose_reconstruction.skeleton import SkeletonStats
 
 
 class TrackingWorker(threading.Thread):
     """
-    Runs the automated point tracking, and provides on-demand 3D reconstruction.
+    Runs automated point tracking and provides on-demand 3D reconstruction.
+
+    Supports multiple tracking algorithms:
+    - 'imm': IMM-based per-keypoint filtering with optional mokap dynamics
+    - 'mokap': Full mokap pipeline (reconstruction + skeleton assembly)
     """
 
     def __init__(
             self,
             app_state: 'AppState',
-            video_backend: 'VideoBackend',
             reconstructor: 'Reconstructor',
-            tracker: 'MultiObjectTracker',
-            frames_in_queue: queue.Queue,
-            progress_out_queue: queue.Queue,
-            command_queue: queue.Queue,
-            stop_batch_track: threading.Event,
-            bone_stats: Optional[dict] = None
+            mot_tracker: 'MultiObjectTracker',
+            in_queue: queue.Queue = None,
+            progress_queue: queue.Queue = None,
+            command_queue: queue.Queue = None,
+            stop_event: threading.Event = None,
     ):
         super().__init__(daemon=True, name="TrackingWorker")
 
         self.app_state = app_state
-        self.video_backend = video_backend
         self.reconstructor = reconstructor
-        self.mot_tracker = tracker
-        self.frames_in_queue = frames_in_queue
-        self.progress_out_queue = progress_out_queue
+        self.mot_tracker = mot_tracker
+
+        self.frames_in_queue = in_queue
+        self.progress_out_queue = progress_queue
         self.command_queue = command_queue
-        self.stop_batch_track_event = stop_batch_track
-        self.bone_stats = bone_stats
+        self.stop_batch_track_event = stop_event
 
         self.shutdown_event = threading.Event()
 
-        self.tracker_algorithm = "simple_kalman"
-        self.active_tracker = self._build_tracker()
+        # Default to IMM tracker (uses learned dynamics if available)
+        self.tracker_algorithm = "imm"
+
+        new_tracker = create_tracker(
+            self.tracker_algorithm,
+            self.app_state,
+            reconstructor=self.reconstructor,
+            mot_tracker=self.mot_tracker
+        )
+        self.active_tracker = new_tracker
 
         # State for live tracking
         self.prev_frames = None
         self.prev_frame_idx = -1
-
-    def _build_tracker(self):
-        return create_tracker(
-            self.tracker_algorithm,
-            self.app_state,
-            bone_stats=self.bone_stats,
-            # These are for the mokap tracker, others will ignore
-            reconstructor=self.reconstructor,
-            mot_tracker=self.mot_tracker
-        )
 
     def run(self):
         """Main worker loop."""
@@ -77,11 +77,22 @@ class TrackingWorker(threading.Thread):
 
                 elif cmd.get("action") == "update_calibration":
                     print("TrackingWorker: Updating calibration...")
-
                     with self.app_state.lock:
                         # Update the reconstructor used by mokap tracker
                         self.reconstructor.rig = self.app_state.rig
-                    # trackersSimple/Improved read rig from app_state directly
+                    # IMM tracker reads rig from app_state directly
+                    continue
+
+                elif cmd.get("action") == "update_skeleton_stats":
+                    # Allow runtime update of skeleton stats
+                    new_stats = cmd.get("skeleton_stats")
+                    if new_stats is not None:
+                        print("TrackingWorker: Updating skeleton stats...")
+                        self.mot_tracker.skeleton_stats = new_stats
+
+                        # Update IMM tracker if it supports dynamic updates
+                        if hasattr(self.active_tracker, 'update_skeleton_stats'):
+                            self.active_tracker.update_skeleton_stats(new_stats)
                     continue
 
                 elif cmd.get("action") == "set_algorithm":
@@ -91,7 +102,15 @@ class TrackingWorker(threading.Thread):
                         print(f"Swapping tracker: {self.tracker_algorithm} -> {new_algo}")
 
                         self.tracker_algorithm = new_algo
-                        self.active_tracker = self._build_tracker()
+
+                        new_tracker = create_tracker(
+                            self.tracker_algorithm,
+                            self.app_state,
+                            reconstructor=self.reconstructor,
+                            mot_tracker=self.mot_tracker
+                        )
+                        self.active_tracker = new_tracker
+
                         self.prev_frames = None  # Reset live tracking state
 
                 elif cmd.get("action") == "batch_track":
@@ -106,7 +125,7 @@ class TrackingWorker(threading.Thread):
 
             # On-demand 3D reconstruction
             with self.app_state.lock:
-                needs_reconstruction = self.app_state.needs_3d_reconstruction
+                needs_reconstruction = self.app_state.needs_reconstruction
                 current_frame_idx = self.app_state.frame_idx
 
             if needs_reconstruction:
@@ -133,22 +152,20 @@ class TrackingWorker(threading.Thread):
         with self.app_state.lock:
             rig = self.app_state.rig
 
-        annotations = self.app_state.data.get_frame_annotations(frame_idx)
+        annotations = self.app_state.data.get_2d(frame=frame_idx)
 
         points_4d = triangulate_and_score(annotations, rig)
-        self.app_state.data.set_frame_points3d(frame_idx, points_4d)
+        self.app_state.data.set_3d(frame=frame_idx, data=points_4d)
 
         with self.app_state.lock:
-            self.app_state.needs_3d_reconstruction = False
+            self.app_state.needs_reconstruction = False
 
     def _process_live_frame(self, data: dict):
-        """
-        Process a single frame for the live tracking.
-        """
+        """Process a single frame for live tracking."""
         frame_idx = data["frame_idx"]
 
         with self.app_state.lock:
-            is_tracking_enabled = self.app_state.keypoint_tracking_enabled
+            is_tracking_enabled = self.app_state.live_tracking_enabled
 
         # We can track if enabled, and if we have adjacent frames
         can_track = is_tracking_enabled and self.prev_frames and data.get("is_adjacent", False)
@@ -161,25 +178,26 @@ class TrackingWorker(threading.Thread):
                 frame_idx=frame_idx,
                 prev_frame_idx=self.prev_frame_idx,
                 source_frames=self.prev_frames,
-                dest_frames=data["raw_frames"]
+                dest_frames=data["frames"]
             )
 
-        self.prev_frames = data["raw_frames"]
+        self.prev_frames = data["frames"]
         self.prev_frame_idx = data["frame_idx"]
 
     def _run_batch_tracking(self, start_frame: int, direction: int = 1):
+        """Run batch tracking from a keyframe."""
         dir_str = "FORWARD" if direction == 1 else "BACKWARD"
         print(f"Starting batch track {dir_str} ({self.tracker_algorithm}) from {start_frame}...")
 
         self.active_tracker.initialize_tracks(start_frame, direction)
 
-        batch_reader = BatchVideoReader(self.video_backend)
-        num_frames = self.app_state.video_metadata['num_frames']
+        batch_reader = BatchVideoReader(self.app_state)
+        nb_frames = self.app_state.frame_count
 
         # Determine the range of frames to process
         if direction == 1:
-            frame_range = range(start_frame + 1, num_frames)
-            total_to_process = num_frames - start_frame - 1
+            frame_range = range(start_frame + 1, nb_frames)
+            total_to_process = nb_frames - start_frame - 1
         else:
             frame_range = range(start_frame - 1, -1, -1)
             total_to_process = start_frame
@@ -215,7 +233,6 @@ class TrackingWorker(threading.Thread):
             # Handle collision / failure (mokap tracker returns False on collision)
             if not success:
                 print(f"Tracking interrupted at frame {dest_frame_idx} (Collision or Loss)")
-                # Set final frame to previous one so UI knows where it stopped
                 final_frame = dest_frame_idx - direction
                 self.progress_out_queue.put({"status": "complete", "final_frame": final_frame})
                 batch_reader.clear_cache()
@@ -225,13 +242,12 @@ class TrackingWorker(threading.Thread):
             current_source_idx = dest_frame_idx
 
             # Report progress to UI
-            # if i % 5 == 0:
             if i % 1 == 0:
                 self.progress_out_queue.put({
                     "status": "running",
                     "progress": i / total_to_process,
                     "current_frame": dest_frame_idx,
-                    "total_frames": num_frames,
+                    "total_frames": nb_frames,
                     "debug_info": self.active_tracker.get_debug_info()
                 })
 

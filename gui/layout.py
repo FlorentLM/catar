@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 import numpy as np
 from dearpygui import dearpygui as dpg
 
@@ -62,16 +62,22 @@ def create_ui(app_state: 'AppState', queues: 'Queues'):
 
     dpg.create_context()
 
-    nb_videos = len(app_state.rig)
+    cam_names = app_state.rig.names
+    nb_videos = len(cam_names)
+
     if nb_videos > 0:
         # Calculate the most 'square' layout
         n_cols = int(np.ceil(np.sqrt(nb_videos)))
         n_rows = int(np.ceil(nb_videos / n_cols))
+        w = app_state.video_info[cam_names[0]].width
+        h = app_state.video_info[cam_names[0]].height
+        video_ar = 1.0 if h == 0 else w / h  # square default
     else:
         n_cols = 1
         n_rows = 1
+        video_ar = 16 / 9
+        print("Warning: No video metadata found. Using default 16:9 aspect ratio.")
 
-    video_ar = app_state.video_metadata['width'] / app_state.video_metadata['height']
     item_width = 480
     item_height = item_width / video_ar
 
@@ -87,7 +93,7 @@ def create_ui(app_state: 'AppState', queues: 'Queues'):
     )
 
     # Setup
-    create_textures(len(app_state.rig))
+    create_textures(app_state.rig.names)
     create_themes()
     register_event_handlers(app_state, queues)
 
@@ -123,12 +129,12 @@ def create_ui(app_state: 'AppState', queues: 'Queues'):
     dpg.show_viewport()
 
 
-def create_textures(num_videos: int):
+def create_textures(cameras_names: List[str]):
     """Create GPU textures for video frames and 3D view."""
 
     with dpg.texture_registry():
         # Video textures
-        for i in range(num_videos):
+        for cam_name in cameras_names:
             black = np.zeros(
                 (config.DISPLAY_HEIGHT, config.DISPLAY_WIDTH, 4),
                 dtype=np.float32
@@ -137,7 +143,7 @@ def create_textures(num_videos: int):
                 width=config.DISPLAY_WIDTH,
                 height=config.DISPLAY_HEIGHT,
                 default_value=black.ravel().tolist(),
-                tag=f"video_texture_{i}",
+                tag=f"video_texture_{cam_name}",
                 format=dpg.mvFormat_Float_rgba
             )
 
@@ -404,7 +410,7 @@ def create_bottom_panel(app_state: 'AppState'):
             slider = dpg.add_slider_int(
                 label="Frame",
                 min_value=0,
-                max_value=app_state.video_metadata['num_frames'] - 1,
+                max_value=app_state.frame_count - 1,
                 default_value=0,
                 callback=set_frame_callback,
                 user_data=user_data,
@@ -431,10 +437,10 @@ def create_bottom_panel(app_state: 'AppState'):
         dpg.add_plot_axis(dpg.mvXAxis, label="Frame", tag="histogram_x_axis")
         dpg.add_plot_axis(dpg.mvYAxis, label="Annotations", tag="histogram_y_axis")
 
-        num_frames = app_state.video_metadata['num_frames']
+        nb_frames = app_state.frame_count
         dpg.add_bar_series(
-            list(range(num_frames)),
-            [0] * num_frames,
+            list(range(nb_frames)),
+            [0] * nb_frames,
             label="Annotation Count",
             parent="histogram_y_axis",
             tag="annotation_histogram_series"
@@ -490,8 +496,8 @@ def create_video_cell(cam_idx: int, app_state: 'AppState'):
         # Display Camera Name (bold) and Filename (faint)
 
         with dpg.group(horizontal=True, horizontal_spacing=5):
-            camera_name = app_state.rig.names[cam_idx]
-            file_name = app_state.video_filenames[cam_idx]
+            camera_name = app_state.rig.get_name(cam_idx)
+            file_name = app_state.video_paths[camera_name].name
 
             dpg.add_text(camera_name)
             faint_text = dpg.add_text(f"({file_name})")
@@ -500,29 +506,29 @@ def create_video_cell(cam_idx: int, app_state: 'AppState'):
         with dpg.drawlist(
             width=config.DISPLAY_WIDTH,
             height=config.DISPLAY_HEIGHT,
-            tag=f"drawlist_{cam_idx}"
+            tag=f"drawlist_{camera_name}"
         ):
             color = config.CAMERA_COLORS[cam_idx % len(config.CAMERA_COLORS)]
             frame_thickness = 2
 
             dpg.draw_image(
-                f"video_texture_{cam_idx}",
+                f"video_texture_{camera_name}",
                 pmin=(0, 0),
                 pmax=(config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT),
-                tag=f"video_image_{cam_idx}"
+                tag=f"video_image_{camera_name}"
             )
             dpg.draw_rectangle(
                 pmin=(0, 0),
                 pmax=(config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT),
-                tag=f"video_border_{cam_idx}",
+                tag=f"video_border_{camera_name}",
                 color=color,
                 thickness=frame_thickness
             )
-            dpg.add_draw_layer(tag=f"annotation_layer_{cam_idx}")
+            dpg.add_draw_layer(tag=f"annotation_layer_{camera_name}")
 
-        with dpg.item_handler_registry(tag=f"image_handler_{cam_idx}"):
+        with dpg.item_handler_registry(tag=f"image_handler_{camera_name}"):
             dpg.add_item_clicked_handler(
                 callback=image_mousedown_callback,
-                user_data={"cam_idx": cam_idx, "app_state": app_state}
+                user_data={"camera_name": camera_name, "app_state": app_state}
             )
-        dpg.bind_item_handler_registry(f"drawlist_{cam_idx}", f"image_handler_{cam_idx}")
+        dpg.bind_item_handler_registry(f"drawlist_{camera_name}", f"image_handler_{camera_name}")

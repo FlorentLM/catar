@@ -10,8 +10,8 @@ def toggle_focus_mode_callback(sender, app_data, user_data):
 
     app_state = user_data["app_state"]
     with app_state.lock:
-        app_state.focus_selected_point = not app_state.focus_selected_point
-        status = "Enabled" if app_state.focus_selected_point else "Disabled"
+        app_state.focus_mode = not app_state.focus_mode
+        status = "Enabled" if app_state.focus_mode else "Disabled"
         print(f"Focus mode: {status}")
 
 
